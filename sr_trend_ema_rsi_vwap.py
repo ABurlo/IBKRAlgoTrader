@@ -70,17 +70,18 @@ class BacktestEngine:
             }
         else:
             # Calculate PNL before updating balance
-            pnl = (executed_price - self.current_position['entry_price']) * shares
-            pnl_pct = (pnl / self.current_position['entry_price']) * 100
-            
-            trade.update({
-                'pnl': pnl,
-                'pnl_pct': pnl_pct
-            })
-            
-            self.balance += position_value - fees
-            self.trade_history.append(trade.copy())
-            self.current_position = None
+            if self.current_position:  # Added null check
+                pnl = (executed_price - self.current_position['entry_price']) * shares
+                pnl_pct = (pnl / self.current_position['entry_price']) * 100
+                
+                trade.update({
+                    'pnl': pnl,
+                    'pnl_pct': pnl_pct
+                })
+                
+                self.balance += position_value - fees
+                self.trade_history.append(trade.copy())
+                self.current_position = None
 
         # Add visual marker
         marker = {
@@ -166,7 +167,6 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
     contract = Stock(symbol, exchange, currency)
     
     if backtest:
-        # Backtesting data (1 year daily)
         bars = ib.reqHistoricalData(
             contract,
             endDateTime=datetime.now(),
@@ -192,10 +192,6 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         
         df['date'] = pd.to_datetime(df['date'])
         df.set_index('date', inplace=True)
-        
-            # Add index validation
-        df = df[~df.index.duplicated(keep='first')]
-        df = df.asfreq('D').ffill()
         
         # Ensure continuous index
         full_index = pd.date_range(start=df.index.min(), end=df.index.max(), freq='D')
@@ -503,10 +499,10 @@ def plot_candlestick(df, backtest=False):
     plt.show()
 
 # =====================
-# EXECUTION HANDLERS
+# EXECUTION HANDLERS (Critical Fix)
 # =====================
 def run_backtest(df):
-    """Execute backtest with robust index handling and trade safeguards"""
+    """Fixed index handling with proper data validation"""
     # Validate dataframe structure and index
     required_columns = ['open', 'high', 'low', 'close', '5_EMA', '10_EMA', '20_EMA', 'RSI']
     if not all(col in df.columns for col in required_columns):
@@ -521,18 +517,13 @@ def run_backtest(df):
         df['date'] = pd.to_datetime(df['date'])
         df = df.set_index('date').sort_index()
         
-    # Pre-calculate valid indices
-    valid_indices = df.index.tolist()
-    
-    for i, current_dt in enumerate(valid_indices):
+    # Fixed loop structure
+    for i, current_dt in enumerate(df.index):  # Use enumerate on df.index
         try:
-            row = df.loc[current_dt]
+            row = df.loc[current_dt]  # Use loc instead of iloc
             
-            # ====================
             # ENTRY CONDITION CHECK
-            # ====================
             if check_entry_conditions(df, current_dt):
-                # Position sizing safeguards
                 position_size = min(
                     engine.balance * 0.02,
                     engine.balance - 100,
@@ -554,11 +545,8 @@ def run_backtest(df):
                     f"| Price: ${trade['price']:.2f} | New Balance: ${trade['new_balance']:.2f}"
                 )
 
-            # ===================
             # EXIT CONDITION CHECK
-            # ===================
             if engine.current_position and check_exit_conditions(df, current_dt):
-                # Validate technical indicators
                 if any(pd.isna(row[col]) for col in ['5_EMA', '10_EMA', 'RSI', 'close']):
                     logger.error(f"Skipping exit due to missing data at {current_dt}")
                     continue
@@ -581,14 +569,8 @@ def run_backtest(df):
         except KeyError as ke:
             logger.error(f"Data access error: {str(ke)}")
             break
-        except IndexError as ie:
-            logger.error(f"Index mismatch at position {i}/{len(df)}: {str(ie)}")
-            break
-        except ZeroDivisionError:
-            logger.error(f"Zero price encountered at {current_dt}")
-            break
         except Exception as e:
-            logger.error(f"Critical error at {current_dt}: {str(e)}")
+            logger.error(f"Error processing {current_dt}: {str(e)}")
             raise
 
     # Post-backtest cleanup
