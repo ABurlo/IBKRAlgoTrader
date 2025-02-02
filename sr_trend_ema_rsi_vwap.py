@@ -203,7 +203,6 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
     return get_multi_timeframe_data(ib, contract)
 
 def get_multi_timeframe_data(ib, contract):
-    # Original multi-timeframe implementation
     timeframes = {
         '5m': ('5 mins', '1 D'),
         '30m': ('30 mins', '1 D'),
@@ -223,14 +222,16 @@ def get_multi_timeframe_data(ib, contract):
         )
         df = util.df(bars)
         
-        # Calculate VWAP and volume metrics
-        df['VWAP'] = (df['volume'] * (df['high'] + df['low'] + df['close']) / 3).cumsum() / df['volume'].cumsum()
-        df['volume_ma'] = df['volume'].rolling(window=20).mean()
-        df['relative_volume'] = df['volume'] / df['volume_ma']
+        # Add EMA calculations (CRITICAL FIX)
+        df['close'] = df['close'].astype(float)
+        for window in [5, 10, 20]:
+            df[f'{window}_EMA'] = df['close'].ewm(span=window, adjust=False).mean()
         
+        # Existing VWAP/volume calculations
+        df['VWAP'] = (df['volume'] * (df['high'] + df['low'] + df['close'])/3).cumsum()/df['volume'].cumsum()
+        df['volume_ma'] = df['volume'].rolling(20).mean()
         df.set_index('date', inplace=True)
         dfs[tf] = df
-    
     return dfs['5m'], dfs['30m'], dfs['1h']
 
 # =====================
@@ -451,18 +452,32 @@ def plot_candlestick(df, backtest=False):
         width=1.5,
         alpha=0.8
     ))
-
-    # Add trade markers
+    
+    # If backtest mode and there are trade markers, build a Series with the same index as df
     if backtest and engine.trade_markers:
-        markers = pd.DataFrame(engine.trade_markers)
+        markers_df = pd.DataFrame(engine.trade_markers)
+        # Create an empty Series with the same index as df and fill with NaN
+        marker_series = pd.Series(np.nan, index=df.index)
+        # Also prepare arrays for marker style and color. We’ll create separate Series for them.
+        marker_style = pd.Series(np.nan, index=df.index)
+        marker_color = pd.Series(np.nan, index=df.index)
+        
+        # Fill in the series at the marker dates
+        for _, row in markers_df.iterrows():
+            marker_series.at[row['date']] = row['price']
+            marker_style.at[row['date']] = row['marker']
+            marker_color.at[row['date']] = row['color']
+        
+        # For simplicity, we can only pass one marker style and one color to make_addplot.
+        # So if you want to show different markers or colors, consider Option 2 below.
         addplots.append(mpf.make_addplot(
-            markers.set_index('date')['price'],
+            marker_series,
             type='scatter',
-            marker=markers['marker'].values,
-            color=markers['color'].values,
-            markersize=100
+            markersize=100,
+            marker='^',  # or choose one default marker style
+            color='green'  # or choose one default color
         ))
-
+    
     # Plot configuration
     mc = mpf.make_marketcolors(
         up='green', down='red',
@@ -498,6 +513,7 @@ def plot_candlestick(df, backtest=False):
     )
     
     plt.show()
+
 
 # =====================
 # EXECUTION HANDLERS (Critical Fix)
