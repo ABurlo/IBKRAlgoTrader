@@ -15,7 +15,7 @@ from matplotlib.patches import Patch
 # =====================
 # GLOBAL CONFIGURATION
 # =====================
-symbol = "MSFT"  # Default Ticker
+symbol = "CVNA"  # Default Ticker
 initial_balance = 10000  # IBKR C.B.U. initial balance
 
 # =====================
@@ -188,46 +188,65 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
     contract = Stock(symbol, exchange, currency)
     
     if backtest:
+        # Modified duration and bar size settings
         bars = ib.reqHistoricalData(
             contract,
-            endDateTime=datetime.now(),
+            endDateTime='',  # Empty string means current time
             durationStr='365 D',
-            barSizeSetting='1 day',
+            barSizeSetting='1 hour',
             whatToShow='TRADES',
             useRTH=True,
-            formatDate=1
+            formatDate=1,
+            keepUpToDate=False  # Ensure we get historical data only
         )
+        
+        if not bars:
+            raise ValueError("No data received from IB")
+            
         df = util.df(bars)
         
+        # Ensure we have data before calculating indicators
+        if len(df) == 0:
+            raise ValueError("Empty dataframe received from IB")
+            
         # Calculate technical indicators
         for window in [5, 10, 20]:
             df[f'{window}_EMA'] = df['close'].ewm(span=window, adjust=False).mean()
         
-        df['VWAP'] = (df['volume'] * (df['high'] + df['low'] + df['close']) / 3).cumsum() / df['volume'].cumsum()
+        # Calculate VWAP properly for intraday data
+        df['vwap_numerator'] = df['volume'] * (df['high'] + df['low'] + df['close']) / 3
+        df['vwap_denominator'] = df['volume']
         
+        # Group by date to reset VWAP calculations daily
+        df['date'] = pd.to_datetime(df['date'])
+        df['trading_date'] = df['date'].dt.date
+        
+        # Calculate VWAP for each trading day
+        df['VWAP'] = (df.groupby('trading_date')['vwap_numerator'].cumsum() / 
+                      df.groupby('trading_date')['vwap_denominator'].cumsum())
+        
+        # Clean up temporary columns
+        df = df.drop(['vwap_numerator', 'vwap_denominator', 'trading_date'], axis=1)
+        
+        # Calculate RSI
         delta = df['close'].diff()
         gain = delta.where(delta > 0, 0).ewm(alpha=1/14, adjust=False).mean()
         loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
         rs = gain / loss
         df['RSI'] = 100 - (100 / (1 + rs))
         
-        df['date'] = pd.to_datetime(df['date'])
         df.set_index('date', inplace=True)
-        
-        # Ensure continuous index
-        full_index = pd.date_range(start=df.index.min(), end=df.index.max(), freq='D')
-        df = df.reindex(full_index).ffill()
         
         return df
     
-    # Real-time data (multi-timeframe)
+    # Real-time data handling remains unchanged
     return get_multi_timeframe_data(ib, contract)
 
 def get_multi_timeframe_data(ib, contract):
     timeframes = {
-        '5m': ('5 mins', '7 D'),
-        '30m': ('30 mins', '7 D'),
-        '1h': ('1 hour', '7 D')
+        '5m': ('5 mins', '1 D'),
+        '30m': ('30 mins', '1 D'),
+        '1h': ('1 hour', '1 D')
     }
     
     dfs = {}
