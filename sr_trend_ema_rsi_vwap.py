@@ -435,11 +435,12 @@ def find_trendlines(df_5m, min_touches=3):
 def plot_candlestick(df, backtest=False):
     addplots = []
     
-    # Add technical indicators
+    # Add technical indicators using EMA dictionary mapping
+    ema_colors = {5: 'blue', 10: 'orange', 20: 'red'}
     for ema in [5, 10, 20]:
         addplots.append(mpf.make_addplot(
             df[f'{ema}_EMA'],
-            color=['blue', 'orange', 'red'][ema//5-1],
+            color=ema_colors[ema],
             width=1.5,
             alpha=0.8
         ))
