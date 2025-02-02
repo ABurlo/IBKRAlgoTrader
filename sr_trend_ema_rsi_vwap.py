@@ -1,3 +1,6 @@
+# =====================
+# CORE IMPORTS
+# =====================
 from ib_insync import *
 import pandas as pd
 import numpy as np
@@ -9,118 +12,234 @@ import logging
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 
-# Shared Configuration
-symbol = "F" # Default Ticker
+# =====================
+# GLOBAL CONFIGURATION
+# =====================
+symbol = "MSFT"  # Default Ticker
+initial_balance = 10000  # IBKR C.B.U. initial balance
 
-# Apply nest_asyncio to allow nested event loops
-nest_asyncio.apply()
+# =====================
+# BACKTESTING ENGINE
+# =====================
+class BacktestEngine:
+    def __init__(self):
+        self.balance = initial_balance
+        self.positions = {}
+        self.trade_history = []
+        self.current_position = None
+        self.fee_per_share = 0.0035
+        self.slippage = 0.0002
+        self.trade_markers = []
+        self.entry_conditions = {
+            'ema_order': False,
+            'rsi_threshold': False,
+            'position_status': False
+        }
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | %(message)s',
-    handlers=[
-        logging.FileHandler('trading_log.txt'),
-        logging.StreamHandler()
+    def calculate_fees(self, shares):
+        return abs(shares) * self.fee_per_share
+
+    def apply_slippage(self, price, is_buy=True):
+        slippage = price * self.slippage
+        return price + slippage if is_buy else price - slippage
+
+    def execute_trade(self, ticker, price, shares, action, timestamp):
+        executed_price = self.apply_slippage(price, action=='BUY')
+        fees = self.calculate_fees(shares)
+        position_value = abs(shares * executed_price)
+        position_pct = (position_value / self.balance) * 100
+
+        trade = {
+            'timestamp': timestamp,
+            'action': action,
+            'price': executed_price,
+            'shares': shares,
+            'position_value': position_value,
+            'position_pct': position_pct,
+            'fees': fees,
+            'new_balance': self.balance
+        }
+
+        if action == 'BUY':
+            self.balance -= position_value + fees
+            self.current_position = {
+                'entry_price': executed_price,
+                'shares': shares,
+                'entry_time': timestamp,
+                'fees_paid': fees
+            }
+        else:
+            # Calculate PNL before updating balance
+            pnl = (executed_price - self.current_position['entry_price']) * shares
+            pnl_pct = (pnl / self.current_position['entry_price']) * 100
+            
+            trade.update({
+                'pnl': pnl,
+                'pnl_pct': pnl_pct
+            })
+            
+            self.balance += position_value - fees
+            self.trade_history.append(trade.copy())
+            self.current_position = None
+
+        # Add visual marker
+        marker = {
+            'date': timestamp,
+            'price': executed_price,
+            'marker': '▼' if action == 'SELL' else '▲',
+            'color': 'red' if action == 'SELL' else 'green',
+            'size': 100
+        }
+        self.trade_markers.append(marker)
+    
+        return trade
+
+# Initialize engine globally
+engine = BacktestEngine()
+
+# =====================
+# STRATEGY CONDITIONS
+# =====================
+def check_entry_conditions(df, index):
+    row = df.loc[index]
+    conditions = {
+        'ema_order': (row['5_EMA'] > row['10_EMA'] > row['20_EMA'] > row['VWAP']),
+        'rsi_threshold': row['RSI'] < 70,
+        'position_status': not engine.current_position
+    }
+    engine.entry_conditions = conditions
+    return all(conditions.values())
+
+def check_exit_conditions(df, index):
+    if not engine.current_position:
+        return False
+        
+    row = df.loc[index]
+    exit_conditions = [
+        row['5_EMA'] < row['10_EMA'],
+        row['10_EMA'] < row['20_EMA'],
+        row['RSI'] > 70,
+        row['close'] < engine.current_position['entry_price'] * 0.98
     ]
-)
+    return any(exit_conditions)
+
+# =====================
+# ENHANCED LOGGING
+# =====================
+class TradeFormatter(logging.Formatter):
+    GREEN = '\033[92m'
+    RED = '\033[91m'
+    RESET = '\033[0m'
+    
+    def format(self, record):
+        if 'BUY' in record.msg:
+            record.msg = f"{self.GREEN}{record.msg}{self.RESET}"
+        elif 'SELL' in record.msg:
+            record.msg = f"{self.RED}{record.msg}{self.RESET}"
+        return super().format(record)
+
+# Configure root logger directly
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+
+# Clear existing handlers
+for handler in root_logger.handlers[:]:
+    root_logger.removeHandler(handler)
+
+# Create and configure handlers
+handler = logging.StreamHandler()
+handler.setFormatter(TradeFormatter('%(asctime)s | %(message)s'))
+root_logger.addHandler(handler)
+
+file_handler = logging.FileHandler('strategy_execution.log')
+file_handler.setFormatter(logging.Formatter('%(asctime)s | %(message)s'))
+root_logger.addHandler(file_handler)
+
 logger = logging.getLogger(__name__)
 
-# Initialize addplots list at the start of your function
-addplots = []
+# =====================
+# DATA MANAGEMENT
+# =====================
+nest_asyncio.apply()
 
-def get_historical_data(ib, symbol, exchange='SMART', currency='USD'):
+def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=False):
     contract = Stock(symbol, exchange, currency)
-    end_time = datetime.now()
     
-    # Get data for all three timeframes
-    bars_5m = ib.reqHistoricalData(
-        contract,
-        endDateTime=end_time,
-        durationStr='1 D',
-        barSizeSetting='5 mins',
-        whatToShow='TRADES',
-        useRTH=True,
-        formatDate=1
-    )
-    
-    bars_30m = ib.reqHistoricalData(
-        contract,
-        endDateTime=end_time,
-        durationStr='1 D',
-        barSizeSetting='30 mins',
-        whatToShow='TRADES',
-        useRTH=True,
-        formatDate=1
-    )
-    
-    bars_1h = ib.reqHistoricalData(
-        contract,
-        endDateTime=end_time,
-        durationStr='1 D',
-        barSizeSetting='1 hour',
-        whatToShow='TRADES',
-        useRTH=True,
-        formatDate=1
-    )
-    
-    # Convert to DataFrames
-    df_5m = util.df(bars_5m)
-    df_30m = util.df(bars_30m)
-    df_1h = util.df(bars_1h)
-    
-    # Add volume analysis indicators
-    for df in [df_5m, df_30m, df_1h]:
-        # Calculate VWAP
+    if backtest:
+        # Backtesting data (1 year daily)
+        bars = ib.reqHistoricalData(
+            contract,
+            endDateTime=datetime.now(),
+            durationStr='365 D',
+            barSizeSetting='1 day',
+            whatToShow='TRADES',
+            useRTH=True,
+            formatDate=1
+        )
+        df = util.df(bars)
+        
+        # Calculate technical indicators
+        for window in [5, 10, 20]:
+            df[f'{window}_EMA'] = df['close'].ewm(span=window, adjust=False).mean()
+        
         df['VWAP'] = (df['volume'] * (df['high'] + df['low'] + df['close']) / 3).cumsum() / df['volume'].cumsum()
         
-        # Calculate Volume Moving Average
-        df['volume_ma'] = df['volume'].rolling(window=20).mean()
+        delta = df['close'].diff()
+        gain = delta.where(delta > 0, 0).ewm(alpha=1/14, adjust=False).mean()
+        loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
+        rs = gain / loss
+        df['RSI'] = 100 - (100 / (1 + rs))
         
-        # Calculate relative volume (current volume vs average)
+        df['date'] = pd.to_datetime(df['date'])
+        df.set_index('date', inplace=True)
+        
+            # Add index validation
+        df = df[~df.index.duplicated(keep='first')]
+        df = df.asfreq('D').ffill()
+        
+        # Ensure continuous index
+        full_index = pd.date_range(start=df.index.min(), end=df.index.max(), freq='D')
+        df = df.reindex(full_index).ffill().bfill()
+        
+        return df
+    
+    # Real-time data (multi-timeframe)
+    return get_multi_timeframe_data(ib, contract)
+
+def get_multi_timeframe_data(ib, contract):
+    # Original multi-timeframe implementation
+    timeframes = {
+        '5m': ('5 mins', '1 D'),
+        '30m': ('30 mins', '1 D'),
+        '1h': ('1 hour', '1 D')
+    }
+    
+    dfs = {}
+    for tf, (bar_size, duration) in timeframes.items():
+        bars = ib.reqHistoricalData(
+            contract,
+            endDateTime=datetime.now(),
+            durationStr=duration,
+            barSizeSetting=bar_size,
+            whatToShow='TRADES',
+            useRTH=True,
+            formatDate=1
+        )
+        df = util.df(bars)
+        
+        # Calculate VWAP and volume metrics
+        df['VWAP'] = (df['volume'] * (df['high'] + df['low'] + df['close']) / 3).cumsum() / df['volume'].cumsum()
+        df['volume_ma'] = df['volume'].rolling(window=20).mean()
         df['relative_volume'] = df['volume'] / df['volume_ma']
         
-        # Add volume trend analysis
-        df['volume_trend'] = df.apply(lambda x: 1 if x['close'] > x['open'] and x['volume'] > x['volume_ma'] 
-                                    else -1 if x['close'] < x['open'] and x['volume'] > x['volume_ma']
-                                    else 0, axis=1)
+        df.set_index('date', inplace=True)
+        dfs[tf] = df
     
-    df_5m.set_index('date', inplace=True)
-    df_30m.set_index('date', inplace=True)
-    df_1h.set_index('date', inplace=True)
-    
-    # Enhanced logging with volume analysis
-    for index, row in df_5m.iterrows():
-        logger.info(
-            f"5M | Symbol: {symbol} | Time: {index} | "
-            f"Open: {row['open']:.2f} | High: {row['high']:.2f} | "
-            f"Low: {row['low']:.2f} | Close: {row['close']:.2f} | "
-            f"Volume: {row['volume']} | VWAP: {row['VWAP']:.2f} | "
-            f"Rel Volume: {row['relative_volume']:.2f}"
-        )
-        
-        # Find corresponding 30m candle
-        thirty_min_time = index.replace(minute=(index.minute // 30) * 30)
-        if thirty_min_time in df_30m.index:
-            thirty_min_data = df_30m.loc[thirty_min_time]
-            logger.info(
-                f"30M | Symbol: {symbol} | Time: {thirty_min_time} | "
-                f"Open: {thirty_min_data['open']:.2f} | High: {thirty_min_data['high']:.2f} | "
-                f"Low: {thirty_min_data['low']:.2f} | Close: {thirty_min_data['close']:.2f} | "
-                f"Volume: {thirty_min_data['volume']} | VWAP: {thirty_min_data['VWAP']:.2f}"
-            )
-        
-        # Find corresponding 1h candle
-        hour_time = index.replace(minute=0)
-        if hour_time in df_1h.index:
-            hour_data = df_1h.loc[hour_time]
-            logger.info(
-                f"1H | Symbol: {symbol} | Time: {hour_time} | "
-                f"Open: {hour_data['open']:.2f} | High: {hour_data['high']:.2f} | "
-                f"Low: {hour_data['low']:.2f} | Close: {hour_data['close']:.2f} | "
-                f"Volume: {hour_data['volume']} | VWAP: {hour_data['VWAP']:.2f}"
-            )
-    return df_5m, df_30m, df_1h
+    return dfs['5m'], dfs['30m'], dfs['1h']
+
+# =====================
+# TECHNICAL ANALYSIS
+# ===================== 
 
 def find_support_resistance(df_5m, df_15m, df_30m, window=20, min_touches=3, price_threshold=0.15):
     levels = {'support': [], 'resistance': []}
@@ -314,208 +433,199 @@ def find_trendlines(df_5m, min_touches=3):
     
     return trendlines
 
-def plot_candlestick(df_5m, df_15m, df_30m):
+# =====================
+# VISUALIZATION ENGINE
+# =====================
+def plot_candlestick(df, backtest=False):
     addplots = []
     
-    if df_5m.empty:
-        logger.warning("No data available for plotting")
-        return
-
-    # Calculate RSI
-    delta = df_5m['close'].diff()
-    gain = delta.where(delta > 0, 0).ewm(alpha=1/14, adjust=False).mean()  # EMA alternative
-    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
-    rs = gain / loss
-    df_5m['RSI'] = 100 - (100 / (1 + rs))
-
-    # Create RSI plot
-    rsi_plot = mpf.make_addplot(
-        df_5m['RSI'],
-        panel=1,
+    # Add technical indicators
+    for ema in [5, 10, 20]:
+        addplots.append(mpf.make_addplot(
+            df[f'{ema}_EMA'],
+            color=['blue', 'orange', 'red'][ema//5-1],
+            width=1.5,
+            alpha=0.8
+        ))
+    
+    addplots.append(mpf.make_addplot(
+        df['VWAP'],
         color='purple',
-        width=0.7,
-        ylabel='RSI',
-        ylim=(0, 100),
+        width=1.5,
         alpha=0.8
-    )
-    addplots.append(rsi_plot)
-
-    # Calculate EMAs
-    df_5m['5_EMA'] = df_5m['close'].ewm(span=5, adjust=False).mean()
-    df_5m['10_EMA'] = df_5m['close'].ewm(span=10, adjust=False).mean()
-    df_5m['20_EMA'] = df_5m['close'].ewm(span=20, adjust=False).mean()
-
-    # Add EMAs to addplots
-    addplots.append(mpf.make_addplot(
-        df_5m['5_EMA'],
-        color='blue',
-        width=1.5,
-        alpha=0.8,
-        secondary_y=False
-    ))
-    
-    addplots.append(mpf.make_addplot(
-        df_5m['10_EMA'],
-        color='orange',
-        width=1.5,
-        alpha=0.8,
-        secondary_y=False
     ))
 
-    addplots.append(mpf.make_addplot(
-        df_5m['20_EMA'],
-        color='red',
-        width=1.5,
-        alpha=0.8,
-        secondary_y=False
-    ))
+    # Add trade markers
+    if backtest and engine.trade_markers:
+        markers = pd.DataFrame(engine.trade_markers)
+        addplots.append(mpf.make_addplot(
+            markers.set_index('date')['price'],
+            type='scatter',
+            marker=markers['marker'].values,
+            color=markers['color'].values,
+            markersize=100
+        ))
 
-    # Calculate VWAP
-    df_5m['VWAP'] = (df_5m['volume'] * (df_5m['high'] + df_5m['low'] + df_5m['close']) / 3).cumsum() / df_5m['volume'].cumsum()
-
-    # Add VWAP to addplots
-    addplots.append(mpf.make_addplot(
-        df_5m['VWAP'],
-        color='purple',
-        width=1.5,
-        alpha=0.8,
-        secondary_y=False
-    ))
-        
-    # Get support/resistance levels
-    min_touches = 5
-    levels, touches = find_support_resistance(df_5m, df_15m, df_30m, min_touches=min_touches)
-    
-    # Get trendlines
-    trendlines = find_trendlines(df_5m, min_touches=5)
-    
-    # Support/Resistance colors
-    support_colors = [(0, 0, 1, 1.0) for _ in levels['support']]
-    resistance_colors = [(1, 0, 0, 1.0) for _ in levels['resistance']]
-    
-    hlines = dict(
-        hlines=levels['support'] + levels['resistance'],
-        colors=support_colors + resistance_colors,
-        linestyle='--',
-        linewidths=1.0
-    )
-    
-    # Create market colors and style (modified volume colors)
+    # Plot configuration
     mc = mpf.make_marketcolors(
-        up='green',
-        down='red',
-        edge='inherit',
-        wick='inherit',
-        volume={'up':'green', 'down':'red'}  # Volume colors moved here
+        up='green', down='red',
+        edge='inherit', wick='inherit',
+        volume={'up':'green', 'down':'red'}
     )
     
-    s = mpf.make_mpf_style(
-        marketcolors=mc,
-        gridstyle='dotted'
-    )
+    s = mpf.make_mpf_style(marketcolors=mc, gridstyle='dotted')
     
-    # Add trendlines
-    for line in trendlines['bullish']:
-        addplots.append(mpf.make_addplot(
-            line,
-            color='yellow',
-            width=1.5,
-            alpha=1.0,
-            linestyle='-',
-            secondary_y=False
-        ))
-
-    for line in trendlines['bearish']:
-        addplots.append(mpf.make_addplot(
-            line,
-            color='yellow',
-            width=1.5,
-            alpha=1.0,
-            linestyle='-',
-            secondary_y=False
-        ))
-
-    # Create custom legend handles
-    legend_handles = [
-        Patch(facecolor="green", label="Bullish Candle"),
-        Patch(facecolor="red", label="Bearish Candle"),
-        Patch(facecolor="yellow", label="Trendlines"),
-        Patch(facecolor="blue", label="Support"),
-        Patch(facecolor="red", label="Resistance"),
-        Patch(facecolor="blue", label="5 EMA"),
-        Patch(facecolor="orange", label="10 EMA"),
-        Patch(facecolor="red", label="20 EMA"),
-        Patch(facecolor="purple", label="VWAP")
-    ]
-
-    # Create figure and axis objects with adjusted layout
     fig, axlist = mpf.plot(
-        df_5m,
+        df,
         type='candle',
         style=s,
-        title='',
-        volume=True,  # Changed from dict to boolean
-        volume_panel=2,  # Added separate volume_panel parameter
+        volume=True,
         addplot=addplots,
-        hlines=hlines,
         figsize=(12, 8),
-        panel_ratios=(6, 2, 2),
+        panel_ratios=(6, 2),
         returnfig=True
     )
-
-    # Configure RSI panel
-    ax_rsi = axlist[1]
-    ax_rsi.grid(True, which='both', linestyle='--', alpha=0.5)
-    ax_rsi.set_yticks([30, 50, 70])
-    ax_rsi.axhline(30, color='gray', linestyle='--', alpha=0.7)
-    ax_rsi.axhline(70, color='gray', linestyle='--', alpha=0.7)
-
-    # Add title above the chart
-    fig.suptitle('5-Minute Candlestick Chart with Multi-Timeframe S/R Levels\nStock | $' + symbol, y=0.98, fontsize=14)
-
-    # Add legend above the chart
+    
+    # Configure axes and legends
     ax = axlist[0]
     ax.legend(
-        handles=legend_handles,
+        handles=[
+            Patch(facecolor="blue", label="5 EMA"),
+            Patch(facecolor="orange", label="10 EMA"),
+            Patch(facecolor="red", label="20 EMA"),
+            Patch(facecolor="purple", label="VWAP")
+        ],
         loc='upper center',
-        bbox_to_anchor=(0.5, 1.12),
-        ncol=5,
-        frameon=True,
-        fancybox=True,
-        shadow=True
+        bbox_to_anchor=(0.5, 1.1),
+        ncol=4
     )
-
-    # Adjust layout to prevent cutoff
-    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    
     plt.show()
 
-    # Log levels
-    logger.info("Support Levels (from strongest):")
-    for price in sorted(levels['support'], key=lambda x: touches[x], reverse=True):
-        logger.info(f"Level: {price:.2f}, Strength: {touches[price]} touches")
-    
-    logger.info("Resistance Levels (from strongest):")
-    for price in sorted(levels['resistance'], key=lambda x: touches[x], reverse=True):
-        logger.info(f"Level: {price:.2f}, Strength: {touches[price]} touches")
+# =====================
+# EXECUTION HANDLERS
+# =====================
+def run_backtest(df):
+    """Execute backtest with robust index handling and trade safeguards"""
+    # Validate dataframe structure and index
+    required_columns = ['open', 'high', 'low', 'close', '5_EMA', '10_EMA', '20_EMA', 'RSI']
+    if not all(col in df.columns for col in required_columns):
+        missing = [col for col in required_columns if col not in df.columns]
+        raise ValueError(f"Missing required columns: {missing}")
 
+    # Convert index to datetime and sort
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df = df.reset_index(drop=False)
+        if 'date' not in df.columns:
+            raise KeyError("DataFrame must contain 'date' column for index conversion")
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.set_index('date').sort_index()
+        
+    # Pre-calculate valid indices
+    valid_indices = df.index.tolist()
+    
+    for i, current_dt in enumerate(valid_indices):
+        try:
+            row = df.loc[current_dt]
+            
+            # ====================
+            # ENTRY CONDITION CHECK
+            # ====================
+            if check_entry_conditions(df, current_dt):
+                # Position sizing safeguards
+                position_size = min(
+                    engine.balance * 0.02,
+                    engine.balance - 100,
+                    key=lambda x: x if x > 0 else 0
+                )
+                
+                if row['close'] <= 0 or pd.isna(row['close']):
+                    logger.error(f"Skipping invalid price at {current_dt}")
+                    continue
+                    
+                shares = max(0.01, position_size / row['close'])
+                
+                # Execute buy order
+                trade = engine.execute_trade(symbol, row['close'], shares, 'BUY', current_dt)
+                
+                logger.info(
+                    f"BUY | {symbol} | Size: ${trade['position_value']:.2f} "
+                    f"| Shares: {trade['shares']:.2f} | Balance%: {trade['position_pct']:.2f}% "
+                    f"| Price: ${trade['price']:.2f} | New Balance: ${trade['new_balance']:.2f}"
+                )
+
+            # ===================
+            # EXIT CONDITION CHECK
+            # ===================
+            if engine.current_position and check_exit_conditions(df, current_dt):
+                # Validate technical indicators
+                if any(pd.isna(row[col]) for col in ['5_EMA', '10_EMA', 'RSI', 'close']):
+                    logger.error(f"Skipping exit due to missing data at {current_dt}")
+                    continue
+                    
+                # Execute sell order
+                trade = engine.execute_trade(
+                    symbol, 
+                    row['close'], 
+                    engine.current_position['shares'], 
+                    'SELL', 
+                    current_dt
+                )
+                
+                logger.info(
+                    f"SELL | {symbol} | PnL: ${trade['pnl']:.2f} "
+                    f"| Return: {trade['pnl_pct']:.2f}% | Price: ${trade['price']:.2f} "
+                    f"| New Balance: ${trade['new_balance']:.2f}"
+                )
+
+        except KeyError as ke:
+            logger.error(f"Data access error: {str(ke)}")
+            break
+        except IndexError as ie:
+            logger.error(f"Index mismatch at position {i}/{len(df)}: {str(ie)}")
+            break
+        except ZeroDivisionError:
+            logger.error(f"Zero price encountered at {current_dt}")
+            break
+        except Exception as e:
+            logger.error(f"Critical error at {current_dt}: {str(e)}")
+            raise
+
+    # Post-backtest cleanup
+    if engine.current_position:
+        logger.warning(f"Exiting remaining position at market close")
+        last_price = df.iloc[-1]['close']
+        trade = engine.execute_trade(
+            symbol, 
+            last_price, 
+            engine.current_position['shares'], 
+            'SELL', 
+            df.index[-1]
+        )
+
+# =====================
+# MAIN EXECUTION
+# =====================
 def main():
-    global symbol
-    # Connect to TWS
     ib = IB()
-    symbol = 'F' # Default Ticker
     ib.connect('127.0.0.1', 7497, clientId=1)
 
-    logger.info(f"Starting data collection for {symbol}")
-    
     try:
-        df_5m, df_15m, df_30m = get_historical_data(ib, symbol)
-        plot_candlestick(df_5m, df_15m, df_30m)
-        logger.info(f"Successfully completed data collection and plotting for {symbol}")
+        # Backtest mode
+        daily_data = get_historical_data(ib, symbol, backtest=True)
+        run_backtest(daily_data)
+        plot_candlestick(daily_data, backtest=True)
+        
+        # Real-time mode
+        df_5m, df_30m, df_1h = get_historical_data(ib, symbol)
+        plot_candlestick(df_5m)
+        
     except Exception as e:
-        logger.error(f"Error occurred: {str(e)}")
+        logger.error(f"Execution error: {str(e)}")
     finally:
         ib.disconnect()
-        logger.info("Disconnected from TWS")
+        logger.info("Final Balance: $%.2f | Total Trades: %d", 
+                   engine.balance, len(engine.trade_history))
 
 if __name__ == "__main__":
     main()
