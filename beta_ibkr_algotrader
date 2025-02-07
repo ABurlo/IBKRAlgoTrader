@@ -84,46 +84,140 @@ initial_balance = 10000
 # CALENDAR VISUALISATION
 # ====================
 def plot_pnl_calendar(engine, start_date, end_date):
-    """Creates calendar heatmap showing daily PNL performance"""
-    # Convert dates to UTC timezone
+    """
+    Creates a square calendar heatmap with daily PNL performance and day numbers.
+    """
+    # Convert dates to UTC timezone and then remove timezone info for easier handling
     start_date = start_date.astimezone(pytz.UTC).replace(tzinfo=None)
     end_date = end_date.astimezone(pytz.UTC).replace(tzinfo=None)
-    
+
     # Create UTC-based date range
     date_range = pd.date_range(start=start_date, end=end_date, freq='D', tz='UTC')
-    
-    # Convert engine dates to UTC for matching
+
+    # Convert engine dates to UTC for matching and ensure dates are timezone-naive
     pnl_data = {
-        pd.Timestamp(k).tz_localize('UTC').date(): v 
+        pd.Timestamp(k).tz_localize('UTC').date(): v
         for k, v in engine.daily_pnl.items()
     }
-    
+
+    # Create a series with PNL data, filling missing dates with 0.0
     pnl_series = pd.Series(
         [pnl_data.get(d.date(), 0.0) for d in date_range],
-        index=date_range.tz_convert(None)  # Remove tz for calplot compatibility
+        index=date_range.tz_convert(None)  # Remove tz for compatibility
     )
-    
-    # Rest of the function remains the same
-    pnl_sign = pnl_series.apply(
-        lambda x: 1 if x > 0 else (-1 if x < 0 else np.nan)
-    )
-    
-    cmap = ListedColormap(['#ff4444', '#44ff44'])
-    
-    plt.figure(figsize=(16, 10))
-    calplot.calplot(
-        pnl_sign,
-        cmap=cmap,
-        fillcolor='whitesmoke',
-        how='sum',
-        edgecolor='white',
-        linewidth=0.5,
-        daylabels='MTWTFSS',
-        dayticks=[0, 2, 4, 6],
-        monthticks=True,
-        dropzero=True
-    )
-    plt.title(f'Daily Trading Performance: {start_date.year}', pad=20)
+
+    # Calculate PNL percentages
+    pnl_percentages = pnl_series / initial_balance * 100
+
+    # Plot configuration
+    box_size = 1.0  # Set box size for square appearance
+    fig_width = 8
+    fig_height = 8 * ((len(date_range) + 6) // 7) / 7 # Adjust height dynamically
+
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+
+    # Calendar layout variables
+    day_number = 1
+    current_col = 0
+    current_row = 0
+
+    # Date range for the entire period
+    all_days_in_range = pd.date_range(start=start_date, end=end_date)
+
+    # Plot each day
+    for day in all_days_in_range:
+        pnl = pnl_data.get(day.date(), 0.0)
+        color = '#44ff44' if pnl > 0 else '#ff4444' if pnl < 0 else 'whitesmoke'
+
+        # Draw the rectangle with a border
+        rect = plt.Rectangle((current_col, current_row), box_size, box_size,
+                             facecolor=color, edgecolor='gray', linewidth=0.5)
+        ax.add_patch(rect)
+
+        # Text placement
+        text_color = 'black'
+
+        # Display PNL and percentage change if PNL is significant
+        if abs(pnl) > 0.01: # Only show PNL if it is greater than 0.01
+            ax.text(
+                current_col + box_size / 2,
+                current_row + box_size * 0.7,
+                f"${pnl:.2f}",
+                ha='center',
+                va='center',
+                fontsize=8,
+                color=text_color
+            )
+
+            sign_pnl_pct = '+' if pnl > 0 else '-'
+            ax.text(
+                current_col + box_size / 2,
+                current_row + box_size * 0.3,
+                f"{sign_pnl_pct}{pnl_percentages[day]:.2f}%",
+                ha='center',
+                va='center',
+                fontsize=8,
+                color=text_color
+            )
+
+        # Day number in top-left
+        ax.text(
+            current_col + box_size * 0.1,
+            current_row + box_size * 0.9,
+            f"{day_number}",
+            ha='left',
+            va='top',
+            fontsize=7,
+            color='gray'
+        )
+
+        day_number += 1
+        current_col += 1
+
+        # Move to the next row
+        if current_col > 6:
+            current_col = 0
+            current_row += 1
+
+    # Month labels
+    months = pd.date_range(start=start_date, end=end_date, freq='MS')
+    month_names = [month.strftime('%b') for month in months]
+    month_start_pos = []
+
+    for month in months:
+        day_diff = (month.date() - all_days_in_range[0].date()).days
+        row_start = day_diff // 7
+        col_start = day_diff % 7
+        month_start_pos.append((col_start, row_start))
+
+    # Axis configuration
+    ax.set_xlim(0, 7)
+    ax.set_ylim(current_row + 1, 0)  # Invert y-axis
+
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+    # Position month names
+    for i, month in enumerate(month_names):
+        col, row = month_start_pos[i]
+        ax.text(
+            col + 0.1,
+            row - 0.2,
+            month,
+            ha='left',
+            va='top',
+            fontsize=9,
+            color='black',
+            rotation=0
+        )
+
+    # Grid lines
+    ax.set_xticks(np.arange(0, 7, 1), minor=False)
+    ax.set_yticks(np.arange(0, current_row + 1, 1), minor=False)
+    ax.grid(which='both', color='black', linewidth=0.5)
+
+    plt.title(f"Daily Trading Performance: {start_date.year}", pad=20)
+    plt.tight_layout()
     plt.show()
 
 # =====================
