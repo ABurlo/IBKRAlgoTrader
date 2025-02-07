@@ -83,65 +83,82 @@ initial_balance = 10000
 # ====================
 # CALENDAR VISUALISATION
 # ====================
-def plot_pnl_calendar(engine, start_date, end_date):
+def plot_pnl_calendar(engine, start_date, end_date, initial_balance):
     """
-    Creates a square calendar heatmap with daily PNL performance and day numbers.
+    Creates a square calendar heatmap visualizing daily PNL, trade stats, and day/month context.
     """
-    # Convert dates to UTC timezone and then remove timezone info for easier handling
-    start_date = start_date.astimezone(pytz.UTC).replace(tzinfo=None)
-    end_date = end_date.astimezone(pytz.UTC).replace(tzinfo=None)
 
-    # Create UTC-based date range
+    # Standardize and sanitize date inputs with timezone handling
+    start_date = pd.Timestamp(start_date).replace(hour=0, minute=0, second=0, microsecond=0)
+    start_date = start_date.tz_convert('UTC')
+
+    end_date = pd.Timestamp(end_date).replace(hour=23, minute=59, second=59, microsecond=999)
+    end_date = end_date.tz_convert('UTC')
+
+    # Generate a comprehensive daily date range
     date_range = pd.date_range(start=start_date, end=end_date, freq='D', tz='UTC')
 
-    # Convert engine dates to UTC for matching and ensure dates are timezone-naive
+    # Harmonize PNL data with timezone-aware keys
     pnl_data = {
-        pd.Timestamp(k).tz_localize('UTC').date(): v
+        pd.Timestamp(k, tz='UTC').date(): v
         for k, v in engine.daily_pnl.items()
     }
 
-    # Create a series with PNL data, filling missing dates with 0.0
+    # Create a time-series for daily PNL, defaulting missing days to zero
     pnl_series = pd.Series(
         [pnl_data.get(d.date(), 0.0) for d in date_range],
-        index=date_range.tz_convert(None)  # Remove tz for compatibility
+        index=date_range
     )
 
-    # Calculate PNL percentages
+    # Compute PNL percentages relative to initial balance
     pnl_percentages = pnl_series / initial_balance * 100
 
-    # Plot configuration
-    box_size = 1.0  # Set box size for square appearance
-    fig_width = 8
-    fig_height = 8 * ((len(date_range) + 6) // 7) / 7 # Adjust height dynamically
+    # Visual styling parameters
+    box_size = 1.0
+    fig_width = 10
+    fig_height = 8 * ((len(date_range) + 6) // 7) / 7  # Height adjusts to date range
 
+    # Initialize plot
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
 
-    # Calendar layout variables
-    day_number = 1
-    current_col = 0
+    # Calendar layout starting points
+    current_col = start_date.weekday()
     current_row = 0
+    day_number = 1
 
-    # Date range for the entire period
-    all_days_in_range = pd.date_range(start=start_date, end=end_date)
+    # Day labels for the header row
+    day_letters = ['M', 'Tu', 'W', 'Th', 'F', 'Sa', 'Su']
 
-    # Plot each day
-    for day in all_days_in_range:
+    # Day letter header
+    for i, day_letter in enumerate(day_letters):
+        ax.text(i + 0.5, -0.7, day_letter, ha='center', va='center', fontsize=10, color='dimgray')
+
+    # Loop through each day in the date range
+    for day in date_range:
         pnl = pnl_data.get(day.date(), 0.0)
-        color = '#44ff44' if pnl > 0 else '#ff4444' if pnl < 0 else 'whitesmoke'
+        color = '#5cb85c' if pnl > 0 else '#d9534f' if pnl < 0 else 'whitesmoke'
 
-        # Draw the rectangle with a border
+        # Render day rectangle
         rect = plt.Rectangle((current_col, current_row), box_size, box_size,
-                             facecolor=color, edgecolor='gray', linewidth=0.5)
+                             facecolor=color, edgecolor='lightgray', linewidth=0.5)
         ax.add_patch(rect)
 
-        # Text placement
+        # Consistent text color
         text_color = 'black'
 
-        # Display PNL and percentage change if PNL is significant
-        if abs(pnl) > 0.01: # Only show PNL if it is greater than 0.01
+        # Collect daily trade stats
+        trade_date = day.date()
+        trades_today = [trade for trade in engine.trade_history if pd.Timestamp(trade['timestamp']).tz_convert('UTC').date() == trade_date]
+        num_trades = len(trades_today)
+        winning_trades = sum(1 for trade in trades_today if trade.get('pnl', 0) > 0)
+        losing_trades = num_trades - winning_trades
+        win_rate = (winning_trades / num_trades) * 100 if num_trades > 0 else 0
+
+        # Display PNL and trade statistics, if trades occurred
+        if num_trades > 0:  # Only display stats if trades occurred
             ax.text(
                 current_col + box_size / 2,
-                current_row + box_size * 0.7,
+                current_row + box_size * 0.75,
                 f"${pnl:.2f}",
                 ha='center',
                 va='center',
@@ -149,18 +166,37 @@ def plot_pnl_calendar(engine, start_date, end_date):
                 color=text_color
             )
 
-            sign_pnl_pct = '+' if pnl > 0 else '-'
             ax.text(
                 current_col + box_size / 2,
-                current_row + box_size * 0.3,
-                f"{sign_pnl_pct}{pnl_percentages[day]:.2f}%",
+                current_row + box_size * 0.45,
+                f"#Trades: {num_trades}",
                 ha='center',
                 va='center',
-                fontsize=8,
+                fontsize=7,
                 color=text_color
             )
 
-        # Day number in top-left
+            ax.text(
+                current_col + box_size / 2,
+                current_row + box_size * 0.15,
+                f"Win: {win_rate:.0f}%  {winning_trades}/{losing_trades}",
+                ha='center',
+                va='center',
+                fontsize=7,
+                color=text_color
+            )
+        else:
+            ax.text(
+                current_col + box_size / 2,
+                current_row + box_size * 0.45,
+                "No Trades",
+                ha='center',
+                va='center',
+                fontsize=7,
+                color=text_color
+            )
+
+        # Print day number
         ax.text(
             current_col + box_size * 0.1,
             current_row + box_size * 0.9,
@@ -168,13 +204,14 @@ def plot_pnl_calendar(engine, start_date, end_date):
             ha='left',
             va='top',
             fontsize=7,
-            color='gray'
+            color='dimgray'
         )
 
+        # Update counters
         day_number += 1
         current_col += 1
 
-        # Move to the next row
+        # Row increment
         if current_col > 6:
             current_col = 0
             current_row += 1
@@ -184,20 +221,21 @@ def plot_pnl_calendar(engine, start_date, end_date):
     month_names = [month.strftime('%b') for month in months]
     month_start_pos = []
 
+    # Month label positioning
     for month in months:
-        day_diff = (month.date() - all_days_in_range[0].date()).days
+        day_diff = (month.normalize() - date_range[0].normalize()).days
         row_start = day_diff // 7
-        col_start = day_diff % 7
+        col_start = (day_diff % 7)
         month_start_pos.append((col_start, row_start))
 
-    # Axis configuration
+    # Configure axis
     ax.set_xlim(0, 7)
-    ax.set_ylim(current_row + 1, 0)  # Invert y-axis
+    ax.set_ylim(current_row + 1, -1)
 
     ax.set_xticks([])
     ax.set_yticks([])
 
-    # Position month names
+    # Add month labels
     for i, month in enumerate(month_names):
         col, row = month_start_pos[i]
         ax.text(
@@ -211,13 +249,16 @@ def plot_pnl_calendar(engine, start_date, end_date):
             rotation=0
         )
 
-    # Grid lines
+    # Grid
     ax.set_xticks(np.arange(0, 7, 1), minor=False)
     ax.set_yticks(np.arange(0, current_row + 1, 1), minor=False)
-    ax.grid(which='both', color='black', linewidth=0.5)
+    ax.grid(which='both', color='lightgray', linewidth=0.5)
 
-    plt.title(f"Daily Trading Performance: {start_date.year}", pad=20)
+    # Set the title with month and year
+    title = f"Trading Performance: {start_date.strftime('%B %Y')}"
+    plt.title(title, pad=20, fontsize=14)
     plt.tight_layout()
+    plt.subplots_adjust(top=0.9) # Shift title up
     plt.show()
 
 # =====================
@@ -866,55 +907,58 @@ def run_backtest(df_tuple):
 def main():
     ib = IB()
     ib.connect('127.0.0.1', 7497, clientId=1)
+
+    start_date = None  # Initialize start_date to None
+    end_date = None    # Initialize end_date to None
     try:
         # Backtest mode
         daily_data = get_historical_data(ib, symbol, backtest=True)
         run_backtest(daily_data)
         plot_candlestick(daily_data, backtest=True)
-        
+
         # Real-time mode
         df_5m, df_30m, df_1h = get_historical_data(ib, symbol)
         plot_candlestick(df_5m)
-        
+
     except Exception as e:
         logger.error(f"Execution error: {str(e)}")
     finally:
         if 'ib' in locals() and ib.isConnected():
             ib.disconnect()
-            
+
             if engine.trade_history:
                 trade_history = pd.DataFrame(engine.trade_history)
-                
+
                 # Calculate performance metrics
                 total_trades = len(trade_history)
                 profitable_trades = (trade_history['pnl'] > 0).sum()
                 losing_trades = (trade_history['pnl'] < 0).sum()
                 win_rate = (trade_history['pnl'] > 0).mean() * 100
-                
+
                 # Calculate returns and risk metrics
                 total_pnl = trade_history['pnl'].sum()
                 returns = trade_history['pnl'] / initial_balance
                 annualized_return = ((engine.balance/initial_balance) ** (252/len(returns)) - 1) * 100
                 volatility = returns.std() * np.sqrt(252)
-                
+
                 # Calculate Sharpe and Sortino ratios
                 risk_free_rate = 0.02  # 2% annual risk-free rate
                 excess_returns = returns - (risk_free_rate/252)
                 sharpe_ratio = np.sqrt(252) * excess_returns.mean() / returns.std()
                 downside_returns = returns[returns < 0]
                 sortino_ratio = np.sqrt(252) * excess_returns.mean() / downside_returns.std()
-                
+
                 # Calculate drawdown
                 cumulative_returns = (1 + returns).cumprod()
                 rolling_max = cumulative_returns.expanding().max()
                 drawdowns = (cumulative_returns - rolling_max) / rolling_max
                 max_drawdown = drawdowns.min() * 100
-                
+
                 # Calculate trade statistics
                 avg_profit = trade_history[trade_history['pnl'] > 0]['pnl'].mean()
                 avg_loss = abs(trade_history[trade_history['pnl'] < 0]['pnl'].mean())
                 profit_factor = abs(trade_history[trade_history['pnl'] > 0]['pnl'].sum()) / abs(trade_history[trade_history['pnl'] < 0]['pnl'].sum())
-                
+
                 logger.info(f"Total Trades: {total_trades}")
                 logger.info(f"Profitable Trades: {profitable_trades}")
                 logger.info(f"Losing Trades: {losing_trades}")
@@ -929,10 +973,14 @@ def main():
                 logger.info(f"Average Loss: ${avg_loss:.2f}")
                 logger.info(f"Profit Factor: {profit_factor:.2f}")
 
-                # In main() function:
-                start_date = trade_history['timestamp'].min().to_pydatetime().astimezone(pytz.UTC)
-                end_date = trade_history['timestamp'].max().to_pydatetime().astimezone(pytz.UTC)
-                plot_pnl_calendar(engine, start_date, end_date)
+                # Ensure trade_history['timestamp'] exists and is not empty
+                if 'timestamp' in trade_history.columns and not trade_history['timestamp'].empty:
+                    trade_history['timestamp'] = pd.to_datetime(trade_history['timestamp'], utc=True)
+                    start_date = pd.Timestamp(trade_history['timestamp'].min()).tz_convert('UTC').replace(hour=0, minute=0, second=0, microsecond=0)
+                    end_date = pd.Timestamp(trade_history['timestamp'].max()).tz_convert('UTC').replace(hour=23, minute=59, second=59, microsecond=999)
+                    plot_pnl_calendar(engine, start_date, end_date, initial_balance)
+                else:
+                    logger.warning("No trade history or missing timestamp data. Skipping PNL calendar plot.")
 
 if __name__ == '__main__':
     main()
