@@ -83,86 +83,122 @@ initial_balance = 10000
 # =====================
 # PNL CALENDAR (FIXED)
 # =====================
+# =====================
+# PNL CALENDAR (FIXED)
+# =====================
 def plot_pnl_calendar(engine, start_date, end_date, initial_balance):
     """
-    Generates month-accurate PnL calendar with proper timezone handling.
-    Fixes size mismatches for marker placement and timezone stripping.
+    Generates a detailed PnL calendar, showing Win Rate %, W:L Ratio, 
+    # of Trades, PnL, and color-coded day shading with varying intensity.
     """
     ny_tz = pytz.timezone('America/New_York')
-    cal_data = []  # Container for calendar data
 
-    # Convert to NY timezone and strip timezones for period conversion
-    start = pd.Timestamp(start_date).tz_convert(ny_tz).normalize().tz_localize(None)
-    end = pd.Timestamp(end_date).tz_convert(ny_tz).normalize().tz_localize(None)
+    # Convert start and end dates to NY timezone
+    start = pd.Timestamp(start_date).tz_convert(ny_tz).normalize()
+    end = pd.Timestamp(end_date).tz_convert(ny_tz).normalize()
 
-    # Generate monthly grid
-    months = pd.date_range(
-        start=start.to_period('M').start_time,
-        end=end.to_period('M').end_time,
-        freq='MS'
-    ).tz_localize('America/New_York')
+    # Generate all dates in the range
+    all_dates = pd.date_range(start=start, end=end, freq='D', tz=ny_tz)
 
-    for month_start in months:
-        month_end = (month_start + pd.offsets.MonthEnd(1)).tz_convert(ny_tz)
-        days = pd.date_range(month_start, month_end, freq='D', tz=ny_tz)
+    # Process daily PnL data
+    daily_pnl = pd.DataFrame.from_dict(engine.daily_pnl, orient='index', columns=['pnl'])
+    daily_pnl.index = pd.to_datetime(daily_pnl.index).tz_localize('UTC').tz_convert(ny_tz)
+    daily_pnl = daily_pnl.reindex(all_dates, fill_value=0).reset_index()
+    daily_pnl.rename(columns={'index': 'date'}, inplace=True)
 
-        # Filter trades for the current month
-        month_trades = [
-            t for t in engine.trade_history
-            if month_start <= pd.Timestamp(t['timestamp']).tz_convert(ny_tz) <= month_end
-        ]
-
-        daily_pnl = pd.Series(0.0, index=days)
-        for trade in month_trades:
-            trade_dt = pd.Timestamp(trade['timestamp']).tz_convert(ny_tz).floor('D')
-            if trade_dt in daily_pnl.index:
-                daily_pnl[trade_dt] += trade.get('pnl', 0)
-
-        # Store monthly data
-        cal_data.append(pd.DataFrame({
-            'date': days,
-            'pnl': daily_pnl.values,
-            'weekday': days.dayofweek,
-            'month': days.month
-        }))
-
-    full_calendar = pd.concat(cal_data)
-
-    # Visualization
+    # Add title to the calendar dynamically
+    title = f"{symbol} Trading Performance {start_date.strftime('%B %Y')}"
+    
+    # Visualization with details
     fig, ax = plt.subplots(figsize=(12, 8))
     ax.set_facecolor('#f0f0f0')
 
-    for idx, row in full_calendar.iterrows():
+# Updated Color Logic
+    for i, row in daily_pnl.iterrows():
         date = row['date']
-        col = date.weekday()
-        week_num = (date.day - 1) // 7
-        row_pos = (date.month - full_calendar['month'].min()) * 5 + week_num
+        col = date.weekday()  # Day of the week (Monday=0, Sunday=6)
+        week_num = (date.day - 1) // 7  # Calendar week index
+        row_pos = -week_num  # Inverted y-axis for calendar rows
 
-        # Set color based on PnL
-        color = '#5cb85c' if row.pnl > 0 else '#d9534f' if row.pnl < 0 else 'white'
+        # Filter trades for the specific date
+        trades = [t for t in engine.trade_history if pd.Timestamp(t['timestamp']).date() == date.date()]
+        metrics = calculate_day_metrics(trades)
 
-        # Draw cell
+        # If no trades occurred, set the color to grey
+        if metrics['num_trades'] == 0:
+            color = '#d3d3d3'  # Default grey for no trades
+        else:
+            # Determine cell color intensity based on PnL
+            max_abs_pnl = abs(daily_pnl['pnl']).max()
+            color_intensity = min(1, abs(row.pnl) / max_abs_pnl) if max_abs_pnl > 0 else 0
+            color = (
+                (1 - color_intensity, 0.8, 0.8 - color_intensity)  # Red for losses
+                if row.pnl < 0 else
+                (0.8 - color_intensity, 1, 0.8 - color_intensity)  # Green for gains
+            )
+
+        # Plot cell rectangle
         ax.add_patch(plt.Rectangle(
-            (col, -row_pos), 1, 1,
+            (col, row_pos), 1, 1,
             facecolor=color,
             edgecolor='gray',
             lw=0.5
         ))
 
-        # Add date and PnL labels
-        ax.text(col + 0.05, -row_pos + 0.85, date.day, ha='left', va='top', fontsize=8)
-        if abs(row.pnl) > 0:
-            ax.text(col + 0.5, -row_pos + 0.5, f"${row.pnl:.2f}", ha='center', va='center', fontsize=8)
+        # Add text for metrics
+        ax.text(col + 0.05, row_pos + 0.85, str(date.day), ha='left', va='top', fontsize=8)
+        ax.text(col + 0.5, row_pos + 0.5,
+                f"${row.pnl:.2f}\nW%: {metrics['win_rate']:.2f}%\nTrades: {metrics['num_trades']}",
+                ha='center', va='center', fontsize=6)
 
-    # Configure the axis
+
+    # Configure axis
     ax.set_xlim(-0.5, 6.5)
-    ax.set_ylim(-full_calendar['month'].nunique() * 5, 0.5)
+    ax.set_ylim(-daily_pnl['date'].max().month * 5 - 0.5, 0.5)
     ax.set_xticks(range(7))
     ax.set_xticklabels(['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'])
     ax.set_yticks([])
 
-    #plt.tight_layout()
+    plt.suptitle(title, fontsize=16)
+    plt.tight_layout()
     plt.show()
+
+
+def calculate_day_metrics(trades):
+    """
+    Calculate trading metrics for the calendar (Win Rate %, W:L Ratio, # of Trades, PnL).
+    Enhanced with error handling for missing 'pnl' field.
+    """
+    # Initialize metrics with proper type casting
+    num_trades = len(trades)
+    wins = 0
+    losses = 0
+    pnl = 0.0  # Explicit float initialization
+
+    for t in trades:
+        # Handle missing 'pnl' key with default to 0
+        trade_pnl = t.get('pnl', 0.0)
+        
+        # Track wins/losses
+        if trade_pnl > 0:
+            wins += 1
+        elif trade_pnl < 0:
+            losses += 1
+            
+        # Accumulate PnL
+        pnl += float(trade_pnl)
+
+    # Calculate metrics with division safeguards
+    win_rate = (wins / num_trades * 100) if num_trades > 0 else 0.0
+    win_loss_ratio = (wins / losses) if losses > 0 else float('inf')
+
+    return {
+        'win_rate': round(win_rate, 2),
+        'win_loss_ratio': round(win_loss_ratio, 2) if win_loss_ratio < float('inf') else 'Infinity',
+        'num_trades': num_trades,
+        'pnl': round(pnl, 2)
+    }
+
 
 # =====================
 # BACKTESTING ENGINE
@@ -676,33 +712,35 @@ def plot_candlestick(df, backtest=False):
     # RSI Line with Thresholds
     addplots.append(mpf.make_addplot(
         df['RSI'],
-        panel=1,  # Explicit RSI panel
-        ylabel='RSI',
+        panel=1,
+        ylabel='',  # Leave empty to use only tick labels
         color='#4B0082',  # Indigo
         width=1.2,
         ylim=(0, 100)
     ))
-    
-    # Threshold Lines
-    for level in [30, 70]:
+
+    # Threshold Lines (30, 50, 70)
+    for level in [30, 50, 70]:
         addplots.append(mpf.make_addplot(
             pd.Series(level, index=df.index),
             panel=1,
             color='gray',
             width=0.8,
-            linestyle='--'
+            linestyle='--',
         ))
 
     # ===== 3. VOLUME PANEL (2) =====
+    volume_colors = np.where(df['close'] > df['open'], '#5cb85c', '#d9534f')
+
     addplots.append(mpf.make_addplot(
         df['volume'],
         type='bar',
         panel=2,  # Explicit volume panel
-        color='dimgray',
-        alpha=0.3,
+        color=volume_colors,
+        alpha=0.6,
         ylabel='Volume'
     ))
-
+    
    # ===== TRADE MARKERS =====
     if backtest and engine.trade_markers:
         # Create aligned marker series
