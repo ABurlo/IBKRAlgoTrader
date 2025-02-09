@@ -314,7 +314,7 @@ class BacktestEngine:
 
         # Append the trade to history regardless of the action
         self.trade_history.append(trade)
-        logger.info(f"{action} executed: {trade}")
+        #logger.info(f"{action} executed: {trade}")
         return trade
 
 def close_position_eod(self, eod_price, timestamp):
