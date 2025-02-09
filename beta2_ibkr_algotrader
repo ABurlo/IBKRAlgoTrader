@@ -138,7 +138,6 @@ def plot_pnl_calendar(engine, start_date, end_date, initial_balance, symbol):
         num_weeks = ((month_end.day + first_day_offset - 1) // 7) + 1
 
         # Plot each day
-        # Inside your loop for plotting each day
         for i, row in daily_pnl.iterrows():
             date = row['date']
             col = date.weekday()  # Day of the week (Monday=0, Sunday=6)
@@ -146,37 +145,48 @@ def plot_pnl_calendar(engine, start_date, end_date, initial_balance, symbol):
             week_num = (day_of_month + first_day_offset - 1) // 7
             row_pos = -week_num
 
-            # Filter trades for the specific date
-            trades = [t for t in engine.trade_history if pd.Timestamp(t['timestamp']).date() == date.date()]
-            
-            # Calculate metrics for the day
-            metrics = calculate_day_metrics(trades)
-
-            # If no trades occurred, set the color to grey
-            if metrics['num_trades'] == 0:
-                color = '#d3d3d3'  # Default grey for no trades
+            # Check if the day is Saturday (5) or Sunday (6)
+            if col in [5, 6]:
+                color = '#000000'  # Solid black
+                # Plot cell rectangle
+                ax.add_patch(plt.Rectangle(
+                    (col, row_pos), 1, 1,
+                    facecolor=color,
+                    edgecolor='gray',
+                    lw=0.5
+                ))
             else:
-                # Determine cell color intensity based on PnL
-                max_abs_pnl = abs(daily_pnl['pnl']).max()
-                color_intensity = min(1, abs(row.pnl) / max_abs_pnl) if max_abs_pnl > 0 else 0
-                color = (
-                    (1 - color_intensity, 0.8, 0.8 - color_intensity) if row.pnl < 0 else
-                    (0.8 - color_intensity, 1, 0.8 - color_intensity)
-                )
+                # Filter trades for the specific date
+                trades = [t for t in engine.trade_history if pd.Timestamp(t['timestamp']).date() == date.date()]
 
-            # Plot cell rectangle
-            ax.add_patch(plt.Rectangle(
-                (col, row_pos), 1, 1,
-                facecolor=color,
-                edgecolor='gray',
-                lw=0.5
-            ))
+                # Calculate metrics for the day
+                metrics = calculate_day_metrics(trades)
 
-            # Add text for metrics
-            ax.text(col + 0.05, row_pos + 0.85, str(day_of_month), ha='left', va='top', fontsize=8)
-            ax.text(col + 0.5, row_pos + 0.5,
-                    f"${row.pnl:.2f}\nW%: {metrics['win_rate']:.2f}%\nTrades: {metrics['num_trades']}",
-                    ha='center', va='center', fontsize=6)
+                # If no trades occurred, set the color to grey
+                if metrics['num_trades'] == 0:
+                    color = '#d3d3d3'  # Default grey for no trades
+                else:
+                    # Determine cell color intensity based on PnL
+                    max_abs_pnl = abs(daily_pnl['pnl']).max()
+                    color_intensity = min(1, abs(row.pnl) / max_abs_pnl) if max_abs_pnl > 0 else 0
+                    color = (
+                        (1 - color_intensity, 0.8, 0.8 - color_intensity) if row.pnl < 0 else
+                        (0.8 - color_intensity, 1, 0.8 - color_intensity)
+                    )
+
+                # Plot cell rectangle
+                ax.add_patch(plt.Rectangle(
+                    (col, row_pos), 1, 1,
+                    facecolor=color,
+                    edgecolor='gray',
+                    lw=0.5
+                ))
+
+                # Add text for metrics
+                ax.text(col + 0.05, row_pos + 0.85, str(day_of_month), ha='left', va='top', fontsize=8)
+                ax.text(col + 0.5, row_pos + 0.5,
+                        f"${row.pnl:.2f}\nW%: {metrics['win_rate']:.2f}%\nTrades: {metrics['num_trades']}",
+                        ha='center', va='center', fontsize=6)
 
         # Configure axis limits and labels
         ax.set_xlim(-0.5, 6.5)
