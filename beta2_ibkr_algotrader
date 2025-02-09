@@ -81,87 +81,113 @@ symbol = "PEP"
 initial_balance = 10000
 
 # =====================
+# MARKET CLOSURE WARNING
+# =====================
+def is_market_close(index):
+    """Check if current time is near market close"""
+    market_close_time = time(16, 0)  # 4 PM ET
+    current_time = index.time()
+    
+    # Create dummy datetime for comparison
+    dummy_date = datetime.today().date()
+    market_close = datetime.combine(dummy_date, market_close_time)
+    comparison_time = datetime.combine(dummy_date, current_time)
+    
+    time_delta = timedelta(minutes=10)
+    return (market_close - time_delta).time() <= current_time <= market_close.time()
+
+# =====================
 # PNL CALENDAR (FIXED)
 # =====================
-# =====================
-# PNL CALENDAR (FIXED)
-# =====================
-def plot_pnl_calendar(engine, start_date, end_date, initial_balance):
+import pandas as pd
+import matplotlib.pyplot as plt
+import pytz
+
+def plot_pnl_calendar(engine, start_date, end_date, initial_balance, symbol):
     """
-    Generates a detailed PnL calendar, showing Win Rate %, W:L Ratio, 
-    # of Trades, PnL, and color-coded day shading with varying intensity.
+    Generates a detailed PnL calendar for each month within the specified date range, 
+    showing Win Rate %, W:L Ratio, # of Trades, PnL, and color-coded day shading with varying intensity.
     """
     ny_tz = pytz.timezone('America/New_York')
 
     # Convert start and end dates to NY timezone
-    start = pd.Timestamp(start_date).tz_convert(ny_tz).normalize()
-    end = pd.Timestamp(end_date).tz_convert(ny_tz).normalize()
+    start_date = pd.Timestamp(start_date).tz_convert(ny_tz).normalize()
+    end_date = pd.Timestamp(end_date).tz_convert(ny_tz).normalize()
 
-    # Generate all dates in the range
-    all_dates = pd.date_range(start=start, end=end, freq='D', tz=ny_tz)
+    current_date = start_date
+    while current_date <= end_date:
+        # Calculate the end of the current month
+        next_month = current_date.replace(day=1) + pd.DateOffset(months=1)
+        month_end = min(next_month - pd.Timedelta(days=1), end_date)
 
-    # Process daily PnL data
-    daily_pnl = pd.DataFrame.from_dict(engine.daily_pnl, orient='index', columns=['pnl'])
-    daily_pnl.index = pd.to_datetime(daily_pnl.index).tz_localize('UTC').tz_convert(ny_tz)
-    daily_pnl = daily_pnl.reindex(all_dates, fill_value=0).reset_index()
-    daily_pnl.rename(columns={'index': 'date'}, inplace=True)
+        # Generate all dates in the current month
+        all_dates = pd.date_range(start=current_date, end=month_end, freq='D', tz=ny_tz)
 
-    # Add title to the calendar dynamically
-    title = f"{symbol} Trading Performance {start_date.strftime('%B %Y')}"
-    
-    # Visualization with details
-    fig, ax = plt.subplots(figsize=(12, 8))
-    ax.set_facecolor('#f0f0f0')
+        # Process daily PnL data
+        daily_pnl = pd.DataFrame.from_dict(engine.daily_pnl, orient='index', columns=['pnl'])
+        daily_pnl.index = pd.to_datetime(daily_pnl.index).tz_localize('UTC').tz_convert(ny_tz)
+        daily_pnl = daily_pnl.reindex(all_dates, fill_value=0).reset_index()
+        daily_pnl.rename(columns={'index': 'date'}, inplace=True)
 
-# Updated Color Logic
-    for i, row in daily_pnl.iterrows():
-        date = row['date']
-        col = date.weekday()  # Day of the week (Monday=0, Sunday=6)
-        week_num = (date.day - 1) // 7  # Calendar week index
-        row_pos = -week_num  # Inverted y-axis for calendar rows
+        # Add title to the calendar dynamically
+        title = f"{symbol} Trading Performance {current_date.strftime('%B %Y')}"
+        
+        # Visualization with details
+        fig, ax = plt.subplots(figsize=(12, 8))
+        ax.set_facecolor('#f0f0f0')
 
-        # Filter trades for the specific date
-        trades = [t for t in engine.trade_history if pd.Timestamp(t['timestamp']).date() == date.date()]
-        metrics = calculate_day_metrics(trades)
+        # Updated Color Logic
+        for i, row in daily_pnl.iterrows():
+            date = row['date']
+            col = date.weekday()  # Day of the week (Monday=0, Sunday=6)
+            week_num = (date.day - 1) // 7  # Calendar week index
+            row_pos = -week_num  # Inverted y-axis for calendar rows
 
-        # If no trades occurred, set the color to grey
-        if metrics['num_trades'] == 0:
-            color = '#d3d3d3'  # Default grey for no trades
-        else:
-            # Determine cell color intensity based on PnL
-            max_abs_pnl = abs(daily_pnl['pnl']).max()
-            color_intensity = min(1, abs(row.pnl) / max_abs_pnl) if max_abs_pnl > 0 else 0
-            color = (
-                (1 - color_intensity, 0.8, 0.8 - color_intensity)  # Red for losses
-                if row.pnl < 0 else
-                (0.8 - color_intensity, 1, 0.8 - color_intensity)  # Green for gains
-            )
+            # Filter trades for the specific date
+            trades = [t for t in engine.trade_history if pd.Timestamp(t['timestamp']).date() == date.date()]
+            metrics = calculate_day_metrics(trades)
 
-        # Plot cell rectangle
-        ax.add_patch(plt.Rectangle(
-            (col, row_pos), 1, 1,
-            facecolor=color,
-            edgecolor='gray',
-            lw=0.5
-        ))
+            # If no trades occurred, set the color to grey
+            if metrics['num_trades'] == 0:
+                color = '#d3d3d3'  # Default grey for no trades
+            else:
+                # Determine cell color intensity based on PnL
+                max_abs_pnl = abs(daily_pnl['pnl']).max()
+                color_intensity = min(1, abs(row.pnl) / max_abs_pnl) if max_abs_pnl > 0 else 0
+                color = (
+                    (1 - color_intensity, 0.8, 0.8 - color_intensity)  # Red for losses
+                    if row.pnl < 0 else
+                    (0.8 - color_intensity, 1, 0.8 - color_intensity)  # Green for gains
+                )
 
-        # Add text for metrics
-        ax.text(col + 0.05, row_pos + 0.85, str(date.day), ha='left', va='top', fontsize=8)
-        ax.text(col + 0.5, row_pos + 0.5,
-                f"${row.pnl:.2f}\nW%: {metrics['win_rate']:.2f}%\nTrades: {metrics['num_trades']}",
-                ha='center', va='center', fontsize=6)
+            # Plot cell rectangle
+            ax.add_patch(plt.Rectangle(
+                (col, row_pos), 1, 1,
+                facecolor=color,
+                edgecolor='gray',
+                lw=0.5
+            ))
+
+            # Add text for metrics
+            ax.text(col + 0.05, row_pos + 0.85, str(date.day), ha='left', va='top', fontsize=8)
+            ax.text(col + 0.5, row_pos + 0.5,
+                    f"${row.pnl:.2f}\nW%: {metrics['win_rate']:.2f}%\nTrades: {metrics['num_trades']}",
+                    ha='center', va='center', fontsize=6)
 
 
-    # Configure axis
-    ax.set_xlim(-0.5, 6.5)
-    ax.set_ylim(-daily_pnl['date'].max().month * 5 - 0.5, 0.5)
-    ax.set_xticks(range(7))
-    ax.set_xticklabels(['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'])
-    ax.set_yticks([])
+        # Configure axis
+        ax.set_xlim(-0.5, 6.5)
+        ax.set_ylim(-daily_pnl['date'].max().month * 5 - 0.5, 0.5)
+        ax.set_xticks(range(7))
+        ax.set_xticklabels(['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'])
+        ax.set_yticks([])
 
-    plt.suptitle(title, fontsize=16)
-    plt.tight_layout()
-    plt.show()
+        plt.suptitle(title, fontsize=16)
+        plt.tight_layout()
+        plt.show()
+
+        # Move to the first day of the next month
+        current_date = next_month
 
 
 def calculate_day_metrics(trades):
@@ -199,7 +225,6 @@ def calculate_day_metrics(trades):
         'pnl': round(pnl, 2)
     }
 
-
 # =====================
 # BACKTESTING ENGINE
 # =====================
@@ -233,18 +258,19 @@ class BacktestEngine:
         return abs(shares * self.fee_per_share)
 
     def execute_trade(self, ticker, price, shares, action, timestamp):
-        executed_price = self.apply_slippage(price, action=='BUY')
+        executed_price = self.apply_slippage(price, action == 'BUY')
         fees = self.calculate_fees(shares)
         position_value = abs(shares * executed_price)
-        
+
         trade = {
             'timestamp': timestamp,
             'action': action,
             'price': executed_price,
-            'shares': shares,
-            'position_value': position_value,
-            'fees': fees,
-            'new_balance': self.balance
+            'shares': round(shares, 2),  # Ensures rounded values for shares
+            'position_value': round(position_value, 2),
+            'fees': round(fees, 2),
+            'new_balance': round(self.balance, 2),
+            'pnl': 0.0,  # Default PnL is 0.0, updated on 'SELL'
         }
 
         trade_date = pd.Timestamp(timestamp).date()
@@ -252,13 +278,13 @@ class BacktestEngine:
             self.daily_pnl[trade_date] = 0.0
 
         if action == 'SELL' and self.current_position:
-            pnl = (executed_price - self.current_position['entry_price']) * shares
+            pnl = (executed_price - self.current_position['entry_price']) * self.current_position['shares']
             self.daily_pnl[trade_date] += pnl
-            trade['pnl'] = pnl
-            trade['pnl_pct'] = (pnl / self.current_position['entry_price']) * 100
-        
-            self.balance += pnl - fees
-            self.current_position = None # Reset current position on sell
+            trade['pnl'] = round(pnl, 2)
+            trade['pnl_pct'] = round((pnl / self.current_position['entry_price']) * 100, 2)
+
+            self.balance += round(pnl - fees, 2)
+            self.current_position = None  # Reset current position on sell
 
         elif action == 'BUY':
             self.balance -= position_value + fees
@@ -273,9 +299,19 @@ class BacktestEngine:
                 'marker': '↑' if action == 'BUY' else '↓'
             })
 
-        self.trade_history.append(trade)  # Append trade to history
-
+        # Append the trade to history regardless of the action
+        self.trade_history.append(trade)
+        logger.info(f"{action} executed: {trade}")
         return trade
+
+def close_position_eod(self, eod_price, timestamp):
+    """
+    Close any open positions at the end of the trading day.
+    """
+    if self.current_position:
+        shares = self.current_position['shares']
+        trade = self.execute_trade(symbol, eod_price, shares, 'SELL', timestamp)
+        logger.info(f"EOD position closed: {trade}")
 
 # Initialize engine globally
 engine = BacktestEngine()
@@ -302,16 +338,25 @@ def check_entry_conditions(df, index):
         return False
 
 def check_exit_conditions(df, index):
+    """
+    Evaluate exit conditions, including EOD closure.
+    """
     if not engine.current_position:
         return False
-        
+
     row = df.loc[index]
     exit_conditions = [
-        row['1_EMA'] < row['3_EMA'],
+        row['1_EMA'] < row['3_EMA'],  # Normal exit conditions
         row['3_EMA'] < row['8_EMA'],
         row['RSI'] > 70,
         row['close'] < engine.current_position['entry_price'] * 0.98
     ]
+
+    # Add EOD condition to forcefully close any open position
+    if is_market_close(index):
+        logger.info(f"Triggering EOD close at {index}.")
+        return True
+
     return any(exit_conditions)
 
 # =====================
@@ -812,53 +857,40 @@ def plot_candlestick(df, backtest=False):
 # =====================
 # EXECUTION HANDLERS (Critical Fix)
 # =====================
-def run_backtest(df_tuple):
-    """Process backtest data with proper tuple handling"""
-    # Extract DataFrame from tuple or use directly
-    if isinstance(df_tuple, tuple):
-        df = df_tuple[0]  # Use first DataFrame from tuple
-    else:
-        df = df_tuple  # Use DataFrame directly if not a tuple
-    
-    # Convert index to datetime if needed
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df = df.reset_index()
-        df['date'] = pd.to_datetime(df['date'])
-        df = df.set_index('date').sort_index()
-    
-    # Process each timestamp
+def run_backtest(df):
+    """
+    Process backtest data with EOD closure enforcement.
+    """
     for current_dt in df.index:
         try:
-            # Get row data using loc to avoid tuple indexing issues
-            row = df.loc[current_dt]
-            
-            # Entry condition check
+            # Evaluate entry conditions
             if check_entry_conditions(df, current_dt):
-                position_size = min(
-                    engine.balance * 0.02,
-                    engine.balance - 100,
-                    key=lambda x: x if x > 0 else 0
-                )
-                
-                if row.close <= 0 or pd.isna(row.close):
-                    logger.error(f"Skipping invalid price at {current_dt}")
-                    continue
-                    
-                shares = max(0.01, position_size / row.close)
-                trade = engine.execute_trade(symbol, row.close, shares, 'BUY', current_dt)
-                log_trade(trade, symbol)
-            
-            # Exit condition check
-            if engine.current_position and check_exit_conditions(df, current_dt):
+                row = df.loc[current_dt]
+                position_size = engine.balance * 0.02  # 2% of balance
+                shares = max(0.01, position_size / row['close'])
+
                 trade = engine.execute_trade(
-                    symbol, 
-                    row.close,
+                    symbol, row['close'], shares, 'BUY', current_dt
+                )
+                log_trade(trade, symbol)
+
+            # Evaluate exit conditions (including EOD)
+            if engine.current_position and check_exit_conditions(df, current_dt):
+                row = df.loc[current_dt]
+                trade = engine.execute_trade(
+                    symbol,
+                    row['close'],
                     engine.current_position['shares'],
                     'SELL',
                     current_dt
                 )
                 log_trade(trade, symbol)
-                
+
+            # Force EOD position closure
+            if is_market_close(current_dt) and engine.current_position:
+                eod_price = row['close']
+                engine.close_position_eod(eod_price, current_dt)
+
         except Exception as e:
             logger.error(f"Error processing {current_dt}: {str(e)}")
             continue
@@ -893,6 +925,27 @@ def main():
             if engine.trade_history:
                 trade_history = pd.DataFrame(engine.trade_history)
 
+                if 'pnl' not in trade_history.columns:
+                    logger.warning("The trade history does not contain a 'pnl' column. Skipping performance metrics.")
+                else:
+                    total_trades = len(trade_history)
+                    profitable_trades = (trade_history['pnl'] > 0).sum()
+                    losing_trades = (trade_history['pnl'] < 0).sum()
+                    win_rate = (trade_history['pnl'] > 0).mean() * 100
+
+                    # Calculate returns and risk metrics
+                    total_pnl = trade_history['pnl'].sum()
+                    returns = trade_history['pnl'] / initial_balance
+                    annualized_return = ((engine.balance / initial_balance) ** (252 / len(returns)) - 1) * 100
+                    volatility = returns.std() * np.sqrt(252)
+
+                    # Calculate Sharpe and Sortino ratios
+                    risk_free_rate = 0.02  # 2% annual risk-free rate
+                    excess_returns = returns - (risk_free_rate / 252)
+                    sharpe_ratio = np.sqrt(252) * excess_returns.mean() / returns.std()
+                    downside_returns = returns[returns < 0]
+                    sortino_ratio = np.sqrt(252) * excess_returns.mean() / downside_returns.std()
+                    
                 # Calculate performance metrics
                 total_trades = len(trade_history)
                 profitable_trades = (trade_history['pnl'] > 0).sum()
@@ -942,7 +995,7 @@ def main():
                     trade_history['timestamp'] = pd.to_datetime(trade_history['timestamp'], utc=True)
                     start_date = pd.Timestamp(trade_history['timestamp'].min()).tz_convert('UTC').replace(hour=0, minute=0, second=0, microsecond=0)
                     end_date = pd.Timestamp(trade_history['timestamp'].max()).tz_convert('UTC').replace(hour=23, minute=59, second=59, microsecond=999)
-                    plot_pnl_calendar(engine, start_date, end_date, initial_balance)
+                    plot_pnl_calendar(engine, start_date, end_date, initial_balance, symbol)
                 else:
                     logger.warning("No trade history or missing timestamp data. Skipping PNL calendar plot.")
 
