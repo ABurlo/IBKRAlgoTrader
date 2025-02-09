@@ -104,10 +104,6 @@ import matplotlib.pyplot as plt
 import pytz
 
 def plot_pnl_calendar(engine, start_date, end_date, initial_balance, symbol):
-    """
-    Generates a detailed PnL calendar for each month within the specified date range, 
-    showing Win Rate %, W:L Ratio, # of Trades, PnL, and color-coded day shading with varying intensity.
-    """
     ny_tz = pytz.timezone('America/New_York')
 
     # Convert start and end dates to NY timezone
@@ -131,20 +127,29 @@ def plot_pnl_calendar(engine, start_date, end_date, initial_balance, symbol):
 
         # Add title to the calendar dynamically
         title = f"{symbol} Trading Performance {current_date.strftime('%B %Y')}"
-        
+
         # Visualization with details
         fig, ax = plt.subplots(figsize=(12, 8))
         ax.set_facecolor('#f0f0f0')
 
-        # Updated Color Logic
+        # Calculate offset for first day and number of weeks
+        first_day_of_month = current_date.replace(day=1)
+        first_day_offset = first_day_of_month.weekday()  # 0 for Monday, 6 for Sunday
+        num_weeks = ((month_end.day + first_day_offset - 1) // 7) + 1
+
+        # Plot each day
+        # Inside your loop for plotting each day
         for i, row in daily_pnl.iterrows():
             date = row['date']
             col = date.weekday()  # Day of the week (Monday=0, Sunday=6)
-            week_num = (date.day - 1) // 7  # Calendar week index
-            row_pos = -week_num  # Inverted y-axis for calendar rows
+            day_of_month = date.day
+            week_num = (day_of_month + first_day_offset - 1) // 7
+            row_pos = -week_num
 
             # Filter trades for the specific date
             trades = [t for t in engine.trade_history if pd.Timestamp(t['timestamp']).date() == date.date()]
+            
+            # Calculate metrics for the day
             metrics = calculate_day_metrics(trades)
 
             # If no trades occurred, set the color to grey
@@ -155,9 +160,8 @@ def plot_pnl_calendar(engine, start_date, end_date, initial_balance, symbol):
                 max_abs_pnl = abs(daily_pnl['pnl']).max()
                 color_intensity = min(1, abs(row.pnl) / max_abs_pnl) if max_abs_pnl > 0 else 0
                 color = (
-                    (1 - color_intensity, 0.8, 0.8 - color_intensity)  # Red for losses
-                    if row.pnl < 0 else
-                    (0.8 - color_intensity, 1, 0.8 - color_intensity)  # Green for gains
+                    (1 - color_intensity, 0.8, 0.8 - color_intensity) if row.pnl < 0 else
+                    (0.8 - color_intensity, 1, 0.8 - color_intensity)
                 )
 
             # Plot cell rectangle
@@ -169,15 +173,15 @@ def plot_pnl_calendar(engine, start_date, end_date, initial_balance, symbol):
             ))
 
             # Add text for metrics
-            ax.text(col + 0.05, row_pos + 0.85, str(date.day), ha='left', va='top', fontsize=8)
+            ax.text(col + 0.05, row_pos + 0.85, str(day_of_month), ha='left', va='top', fontsize=8)
             ax.text(col + 0.5, row_pos + 0.5,
                     f"${row.pnl:.2f}\nW%: {metrics['win_rate']:.2f}%\nTrades: {metrics['num_trades']}",
                     ha='center', va='center', fontsize=6)
 
-
-        # Configure axis
+        # Configure axis limits and labels
         ax.set_xlim(-0.5, 6.5)
-        ax.set_ylim(-daily_pnl['date'].max().month * 5 - 0.5, 0.5)
+        ax.set_ylim(-num_weeks - 0.5, 0.5)  # Dynamically adjust y-axis based on num_weeks
+
         ax.set_xticks(range(7))
         ax.set_xticklabels(['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'])
         ax.set_yticks([])
@@ -186,9 +190,8 @@ def plot_pnl_calendar(engine, start_date, end_date, initial_balance, symbol):
         plt.tight_layout()
         plt.show()
 
-        # Move to the first day of the next month
+        # Move to next month
         current_date = next_month
-
 
 def calculate_day_metrics(trades):
     """
@@ -204,13 +207,13 @@ def calculate_day_metrics(trades):
     for t in trades:
         # Handle missing 'pnl' key with default to 0
         trade_pnl = t.get('pnl', 0.0)
-        
+
         # Track wins/losses
         if trade_pnl > 0:
             wins += 1
         elif trade_pnl < 0:
             losses += 1
-            
+
         # Accumulate PnL
         pnl += float(trade_pnl)
 
