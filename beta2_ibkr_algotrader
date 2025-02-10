@@ -473,6 +473,13 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         # Calculate indicators
         for window in [1, 3, 8]:
             df[f'{window}_EMA'] = df['close'].ewm(span=window, adjust=False).mean()
+        
+        # ===== MACD CALCULATION =====
+        exp12 = df['close'].ewm(span=12, adjust=False).mean()
+        exp26 = df['close'].ewm(span=26, adjust=False).mean()
+        df['MACD'] = exp12 - exp26
+        df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+        df['Histogram'] = df['MACD'] - df['Signal']
             
         # Calculate RSI
         delta = df['close'].diff()
@@ -528,7 +535,15 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         
         df = df.drop(['vwap_numerator', 'vwap_denominator', 'trading_date'], axis=1)
         
-        # Calculate RSI
+        # ======= ADD THIS SECTION =======
+        # MACD calculation
+        exp12 = df['close'].ewm(span=12, adjust=False).mean()
+        exp26 = df['close'].ewm(span=26, adjust=False).mean()
+        df['MACD'] = exp12 - exp26
+        df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+        df['Histogram'] = df['MACD'] - df['Signal']
+        
+        # RSI calculation (already exists, keep this)
         delta = df['close'].diff()
         gain = delta.where(delta > 0, 0.0)
         loss = -delta.where(delta < 0, 0.0)
@@ -736,14 +751,12 @@ def find_trendlines(df_5m, min_touches=3):
             trendlines['bearish'].append(trend_line)
     
     return trendlines
-
 # =====================
-# VISUALIZATION ENGINE (FIXED)
+# VISUALIZATION ENGINE (UPDATED WITH MACD)
 # =====================
 def plot_candlestick(df, backtest=False):
     """
-    Generates 3-panel chart: Price + RSI + Volume
-    Resolves panel ratios error with explicit structure
+    Generates 4-panel chart: Price + MACD + RSI + Volume
     """
     addplots = []
     ema_colors = {1: 'blue', 3: 'orange', 8: 'red'}
@@ -754,7 +767,7 @@ def plot_candlestick(df, backtest=False):
             df[f'{ema}_EMA'],
             color=ema_colors[ema],
             width=1.5,
-            panel=0,  # Force price panel
+            panel=0,
             alpha=0.8
         ))
     
@@ -766,54 +779,76 @@ def plot_candlestick(df, backtest=False):
         linestyle='--'
     ))
 
-    # ===== 2. RSI PANEL (1) =====
-    # RSI Line with Thresholds
+    # ===== 2. MACD PANEL (1) =====
+    # MACD Line
+    addplots.append(mpf.make_addplot(
+        df['MACD'],
+        panel=1,
+        color='#1f77b4',  # Blue
+        width=1.2
+    ))
+    
+    # Signal Line
+    addplots.append(mpf.make_addplot(
+        df['Signal'],
+        panel=1,
+        color='#ff7f0e',  # Orange
+        width=1.2
+    ))
+    
+    # Histogram (Bullish/Bearish coloring)
+    macd_hist_colors = np.where(df['Histogram'] >= 0, '#4B8C08', '#D83B2D')
+    addplots.append(mpf.make_addplot(
+        df['Histogram'],
+        type='bar',
+        panel=1,
+        color=macd_hist_colors,
+        alpha=0.6,
+        width=0.7
+    ))
+
+    # ===== 3. RSI PANEL (2) =====
     addplots.append(mpf.make_addplot(
         df['RSI'],
-        panel=1,
-        ylabel='',  # Leave empty to use only tick labels
-        color='#4B0082',  # Indigo
+        panel=2,
+        color='#4B0082',
         width=1.2,
         ylim=(0, 100)
     ))
-
+    
     # Threshold Lines (30, 50, 70)
     for level in [30, 50, 70]:
         addplots.append(mpf.make_addplot(
             pd.Series(level, index=df.index),
-            panel=1,
+            panel=2,
             color='gray',
             width=0.8,
             linestyle='--',
         ))
 
-    # ===== 3. VOLUME PANEL (2) =====
+    # ===== 4. VOLUME PANEL (3) =====
     volume_colors = np.where(df['close'] > df['open'], '#5cb85c', '#d9534f')
-
     addplots.append(mpf.make_addplot(
         df['volume'],
         type='bar',
-        panel=2,  # Explicit volume panel
+        panel=3,
         color=volume_colors,
         alpha=0.6,
         ylabel='Volume'
     ))
     
-   # ===== TRADE MARKERS =====
+    # ===== TRADE MARKERS =====
     if backtest and engine.trade_markers:
-        # Create aligned marker series
         marker_series = pd.Series(
             data=np.nan,
             index=df.index.copy().tz_convert('America/New_York')
         )
         
-        # Populate markers
         for trade in engine.trade_markers:
             trade_time = pd.to_datetime(trade['date']).tz_convert('America/New_York')
-            if trade_time in marker_series.index:  # Only plot markers with matching timestamps
+            if trade_time in marker_series.index:
                 marker_series[trade_time] = trade['price']
         
-        # Add arrow markers with proper alignment
         addplots.append(mpf.make_addplot(
             marker_series,
             type='scatter',
@@ -831,9 +866,9 @@ def plot_candlestick(df, backtest=False):
             panel=0
         ))
 
-    # ===== PLOT CONFIGURATION =====
+    # ===== STYLE CONFIGURATION =====
     mc = mpf.make_marketcolors(
-        up='#006400', down='#8B0000',  # Dark green/red
+        up='#006400', down='#8B0000',
         edge='inherit', wick='inherit',
         volume={'up':'#006400', 'down':'#8B0000'}
     )
@@ -845,21 +880,26 @@ def plot_candlestick(df, backtest=False):
         facecolor='white'
     )
 
-    # ===== EXECUTE PLOT WITH 3 PANELS =====
+    # ===== EXECUTE PLOT =====
     fig, axlist = mpf.plot(
         df,
         type='candle',
         style=s,
         addplot=addplots,
-        volume=False,  # Handled in addplots
-        panel_ratios=(6,2,2),  # Price:6, RSI:2, Volume:2
-        figsize=(14, 8),
+        volume=False,
+        panel_ratios=(6,3,2,2),  # Price:6, MACD:3, RSI:2, Volume:2
+        figsize=(14, 10),
         returnfig=True
     )
     
     # ===== PANEL ANNOTATIONS =====
-    # RSI Threshold Labels
-    ax_rsi = axlist[1]
+    # MACD Panel
+    ax_macd = axlist[1]
+    ax_macd.axhline(0, color='gray', ls='--', alpha=0.7)
+    ax_macd.set_ylabel('MACD', rotation=90, labelpad=40)
+    
+    # RSI Panel
+    ax_rsi = axlist[2]
     ax_rsi.axhline(30, color='gray', ls='--', alpha=0.7)
     ax_rsi.axhline(70, color='gray', ls='--', alpha=0.7)
     ax_rsi.text(0.01, 0.95, 'Overbought (70)', transform=ax_rsi.transAxes, color='gray')
