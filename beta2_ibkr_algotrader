@@ -77,7 +77,7 @@ class LLDict(MutableMapping):  # FIX: Replaced DictAbstract with MutableMapping
 # =====================
 # GLOBAL CONFIGURATION
 # =====================
-symbol = "PEP"
+symbol = "MSFT"
 initial_balance = 10000
 
 # =====================
@@ -256,6 +256,12 @@ class BacktestEngine:
             'rsi_threshold': False,
             'position_status': False
         }
+        self.williams_params = {
+            'lookback': 14,
+            'oversold': -80,
+            'overbought': -20,
+            'confirmation_bars': 3
+        }
 
     def apply_slippage(self, price, is_buy):
         """
@@ -335,6 +341,7 @@ engine = BacktestEngine()
 def check_entry_conditions(df, index):
     try:
         row = df.loc[index]
+        williams_condition = row['Williams_%R'] < -80 
         # Verify market hours (9:30 AM to 4:00 PM ET)
         if not (time(9,30) <= index.time() <= time(16,0)):
             return False
@@ -343,9 +350,12 @@ def check_entry_conditions(df, index):
             'ema_order': (row['1_EMA'] > row['3_EMA'] > row['8_EMA'] > row['VWAP']),
             'rsi_threshold': row['RSI'] < 70,
             'position_status': not engine.current_position,
-            'valid_vwap': pd.notnull(row['VWAP'])
-        }
-        return all(conditions.values())
+            'valid_vwap': pd.notnull(row['VWAP']),
+            'williams_oversold': row['Williams_%R'] < -80,
+            'williams_trend': row['Williams_%R_diff'] > 0  # Use precomputed diff
+        } 
+        
+        return all(conditions.values()) and williams_condition
     except KeyError as e:
         logger.error(f"Missing indicator column: {str(e)}")
         return False
@@ -362,6 +372,8 @@ def check_exit_conditions(df, index):
         row['1_EMA'] < row['3_EMA'],  # Normal exit conditions
         row['3_EMA'] < row['8_EMA'],
         row['RSI'] > 70,
+        row['Williams_%R'] > -20,
+        row['Williams_%R_diff'] < 0,  # Use precomputed diff
         row['close'] < engine.current_position['entry_price'] * 0.98
     ]
 
@@ -453,7 +465,7 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         bars = ib.reqHistoricalData(
             contract,
             endDateTime='',  # Remove potential timezone info
-            durationStr='7 D',
+            durationStr='365 D',
             barSizeSetting='1 hour',
             whatToShow='TRADES',
             useRTH=True,
@@ -496,9 +508,12 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         df['cumulative_tp_vol'] = df.groupby('trading_date')['tp_vol'].cumsum()
         df['cumulative_vol'] = df.groupby('trading_date')['volume'].cumsum()
         df['VWAP'] = df['cumulative_tp_vol'] / df['cumulative_vol']
-        
+        df['Williams_%R'] = williams_r(df['high'], df['low'], df['close'])
+        df['Williams_%R_diff'] = df['Williams_%R'].diff(3).fillna(0)
         df = df.drop(['tp_vol', 'cumulative_tp_vol', 'cumulative_vol', 'trading_date'], axis=1)
         df.set_index('date', inplace=True)
+        print(df[['1_EMA', '3_EMA', '8_EMA', 'VWAP', 'RSI', 'Williams_%R', 'Williams_%R_diff']].tail(20))
+
         return df
 
     if backtest:
@@ -534,6 +549,7 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
                       df.groupby('trading_date')['vwap_denominator'].cumsum())
         
         df = df.drop(['vwap_numerator', 'vwap_denominator', 'trading_date'], axis=1)
+        df['Williams_%R'] = williams_r(df['high'], df['low'], df['close'])
         
         # ======= ADD THIS SECTION =======
         # MACD calculation
@@ -550,16 +566,29 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
         avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
         df['RSI'] = 100 - (100 / (1 + (avg_gain / avg_loss)))
-        
+        df['Williams_%R'] = williams_r(df['high'], df['low'], df['close'])
+        df['Williams_%R_diff'] = df['Williams_%R'].diff(3).fillna(0)  # Add this line
         df.set_index('date', inplace=True)
         return df
 
     return get_historical_data(ib, symbol, exchange, currency, False)
 
 # =====================
+# WILLIAMS %R IMPLEMENTATION (FIXED)
+# =====================
+def williams_r(high, low, close, lookback=14):
+    """Calculate Williams %R with NaN handling"""
+    highest_high = high.rolling(window=lookback, min_periods=1).max()
+    lowest_low = low.rolling(window=lookback, min_periods=1).min()
+    
+    # Handle division by zero and NaN cases
+    denominator = (highest_high - lowest_low).replace(0, np.nan)
+    wr = -100 * ((highest_high - close) / denominator)
+    return wr.fillna(-50)  # Neutral value when no range
+
+# =====================
 # TECHNICAL ANALYSIS
 # ===================== 
-
 def find_support_resistance(df_5m, df_15m, df_30m, window=20, min_touches=3, price_threshold=0.15):
     levels = {'support': [], 'resistance': []}
     touches = {}
@@ -826,7 +855,27 @@ def plot_candlestick(df, backtest=False):
             linestyle='--',
         ))
 
-    # ===== 4. VOLUME PANEL (3) =====
+    # Add Williams %R to RSI panel
+    addplots.append(mpf.make_addplot(
+        df['Williams_%R'],
+        panel=2,
+        color='darkcyan',
+        width=1.2,
+        alpha=0.5,
+        ylabel='Williams %R/RSI'
+    ))
+
+    # Add horizontal lines for Williams %R levels
+    for level in [-20, -80]:
+        addplots.append(mpf.make_addplot(
+            pd.Series(level, index=df.index),
+            panel=2,
+            color='gray',
+            width=0.8,
+            linestyle=':'
+        ))
+
+    # ===== 5. VOLUME PANEL (4) =====
     volume_colors = np.where(df['close'] > df['open'], '#5cb85c', '#d9534f')
     addplots.append(mpf.make_addplot(
         df['volume'],
