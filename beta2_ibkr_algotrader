@@ -252,7 +252,6 @@ class BacktestEngine:
         self.trade_markers = []
         self.daily_pnl = {}
         self.entry_conditions = {
-            'ema_order': False,
             'rsi_threshold': False,
             'position_status': False
         }
@@ -347,7 +346,6 @@ def check_entry_conditions(df, index):
             return False
             
         conditions = {
-            'ema_order': (row['1_EMA'] > row['3_EMA'] > row['8_EMA'] > row['VWAP']),
             'rsi_threshold': row['RSI'] < 70,
             'position_status': not engine.current_position,
             'valid_vwap': pd.notnull(row['VWAP']),
@@ -369,8 +367,6 @@ def check_exit_conditions(df, index):
 
     row = df.loc[index]
     exit_conditions = [
-        row['1_EMA'] < row['3_EMA'],  # Normal exit conditions
-        row['3_EMA'] < row['8_EMA'],
         row['RSI'] > 70,
         row['Williams_%R'] > -20,
         row['Williams_%R_diff'] < 0,  # Use precomputed diff
@@ -481,10 +477,6 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         df = df.dropna(subset=['volume'])
         df = df[df['volume'] > 0]
         df['date'] = pd.to_datetime(df['date']).dt.tz_localize('America/New_York')  # Handle timezone properly
-
-        # Calculate indicators
-        for window in [1, 3, 8]:
-            df[f'{window}_EMA'] = df['close'].ewm(span=window, adjust=False).mean()
         
         # ===== MACD CALCULATION =====
         exp12 = df['close'].ewm(span=12, adjust=False).mean()
@@ -512,7 +504,6 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         df['Williams_%R_diff'] = df['Williams_%R'].diff(3).fillna(0)
         df = df.drop(['tp_vol', 'cumulative_tp_vol', 'cumulative_vol', 'trading_date'], axis=1)
         df.set_index('date', inplace=True)
-        print(df[['1_EMA', '3_EMA', '8_EMA', 'VWAP', 'RSI', 'Williams_%R', 'Williams_%R_diff']].tail(20))
 
         return df
 
@@ -520,7 +511,7 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         bars = ib.reqHistoricalData(
             contract,
             endDateTime='',
-            durationStr='30 D',
+            durationStr='365 D',
             barSizeSetting='1 hour',
             whatToShow='TRADES',
             useRTH=True,
@@ -535,10 +526,6 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
 
         if df.empty:
             raise ValueError("Empty DataFrame received from IB")
-
-        # Add indicators
-        for window in [1, 3, 8]:
-            df[f'{window}_EMA'] = df['close'].ewm(span=window, adjust=False).mean()
         
         # VWAP calculation
         df['vwap_numerator'] = df['volume'] * (df['high'] + df['low'] + df['close']) / 3
@@ -559,7 +546,7 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
         df['Histogram'] = df['MACD'] - df['Signal']
         
-        # RSI calculation (already exists, keep this)
+        # RSI calculation
         delta = df['close'].diff()
         gain = delta.where(delta > 0, 0.0)
         loss = -delta.where(delta < 0, 0.0)
@@ -574,7 +561,7 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
     return get_historical_data(ib, symbol, exchange, currency, False)
 
 # =====================
-# WILLIAMS %R IMPLEMENTATION (FIXED)
+# WILLIAMS %R IMPLEMENTATION
 # =====================
 def williams_r(high, low, close, lookback=14):
     """Calculate Williams %R with NaN handling"""
@@ -781,25 +768,15 @@ def find_trendlines(df_5m, min_touches=3):
     
     return trendlines
 # =====================
-# VISUALIZATION ENGINE (UPDATED WITH MACD)
+# VISUALIZATION ENGINE
 # =====================
 def plot_candlestick(df, backtest=False):
     """
     Generates 4-panel chart: Price + MACD + RSI + Volume
     """
     addplots = []
-    ema_colors = {1: 'blue', 3: 'orange', 8: 'red'}
     
     # ===== 1. MAIN PRICE PANEL (0) =====
-    for ema in [1, 3, 8]:
-        addplots.append(mpf.make_addplot(
-            df[f'{ema}_EMA'],
-            color=ema_colors[ema],
-            width=1.5,
-            panel=0,
-            alpha=0.8
-        ))
-    
     addplots.append(mpf.make_addplot(
         df['VWAP'],
         color='purple',
