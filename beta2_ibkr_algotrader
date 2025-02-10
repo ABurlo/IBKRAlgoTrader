@@ -461,7 +461,7 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         bars = ib.reqHistoricalData(
             contract,
             endDateTime='',  # Remove potential timezone info
-            durationStr='365 D',
+            durationStr='30 D',
             barSizeSetting='1 hour',
             whatToShow='TRADES',
             useRTH=True,
@@ -511,7 +511,7 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         bars = ib.reqHistoricalData(
             contract,
             endDateTime='',
-            durationStr='365 D',
+            durationStr='30 D',
             barSizeSetting='1 hour',
             whatToShow='TRADES',
             useRTH=True,
@@ -772,7 +772,7 @@ def find_trendlines(df_5m, min_touches=3):
 # =====================
 def plot_candlestick(df, backtest=False):
     """
-    Generates 4-panel chart: Price + MACD + RSI + Volume
+    Generates 5-panel chart: Price + MACD + RSI + Williams %R + Volume
     """
     addplots = []
     
@@ -832,32 +832,19 @@ def plot_candlestick(df, backtest=False):
             linestyle='--',
         ))
 
-    # Add Williams %R to RSI panel
-    addplots.append(mpf.make_addplot(
-        df['Williams_%R'],
-        panel=2,
-        color='darkcyan',
-        width=1.2,
-        alpha=0.5,
-        ylabel='Williams %R/RSI'
-    ))
+    # Add Williams %R in its own panel (3)
+    addplots.append(mpf.make_addplot(df['Williams_%R'], panel=3, color='blue', width=1.2, ylabel='Williams %R'))
 
-    # Add horizontal lines for Williams %R levels
-    for level in [-20, -80]:
-        addplots.append(mpf.make_addplot(
-            pd.Series(level, index=df.index),
-            panel=2,
-            color='gray',
-            width=0.8,
-            linestyle=':'
-        ))
+    # Add overbought (-20) and oversold (-80) markers
+    addplots.append(mpf.make_addplot(pd.Series(-20, index=df.index), panel=3, color='red', linestyle='--'))
+    addplots.append(mpf.make_addplot(pd.Series(-80, index=df.index), panel=3, color='green', linestyle='--'))
 
     # ===== 5. VOLUME PANEL (4) =====
     volume_colors = np.where(df['close'] > df['open'], '#5cb85c', '#d9534f')
     addplots.append(mpf.make_addplot(
         df['volume'],
         type='bar',
-        panel=3,
+        panel=4,
         color=volume_colors,
         alpha=0.6,
         ylabel='Volume'
@@ -913,8 +900,8 @@ def plot_candlestick(df, backtest=False):
         style=s,
         addplot=addplots,
         volume=False,
-        panel_ratios=(6,3,2,2),  # Price:6, MACD:3, RSI:2, Volume:2
-        figsize=(14, 10),
+        panel_ratios=(12,6,4,4,4),  # Price:12, MACD:6, RSI:4, Williams %R:4, Volume:4 - doubled from (6,3,2,2,2)
+        figsize=(14, 20), # increased figure size
         returnfig=True
     )
     
@@ -930,6 +917,13 @@ def plot_candlestick(df, backtest=False):
     ax_rsi.axhline(70, color='gray', ls='--', alpha=0.7)
     ax_rsi.text(0.01, 0.95, 'Overbought (70)', transform=ax_rsi.transAxes, color='gray')
     ax_rsi.text(0.01, 0.05, 'Oversold (30)', transform=ax_rsi.transAxes, color='gray')
+
+    # Williams %R Panel
+    ax_will = axlist[3]
+    ax_will.axhline(-20, color='red', ls='--', alpha=0.7)
+    ax_will.axhline(-80, color='green', ls='--', alpha=0.7)
+    ax_will.text(0.01, 0.95, 'Overbought (-20)', transform=ax_will.transAxes, color='red')
+    ax_will.text(0.01, 0.05, 'Oversold (-80)', transform=ax_will.transAxes, color='green')
 
     plt.show()
 
