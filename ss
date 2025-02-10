@@ -1,0 +1,1003 @@
+# =====================
+# CORE IMPORTS
+# =====================
+from ib_insync import *
+import pandas as pd
+import numpy as np
+import mplfinance as mpf
+from datetime import datetime, timedelta, time
+import asyncio
+import nest_asyncio
+import logging
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+from time import sleep
+import calplot
+from matplotlib.colors import ListedColormap
+from collections.abc import MutableMapping  # FIX: Added correct abstract base class import
+import pytz
+
+# =====================
+# LINKED LIST DICTIONARY IMPLEMENTATION
+# =====================
+class LLNode:
+    __slots__ = ('key', 'value', 'next')
+    def __init__(self, key, value, next=None):
+        self.key = key
+        self.value = value
+        self.next = next
+
+class LLDict(MutableMapping):  # FIX: Replaced DictAbstract with MutableMapping
+    def __init__(self):
+        self.head = None
+        self._size = 0
+
+    def __setitem__(self, key, value):
+        current = self.head
+        while current is not None:
+            if current.key == key:
+                current.value = value
+                return
+            current = current.next
+        self.head = LLNode(key, value, self.head)
+        self._size += 1
+
+    def __getitem__(self, key):
+        current = self.head
+        while current is not None:
+            if current.key == key:
+                return current.value
+            current = current.next
+        raise KeyError(key)
+
+    def __delitem__(self, key):
+        prev = None
+        current = self.head
+        while current is not None:
+            if current.key == key:
+                if prev:
+                    prev.next = current.next
+                else:
+                    self.head = current.next
+                self._size -= 1
+                return
+            prev = current
+            current = current.next
+        raise KeyError(key)
+
+    def __iter__(self):
+        current = self.head
+        while current is not None:
+            yield current.key
+            current = current.next
+
+    def __len__(self):
+        return self._size
+
+# =====================
+# GLOBAL CONFIGURATION
+# =====================
+symbol = "PEP"
+initial_balance = 10000
+
+# =====================
+# MARKET CLOSURE WARNING
+# =====================
+def is_market_close(index):
+    """Check if current time is near market close"""
+    market_close_time = time(16, 0)  # 4 PM ET
+    current_time = index.time()
+    
+    # Create dummy datetime for comparison
+    dummy_date = datetime.today().date()
+    market_close = datetime.combine(dummy_date, market_close_time)
+    comparison_time = datetime.combine(dummy_date, current_time)
+    
+    time_delta = timedelta(minutes=10)
+    return (market_close - time_delta).time() <= current_time <= market_close.time()
+
+# =====================
+# PNL CALENDAR (FIXED)
+# =====================
+import pandas as pd
+import matplotlib.pyplot as plt
+import pytz
+
+def plot_pnl_calendar(engine, start_date, end_date, initial_balance, symbol):
+    """
+    Generates a detailed PnL calendar for each month within the specified date range, 
+    showing Win Rate %, W:L Ratio, # of Trades, PnL, and color-coded day shading with varying intensity.
+    """
+    ny_tz = pytz.timezone('America/New_York')
+
+    # Convert start and end dates to NY timezone
+    start_date = pd.Timestamp(start_date).tz_convert(ny_tz).normalize()
+    end_date = pd.Timestamp(end_date).tz_convert(ny_tz).normalize()
+
+    current_date = start_date
+    while current_date <= end_date:
+        # Calculate the end of the current month
+        next_month = current_date.replace(day=1) + pd.DateOffset(months=1)
+        month_end = min(next_month - pd.Timedelta(days=1), end_date)
+
+        # Generate all dates in the current month
+        all_dates = pd.date_range(start=current_date, end=month_end, freq='D', tz=ny_tz)
+
+        # Process daily PnL data
+        daily_pnl = pd.DataFrame.from_dict(engine.daily_pnl, orient='index', columns=['pnl'])
+        daily_pnl.index = pd.to_datetime(daily_pnl.index).tz_localize('UTC').tz_convert(ny_tz)
+        daily_pnl = daily_pnl.reindex(all_dates, fill_value=0).reset_index()
+        daily_pnl.rename(columns={'index': 'date'}, inplace=True)
+
+        # Add title to the calendar dynamically
+        title = f"{symbol} Trading Performance {current_date.strftime('%B %Y')}"
+        
+        # Visualization with details
+        fig, ax = plt.subplots(figsize=(12, 8))
+        ax.set_facecolor('#f0f0f0')
+
+        # Updated Color Logic
+        for i, row in daily_pnl.iterrows():
+            date = row['date']
+            col = date.weekday()  # Day of the week (Monday=0, Sunday=6)
+            week_num = (date.day - 1) // 7  # Calendar week index
+            row_pos = -week_num  # Inverted y-axis for calendar rows
+
+            # Filter trades for the specific date
+            trades = [t for t in engine.trade_history if pd.Timestamp(t['timestamp']).date() == date.date()]
+            metrics = calculate_day_metrics(trades)
+
+            # If no trades occurred, set the color to grey
+            if metrics['num_trades'] == 0:
+                color = '#d3d3d3'  # Default grey for no trades
+            else:
+                # Determine cell color intensity based on PnL
+                max_abs_pnl = abs(daily_pnl['pnl']).max()
+                color_intensity = min(1, abs(row.pnl) / max_abs_pnl) if max_abs_pnl > 0 else 0
+                color = (
+                    (1 - color_intensity, 0.8, 0.8 - color_intensity)  # Red for losses
+                    if row.pnl < 0 else
+                    (0.8 - color_intensity, 1, 0.8 - color_intensity)  # Green for gains
+                )
+
+            # Plot cell rectangle
+            ax.add_patch(plt.Rectangle(
+                (col, row_pos), 1, 1,
+                facecolor=color,
+                edgecolor='gray',
+                lw=0.5
+            ))
+
+            # Add text for metrics
+            ax.text(col + 0.05, row_pos + 0.85, str(date.day), ha='left', va='top', fontsize=8)
+            ax.text(col + 0.5, row_pos + 0.5,
+                    f"${row.pnl:.2f}\nW%: {metrics['win_rate']:.2f}%\nTrades: {metrics['num_trades']}",
+                    ha='center', va='center', fontsize=6)
+
+
+        # Configure axis
+        ax.set_xlim(-0.5, 6.5)
+        ax.set_ylim(-daily_pnl['date'].max().month * 5 - 0.5, 0.5)
+        ax.set_xticks(range(7))
+        ax.set_xticklabels(['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'])
+        ax.set_yticks([])
+
+        plt.suptitle(title, fontsize=16)
+        plt.tight_layout()
+        plt.show()
+
+        # Move to the first day of the next month
+        current_date = next_month
+
+
+def calculate_day_metrics(trades):
+    """
+    Calculate trading metrics for the calendar (Win Rate %, W:L Ratio, # of Trades, PnL).
+    Enhanced with error handling for missing 'pnl' field.
+    """
+    # Initialize metrics with proper type casting
+    num_trades = len(trades)
+    wins = 0
+    losses = 0
+    pnl = 0.0  # Explicit float initialization
+
+    for t in trades:
+        # Handle missing 'pnl' key with default to 0
+        trade_pnl = t.get('pnl', 0.0)
+        
+        # Track wins/losses
+        if trade_pnl > 0:
+            wins += 1
+        elif trade_pnl < 0:
+            losses += 1
+            
+        # Accumulate PnL
+        pnl += float(trade_pnl)
+
+    # Calculate metrics with division safeguards
+    win_rate = (wins / num_trades * 100) if num_trades > 0 else 0.0
+    win_loss_ratio = (wins / losses) if losses > 0 else float('inf')
+
+    return {
+        'win_rate': round(win_rate, 2),
+        'win_loss_ratio': round(win_loss_ratio, 2) if win_loss_ratio < float('inf') else 'Infinity',
+        'num_trades': num_trades,
+        'pnl': round(pnl, 2)
+    }
+
+# =====================
+# BACKTESTING ENGINE
+# =====================
+class BacktestEngine:
+    def __init__(self):
+        self.balance = initial_balance
+        self.positions = LLDict()
+        self.trade_history = []
+        self.current_position = None
+        self.fee_per_share = 0.0035
+        self.slippage = 0.0002
+        self.trade_markers = []
+        self.daily_pnl = {}
+        self.entry_conditions = {
+            'ema_order': False,
+            'rsi_threshold': False,
+            'position_status': False
+        }
+
+    def apply_slippage(self, price, is_buy):
+        """
+        Applies slippage to the execution price
+        """
+        slippage_factor = 1 + (self.slippage if is_buy else -self.slippage)
+        return price * slippage_factor
+
+    def calculate_fees(self, shares):
+        """
+        Calculates trading fees based on number of shares
+        """
+        return abs(shares * self.fee_per_share)
+
+    def execute_trade(self, ticker, price, shares, action, timestamp):
+        executed_price = self.apply_slippage(price, action == 'BUY')
+        fees = self.calculate_fees(shares)
+        position_value = abs(shares * executed_price)
+
+        trade = {
+            'timestamp': timestamp,
+            'action': action,
+            'price': executed_price,
+            'shares': round(shares, 2),  # Ensures rounded values for shares
+            'position_value': round(position_value, 2),
+            'fees': round(fees, 2),
+            'new_balance': round(self.balance, 2),
+            'pnl': 0.0,  # Default PnL is 0.0, updated on 'SELL'
+        }
+
+        trade_date = pd.Timestamp(timestamp).date()
+        if trade_date not in self.daily_pnl:
+            self.daily_pnl[trade_date] = 0.0
+
+        if action == 'SELL' and self.current_position:
+            pnl = (executed_price - self.current_position['entry_price']) * self.current_position['shares']
+            self.daily_pnl[trade_date] += pnl
+            trade['pnl'] = round(pnl, 2)
+            trade['pnl_pct'] = round((pnl / self.current_position['entry_price']) * 100, 2)
+
+            self.balance += round(pnl - fees, 2)
+            self.current_position = None  # Reset current position on sell
+
+        elif action == 'BUY':
+            self.balance -= position_value + fees
+            self.current_position = {
+                'entry_price': executed_price,
+                'shares': shares,
+                'timestamp': timestamp
+            }
+            self.trade_markers.append({
+                'date': timestamp,
+                'price': executed_price,
+                'marker': '↑' if action == 'BUY' else '↓'
+            })
+
+        # Append the trade to history regardless of the action
+        self.trade_history.append(trade)
+        logger.info(f"{action} executed: {trade}")
+        return trade
+
+def close_position_eod(self, eod_price, timestamp):
+    """
+    Close any open positions at the end of the trading day.
+    """
+    if self.current_position:
+        shares = self.current_position['shares']
+        trade = self.execute_trade(symbol, eod_price, shares, 'SELL', timestamp)
+        logger.info(f"EOD position closed: {trade}")
+
+# Initialize engine globally
+engine = BacktestEngine()
+
+# =====================
+# STRATEGY CONDITIONS
+# =====================
+def check_entry_conditions(df, index):
+    try:
+        row = df.loc[index]
+        # Verify market hours (9:30 AM to 4:00 PM ET)
+        if not (time(9,30) <= index.time() <= time(16,0)):
+            return False
+            
+        conditions = {
+            'ema_order': (row['1_EMA'] > row['3_EMA'] > row['8_EMA'] > row['VWAP']),
+            'rsi_threshold': row['RSI'] < 70,
+            'position_status': not engine.current_position,
+            'valid_vwap': pd.notnull(row['VWAP'])
+        }
+        return all(conditions.values())
+    except KeyError as e:
+        logger.error(f"Missing indicator column: {str(e)}")
+        return False
+
+def check_exit_conditions(df, index):
+    """
+    Evaluate exit conditions, including EOD closure.
+    """
+    if not engine.current_position:
+        return False
+
+    row = df.loc[index]
+    exit_conditions = [
+        row['1_EMA'] < row['3_EMA'],  # Normal exit conditions
+        row['3_EMA'] < row['8_EMA'],
+        row['RSI'] > 70,
+        row['close'] < engine.current_position['entry_price'] * 0.98
+    ]
+
+    # Add EOD condition to forcefully close any open position
+    if is_market_close(index):
+        logger.info(f"Triggering EOD close at {index}.")
+        return True
+
+    return any(exit_conditions)
+
+# =====================
+# ENHANCED LOGGING
+# =====================
+class TradeFormatter(logging.Formatter):
+    GREEN = '\033[92m'
+    RED = '\033[91m'
+    RESET = '\033[0m'
+    
+    def format(self, record):
+        if 'BUY' in record.msg:
+            record.msg = f"{self.GREEN}{record.msg}{self.RESET}"
+        elif 'SELL' in record.msg:
+            record.msg = f"{self.RED}{record.msg}{self.RESET}"
+        return super().format(record)
+
+# Configure root logger directly
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+
+# Clear existing handlers
+for handler in root_logger.handlers[:]:
+    root_logger.removeHandler(handler)
+
+# Create and configure handlers
+handler = logging.StreamHandler()
+handler.setFormatter(TradeFormatter('%(asctime)s | %(message)s'))
+root_logger.addHandler(handler)
+
+file_handler = logging.FileHandler('strategy_execution.log')
+file_handler.setFormatter(logging.Formatter('%(asctime)s | %(message)s'))
+root_logger.addHandler(file_handler)
+
+logger = logging.getLogger(__name__)
+
+def log_trade(trade, symbol, retries=3):
+    """
+    Enhanced trade logging with robust timestamp handling
+    """
+    # Validate trade structure first
+    required_keys = {'timestamp', 'price', 'position_value', 'shares', 'action'}
+    if missing := required_keys - trade.keys():
+        logger.error(f"Missing trade keys: {missing}")
+        return
+
+    # Parse timestamp with proper timezone handling
+    try:
+        trade_time = pd.to_datetime(trade['timestamp'], utc=True)
+        trade_time = trade_time.tz_convert('America/New_York')
+    except Exception as e:
+        logger.error(f"Invalid timestamp {trade['timestamp']}: {str(e)}")
+        return
+
+    # Build log messages
+    log_parts = [
+        f"{trade['action']} | {symbol}",
+        f"Time: {trade_time.strftime('%Y-%m-%d %H:%M:%S%z')}",
+        f"Price: ${trade['price']:.2f}",
+        f"Size: ${trade['position_value']:.2f}",
+        f"Shares: {trade['shares']:.2f}"
+    ]
+    
+    if trade['action'] == 'SELL':
+        log_parts.extend([
+            f"PnL: ${trade['pnl']:.2f}",
+            f"Return: {trade['pnl_pct']:.2f}%"
+        ])
+    
+    logger.info(" | ".join(log_parts))
+
+# =====================
+# DATA MANAGEMENT
+# =====================
+nest_asyncio.apply()
+
+def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=False):
+    contract = Stock(symbol, exchange, currency)
+
+    if not backtest:
+        bars = ib.reqHistoricalData(
+            contract,
+            endDateTime='',  # Remove potential timezone info
+            durationStr='7 D',
+            barSizeSetting='1 hour',
+            whatToShow='TRADES',
+            useRTH=True,
+            formatDate=1,
+            keepUpToDate=False
+        )
+
+        # Convert BarDataList to DataFrame
+        if not bars:
+            raise ValueError("No historical data received")
+        
+        df = util.df(bars)  # Proper conversion to DataFrame
+        df = df.dropna(subset=['volume'])
+        df = df[df['volume'] > 0]
+        df['date'] = pd.to_datetime(df['date']).dt.tz_localize('America/New_York')  # Handle timezone properly
+
+        # Calculate indicators
+        for window in [1, 3, 8]:
+            df[f'{window}_EMA'] = df['close'].ewm(span=window, adjust=False).mean()
+            
+        # Calculate RSI
+        delta = df['close'].diff()
+        gain = delta.where(delta > 0, 0.0)
+        loss = -delta.where(delta < 0, 0.0)
+        avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
+        df['RSI'] = 100 - (100 / (1 + (avg_gain / avg_loss)))
+        
+        # Calculate VWAP
+        df['trading_date'] = df['date'].dt.date
+        typical_price = (df['high'] + df['low'] + df['close']) / 3
+        df['tp_vol'] = df['volume'] * typical_price
+        df['cumulative_tp_vol'] = df.groupby('trading_date')['tp_vol'].cumsum()
+        df['cumulative_vol'] = df.groupby('trading_date')['volume'].cumsum()
+        df['VWAP'] = df['cumulative_tp_vol'] / df['cumulative_vol']
+        
+        df = df.drop(['tp_vol', 'cumulative_tp_vol', 'cumulative_vol', 'trading_date'], axis=1)
+        df.set_index('date', inplace=True)
+        return df
+
+    if backtest:
+        bars = ib.reqHistoricalData(
+            contract,
+            endDateTime='',
+            durationStr='30 D',
+            barSizeSetting='1 hour',
+            whatToShow='TRADES',
+            useRTH=True,
+            formatDate=1,
+            keepUpToDate=False
+        )
+        
+        if not bars:
+            raise ValueError("No historical data received")
+        
+        df = util.df(bars)  # Proper conversion to DataFrame
+
+        if df.empty:
+            raise ValueError("Empty DataFrame received from IB")
+
+        # Add indicators
+        for window in [1, 3, 8]:
+            df[f'{window}_EMA'] = df['close'].ewm(span=window, adjust=False).mean()
+        
+        # VWAP calculation
+        df['vwap_numerator'] = df['volume'] * (df['high'] + df['low'] + df['close']) / 3
+        df['vwap_denominator'] = df['volume']
+        
+        df['trading_date'] = df['date'].dt.date
+        df['VWAP'] = (df.groupby('trading_date')['vwap_numerator'].cumsum() /
+                      df.groupby('trading_date')['vwap_denominator'].cumsum())
+        
+        df = df.drop(['vwap_numerator', 'vwap_denominator', 'trading_date'], axis=1)
+        
+        # Calculate RSI
+        delta = df['close'].diff()
+        gain = delta.where(delta > 0, 0.0)
+        loss = -delta.where(delta < 0, 0.0)
+        avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
+        df['RSI'] = 100 - (100 / (1 + (avg_gain / avg_loss)))
+        
+        df.set_index('date', inplace=True)
+        return df
+
+    return get_historical_data(ib, symbol, exchange, currency, False)
+
+# =====================
+# TECHNICAL ANALYSIS
+# ===================== 
+
+def find_support_resistance(df_5m, df_15m, df_30m, window=20, min_touches=3, price_threshold=0.15):
+    levels = {'support': [], 'resistance': []}
+    touches = {}
+    
+    # Calculate swing highs and lows for all timeframes
+    df_5m['swing_high'] = df_5m['high'].rolling(window=5, center=True).max()
+    df_5m['swing_low'] = df_5m['low'].rolling(window=5, center=True).min()
+    
+    df_15m['swing_high'] = df_15m['high'].rolling(window=3, center=True).max()
+    df_15m['swing_low'] = df_15m['low'].rolling(window=3, center=True).min()
+    
+    df_30m['swing_high'] = df_30m['high'].rolling(window=2, center=True).max()
+    df_30m['swing_low'] = df_30m['low'].rolling(window=2, center=True).min()
+    
+    # Get potential levels from higher timeframes
+    higher_tf_levels = set()
+    
+    # Add 15m levels
+    for _, row in df_15m.iterrows():
+        higher_tf_levels.add(row['swing_high'])
+        higher_tf_levels.add(row['swing_low'])
+    
+    # Add 30m levels
+    for _, row in df_30m.iterrows():
+        higher_tf_levels.add(row['swing_high'])
+        higher_tf_levels.add(row['swing_low'])
+    
+    # Process 5m data with confluence from higher timeframes
+    price_history = []
+    for i in range(len(df_5m)):
+        current_price = df_5m.iloc[i]
+        price_history.append({
+            'high': current_price['high'],
+            'low': current_price['low'],
+            'close': current_price['close'],
+            'swing_high': current_price['swing_high'],
+            'swing_low': current_price['swing_low']
+        })
+        
+        if len(price_history) >= window:
+            window_prices = price_history[-window:]
+            
+            if i % 3 == 0:
+                current_high = window_prices[-1]['swing_high']
+                current_low = window_prices[-1]['swing_low']
+                
+                # Check for confluence with higher timeframe levels
+                has_higher_tf_confluence_high = any(abs(level - current_high)/current_high < price_threshold 
+                                                  for level in higher_tf_levels)
+                has_higher_tf_confluence_low = any(abs(level - current_low)/current_low < price_threshold 
+                                                 for level in higher_tf_levels)
+                
+                support_count = 0
+                resistance_count = 0
+                
+                for k in range(len(window_prices) - 1):
+                    # Support level logic with confluence
+                    if abs(window_prices[k]['low'] - current_low) / current_low < price_threshold:
+                        if (window_prices[k+1]['close'] > current_low and 
+                            window_prices[k+1]['low'] > window_prices[k]['low'] and
+                            has_higher_tf_confluence_low):
+                            support_count += 1
+                    
+                    # Resistance level logic with confluence
+                    if abs(window_prices[k]['high'] - current_high) / current_high < price_threshold:
+                        if (window_prices[k+1]['close'] < current_high and 
+                            window_prices[k+1]['high'] < window_prices[k]['high'] and
+                            has_higher_tf_confluence_high):
+                            resistance_count += 1
+                
+                # Add levels with strong confirmation and higher timeframe confluence
+                if support_count >= min_touches:
+                    levels['support'].append(current_low)
+                    touches[current_low] = support_count
+                
+                if resistance_count >= min_touches:
+                    levels['resistance'].append(current_high)
+                    touches[current_high] = resistance_count
+    
+    # Improved level filtering
+    for level_type in ['support', 'resistance']:
+        levels[level_type] = sorted(set(levels[level_type]))
+        filtered = []
+        
+        # Group nearby levels
+        current_group = []
+        for price in levels[level_type]:
+            if not current_group or abs(price - current_group[-1])/current_group[-1] <= 0.005:
+                current_group.append(price)
+            else:
+                # Take the most touched level from the group
+                best_level = max(current_group, key=lambda x: touches[x])
+                filtered.append(best_level)
+                current_group = [price]
+        
+        if current_group:
+            best_level = max(current_group, key=lambda x: touches[x])
+            filtered.append(best_level)
+        
+        levels[level_type] = filtered
+    
+    return levels, touches
+
+def get_color_intensity(touch_count, min_touches, max_touches):
+    intensity = 0.5 + 0.5 * ((touch_count - min_touches) / (max_touches - min_touches))
+    return min(max(intensity, 0.5), 1.0)
+
+def find_trendlines(df_5m, min_touches=3):
+    trendlines = {'bullish': [], 'bearish': []}
+    
+    # Create lists to store potential trend points
+    bullish_sequences = []
+    bearish_sequences = []
+    current_bullish = []
+    current_bearish = []
+    
+    # Helper function to check if a candle is green/red
+    def is_green_candle(row):
+        return row['close'] > row['open']
+    
+    def is_red_candle(row):
+        return row['close'] < row['open']
+    
+    # Iterate through the dataframe
+    for i in range(len(df_5m)):
+        current_row = df_5m.iloc[i]
+        
+        # Check for bullish sequence
+        if is_green_candle(current_row):
+            if not current_bullish:
+                current_bullish = [(df_5m.index[i], current_row['close'])]
+            else:
+                if current_row['close'] > current_bullish[-1][1]:
+                    current_bullish.append((df_5m.index[i], current_row['close']))
+                else:
+                    if len(current_bullish) >= min_touches:
+                        bullish_sequences.append(current_bullish)
+                    current_bullish = [(df_5m.index[i], current_row['close'])]
+        
+        # Check for bearish sequence
+        if is_red_candle(current_row):
+            if not current_bearish:
+                current_bearish = [(df_5m.index[i], current_row['close'])]
+            else:
+                if current_row['close'] < current_bearish[-1][1]:
+                    current_bearish.append((df_5m.index[i], current_row['close']))
+                else:
+                    if len(current_bearish) >= min_touches:
+                        bearish_sequences.append(current_bearish)
+                    current_bearish = [(df_5m.index[i], current_row['close'])]
+    
+    # Create trend lines from sequences
+    for sequence in bullish_sequences:
+        if len(sequence) >= min_touches:
+            trend_line = pd.Series(index=df_5m.index, dtype=float)
+            start_date, start_price = sequence[0]
+            end_date, end_price = sequence[-1]
+            
+            # Calculate line gradient
+            time_delta = (end_date - start_date).total_seconds()
+            price_delta = end_price - start_price
+            gradient = price_delta / time_delta
+            
+            # Create trend line points
+            for date in df_5m.index:
+                if start_date <= date <= end_date:
+                    seconds_from_start = (date - start_date).total_seconds()
+                    trend_line[date] = start_price + (gradient * seconds_from_start)
+            
+            trendlines['bullish'].append(trend_line)
+    
+    for sequence in bearish_sequences:
+        if len(sequence) >= min_touches:
+            trend_line = pd.Series(index=df_5m.index, dtype=float)
+            start_date, start_price = sequence[0]
+            end_date, end_price = sequence[-1]
+            
+            # Calculate line gradient
+            time_delta = (end_date - start_date).total_seconds()
+            price_delta = end_price - start_price
+            gradient = price_delta / time_delta
+            
+            # Create trend line points
+            for date in df_5m.index:
+                if start_date <= date <= end_date:
+                    seconds_from_start = (date - start_date).total_seconds()
+                    trend_line[date] = start_price + (gradient * seconds_from_start)
+            
+            trendlines['bearish'].append(trend_line)
+    
+    return trendlines
+
+# =====================
+# VISUALIZATION ENGINE (FIXED)
+# =====================
+def plot_candlestick(df, backtest=False):
+    """
+    Generates 3-panel chart: Price + RSI + Volume
+    Resolves panel ratios error with explicit structure
+    """
+    addplots = []
+    ema_colors = {1: 'blue', 3: 'orange', 8: 'red'}
+    
+    # ===== 1. MAIN PRICE PANEL (0) =====
+    for ema in [1, 3, 8]:
+        addplots.append(mpf.make_addplot(
+            df[f'{ema}_EMA'],
+            color=ema_colors[ema],
+            width=1.5,
+            panel=0,  # Force price panel
+            alpha=0.8
+        ))
+    
+    addplots.append(mpf.make_addplot(
+        df['VWAP'],
+        color='purple',
+        width=1.5,
+        panel=0,
+        linestyle='--'
+    ))
+
+    # ===== 2. RSI PANEL (1) =====
+    # RSI Line with Thresholds
+    addplots.append(mpf.make_addplot(
+        df['RSI'],
+        panel=1,
+        ylabel='',  # Leave empty to use only tick labels
+        color='#4B0082',  # Indigo
+        width=1.2,
+        ylim=(0, 100)
+    ))
+
+    # Threshold Lines (30, 50, 70)
+    for level in [30, 50, 70]:
+        addplots.append(mpf.make_addplot(
+            pd.Series(level, index=df.index),
+            panel=1,
+            color='gray',
+            width=0.8,
+            linestyle='--',
+        ))
+
+    # ===== 3. VOLUME PANEL (2) =====
+    volume_colors = np.where(df['close'] > df['open'], '#5cb85c', '#d9534f')
+
+    addplots.append(mpf.make_addplot(
+        df['volume'],
+        type='bar',
+        panel=2,  # Explicit volume panel
+        color=volume_colors,
+        alpha=0.6,
+        ylabel='Volume'
+    ))
+    
+   # ===== TRADE MARKERS =====
+    if backtest and engine.trade_markers:
+        # Create aligned marker series
+        marker_series = pd.Series(
+            data=np.nan,
+            index=df.index.copy().tz_convert('America/New_York')
+        )
+        
+        # Populate markers
+        for trade in engine.trade_markers:
+            trade_time = pd.to_datetime(trade['date']).tz_convert('America/New_York')
+            if trade_time in marker_series.index:  # Only plot markers with matching timestamps
+                marker_series[trade_time] = trade['price']
+        
+        # Add arrow markers with proper alignment
+        addplots.append(mpf.make_addplot(
+            marker_series,
+            type='scatter',
+            markersize=100,
+            marker='$\\uparrow$',
+            color='lime',
+            panel=0
+        ))
+        addplots.append(mpf.make_addplot(
+            marker_series,
+            type='scatter',
+            markersize=100,
+            marker='$\\downarrow$', 
+            color='red',
+            panel=0
+        ))
+
+    # ===== PLOT CONFIGURATION =====
+    mc = mpf.make_marketcolors(
+        up='#006400', down='#8B0000',  # Dark green/red
+        edge='inherit', wick='inherit',
+        volume={'up':'#006400', 'down':'#8B0000'}
+    )
+    
+    s = mpf.make_mpf_style(
+        marketcolors=mc,
+        gridstyle=':',
+        gridcolor='gainsboro',
+        facecolor='white'
+    )
+
+    # ===== EXECUTE PLOT WITH 3 PANELS =====
+    fig, axlist = mpf.plot(
+        df,
+        type='candle',
+        style=s,
+        addplot=addplots,
+        volume=False,  # Handled in addplots
+        panel_ratios=(6,2,2),  # Price:6, RSI:2, Volume:2
+        figsize=(14, 8),
+        returnfig=True
+    )
+    
+    # ===== PANEL ANNOTATIONS =====
+    # RSI Threshold Labels
+    ax_rsi = axlist[1]
+    ax_rsi.axhline(30, color='gray', ls='--', alpha=0.7)
+    ax_rsi.axhline(70, color='gray', ls='--', alpha=0.7)
+    ax_rsi.text(0.01, 0.95, 'Overbought (70)', transform=ax_rsi.transAxes, color='gray')
+    ax_rsi.text(0.01, 0.05, 'Oversold (30)', transform=ax_rsi.transAxes, color='gray')
+
+    plt.show()
+
+# =====================
+# EXECUTION HANDLERS (Critical Fix)
+# =====================
+def run_backtest(df):
+    """
+    Process backtest data with EOD closure enforcement.
+    """
+    for current_dt in df.index:
+        try:
+            # Evaluate entry conditions
+            if check_entry_conditions(df, current_dt):
+                row = df.loc[current_dt]
+                position_size = engine.balance * 0.02  # 2% of balance
+                shares = max(0.01, position_size / row['close'])
+
+                trade = engine.execute_trade(
+                    symbol, row['close'], shares, 'BUY', current_dt
+                )
+                log_trade(trade, symbol)
+
+            # Evaluate exit conditions (including EOD)
+            if engine.current_position and check_exit_conditions(df, current_dt):
+                row = df.loc[current_dt]
+                trade = engine.execute_trade(
+                    symbol,
+                    row['close'],
+                    engine.current_position['shares'],
+                    'SELL',
+                    current_dt
+                )
+                log_trade(trade, symbol)
+
+            # Force EOD position closure
+            if is_market_close(current_dt) and engine.current_position:
+                eod_price = row['close']
+                engine.close_position_eod(eod_price, current_dt)
+
+        except Exception as e:
+            logger.error(f"Error processing {current_dt}: {str(e)}")
+            continue
+
+    return df
+
+# =====================
+# MAIN EXECUTION
+# =====================
+def main():
+    ib = IB()
+    ib.connect('127.0.0.1', 7497, clientId=1)
+
+    start_date = None  # Initialize start_date to None
+    end_date = None    # Initialize end_date to None
+    try:
+        # Backtest mode
+        daily_data = get_historical_data(ib, symbol, backtest=True)
+        run_backtest(daily_data)
+        plot_candlestick(daily_data, backtest=True)
+
+        # Real-time mode
+        df_5m, df_30m, df_1h = get_historical_data(ib, symbol)
+        plot_candlestick(df_5m)
+
+    except Exception as e:
+        logger.error(f"Execution error: {str(e)}")
+    finally:
+        if 'ib' in locals() and ib.isConnected():
+            ib.disconnect()
+
+            if engine.trade_history:
+                trade_history = pd.DataFrame(engine.trade_history)
+
+                if 'pnl' not in trade_history.columns:
+                    logger.warning("The trade history does not contain a 'pnl' column. Skipping performance metrics.")
+                else:
+                    total_trades = len(trade_history)
+                    profitable_trades = (trade_history['pnl'] > 0).sum()
+                    losing_trades = (trade_history['pnl'] < 0).sum()
+                    win_rate = (trade_history['pnl'] > 0).mean() * 100
+
+                    # Calculate returns and risk metrics
+                    total_pnl = trade_history['pnl'].sum()
+                    returns = trade_history['pnl'] / initial_balance
+                    annualized_return = ((engine.balance / initial_balance) ** (252 / len(returns)) - 1) * 100
+                    volatility = returns.std() * np.sqrt(252)
+
+                    # Calculate Sharpe and Sortino ratios
+                    risk_free_rate = 0.02  # 2% annual risk-free rate
+                    excess_returns = returns - (risk_free_rate / 252)
+                    sharpe_ratio = np.sqrt(252) * excess_returns.mean() / returns.std()
+                    downside_returns = returns[returns < 0]
+                    sortino_ratio = np.sqrt(252) * excess_returns.mean() / downside_returns.std()
+                    
+                # Calculate performance metrics
+                total_trades = len(trade_history)
+                profitable_trades = (trade_history['pnl'] > 0).sum()
+                losing_trades = (trade_history['pnl'] < 0).sum()
+                win_rate = (trade_history['pnl'] > 0).mean() * 100
+
+                # Calculate returns and risk metrics
+                total_pnl = trade_history['pnl'].sum()
+                returns = trade_history['pnl'] / initial_balance
+                annualized_return = ((engine.balance/initial_balance) ** (252/len(returns)) - 1) * 100
+                volatility = returns.std() * np.sqrt(252)
+
+                # Calculate Sharpe and Sortino ratios
+                risk_free_rate = 0.02  # 2% annual risk-free rate
+                excess_returns = returns - (risk_free_rate/252)
+                sharpe_ratio = np.sqrt(252) * excess_returns.mean() / returns.std()
+                downside_returns = returns[returns < 0]
+                sortino_ratio = np.sqrt(252) * excess_returns.mean() / downside_returns.std()
+
+                # Calculate drawdown
+                cumulative_returns = (1 + returns).cumprod()
+                rolling_max = cumulative_returns.expanding().max()
+                drawdowns = (cumulative_returns - rolling_max) / rolling_max
+                max_drawdown = drawdowns.min() * 100
+
+                # Calculate trade statistics
+                avg_profit = trade_history[trade_history['pnl'] > 0]['pnl'].mean()
+                avg_loss = abs(trade_history[trade_history['pnl'] < 0]['pnl'].mean())
+                profit_factor = abs(trade_history[trade_history['pnl'] > 0]['pnl'].sum()) / abs(trade_history[trade_history['pnl'] < 0]['pnl'].sum())
+
+                logger.info(f"Total Trades: {total_trades}")
+                logger.info(f"Profitable Trades: {profitable_trades}")
+                logger.info(f"Losing Trades: {losing_trades}")
+                logger.info(f"Win Rate: {win_rate:.2f}%")
+                logger.info(f"Total PnL: ${total_pnl:.2f}")
+                logger.info(f"Annualized Return: {annualized_return:.2f}%")
+                logger.info(f"Volatility: {volatility:.2f}")
+                logger.info(f"Sharpe Ratio: {sharpe_ratio:.2f}")
+                logger.info(f"Sortino Ratio: {sortino_ratio:.2f}")
+                logger.info(f"Max Drawdown: {max_drawdown:.2f}%")
+                logger.info(f"Average Profit: ${avg_profit:.2f}")
+                logger.info(f"Average Loss: ${avg_loss:.2f}")
+                logger.info(f"Profit Factor: {profit_factor:.2f}")
+
+                # Ensure trade_history['timestamp'] exists and is not empty
+                if 'timestamp' in trade_history.columns and not trade_history['timestamp'].empty:
+                    trade_history['timestamp'] = pd.to_datetime(trade_history['timestamp'], utc=True)
+                    start_date = pd.Timestamp(trade_history['timestamp'].min()).tz_convert('UTC').replace(hour=0, minute=0, second=0, microsecond=0)
+                    end_date = pd.Timestamp(trade_history['timestamp'].max()).tz_convert('UTC').replace(hour=23, minute=59, second=59, microsecond=999)
+                    plot_pnl_calendar(engine, start_date, end_date, initial_balance, symbol)
+                else:
+                    logger.warning("No trade history or missing timestamp data. Skipping PNL calendar plot.")
+
+if __name__ == '__main__':
+    main()
