@@ -809,178 +809,134 @@ def find_trendlines(df_5m, min_touches=3):
 # VISUALIZATION ENGINE
 # =====================
 def plot_candlestick(df, backtest=False):
+    """Generates a 6-panel technical analysis chart with candlesticks and indicators
+    
+    Parameters:
+    df (DataFrame): OHLC data with technical indicators
+    backtest (bool): Whether to plot backtest markers
+    
+    Returns:
+    None (displays matplotlib plot)
     """
-    Generates 5-panel chart: Price + MACD + RSI + Williams %R + Volume
-    """
+    # ===== PLOT CONFIGURATION =====
     addplots = []
     
-    # ===== 1. MAIN PRICE PANEL (0) =====
+    # 1. Main Price Panel (0) - Candlesticks and VWAP
     addplots.append(mpf.make_addplot(
         df['VWAP'],
         color='purple',
         width=1.5,
         panel=0,
-        linestyle='--'
+        linestyle='--',
+        ylabel='Price'
     ))
 
-    # ===== 2. MACD PANEL (1) =====
-    # MACD Line
-    addplots.append(mpf.make_addplot(
-        df['MACD'],
-        panel=1,
-        color='#1f77b4',  # Blue
-        width=1.2
-    ))
-    
-    # Signal Line
-    addplots.append(mpf.make_addplot(
-        df['Signal'],
-        panel=1,
-        color='#ff7f0e',  # Orange
-        width=1.2
-    ))
-    
-    # Histogram (Bullish/Bearish coloring)
+    # 2. MACD Panel (1)
     macd_hist_colors = np.where(df['Histogram'] >= 0, '#4B8C08', '#D83B2D')
+    addplots.extend([
+        mpf.make_addplot(df['MACD'], panel=1, color='#1f77b4', width=1.2),
+        mpf.make_addplot(df['Signal'], panel=1, color='#ff7f0e', width=1.2),
+        mpf.make_addplot(df['Histogram'], type='bar', panel=1, 
+                        color=macd_hist_colors, alpha=0.6, width=0.7)
+    ])
+
+    # 3. RSI Panel (2)
+    addplots.extend([
+        mpf.make_addplot(df['RSI'], panel=2, color='#4B0082', width=1.2, ylim=(0, 100)),
+        *[mpf.make_addplot(pd.Series(level, df.index), panel=2,
+                         color='gray', linestyle='--') for level in [30, 50, 70]]
+    ])
+
+    # 4. Williams %R Panel (3)
+    addplots.extend([
+        mpf.make_addplot(df['Williams_%R'], panel=3, color='blue', width=1.2),
+        mpf.make_addplot(pd.Series(-20, df.index), panel=3, color='red', linestyle='--'),
+        mpf.make_addplot(pd.Series(-80, df.index), panel=3, color='green', linestyle='--')
+    ])
+
+    # 5. ADX Panel (5)
     addplots.append(mpf.make_addplot(
-        df['Histogram'],
-        type='bar',
-        panel=1,
-        color=macd_hist_colors,
-        alpha=0.6,
-        width=0.7
-    ))
-
-    # ===== 3. RSI PANEL (2) =====
-    addplots.append(mpf.make_addplot(
-        df['RSI'],
-        panel=2,
-        color='#4B0082',
-        width=1.2,
-        ylim=(0, 100)
-    ))
-    
-    # Threshold Lines (30, 50, 70)
-    for level in [30, 50, 70]:
-        addplots.append(mpf.make_addplot(
-            pd.Series(level, index=df.index),
-            panel=2,
-            color='gray',
-            width=0.8,
-            linestyle='--',
-        ))
-
-    # Add Williams %R in its own panel (3)
-    addplots.append(mpf.make_addplot(df['Williams_%R'], panel=3, color='blue', width=1.2, ylabel='Williams %R'))
-
-    # Add overbought (-20) and oversold (-80) markers
-    addplots.append(mpf.make_addplot(pd.Series(-20, index=df.index), panel=3, color='red', linestyle='--'))
-    addplots.append(mpf.make_addplot(pd.Series(-80, index=df.index), panel=3, color='green', linestyle='--'))
-
-    # ===== FIXED ADX PLOTTING =====
-    if 'adx' not in df.columns:
-        df['adx'] = 0
-    df['adx'] = df['adx'].fillna(method='ffill').fillna(0)
-
-    addplots.append(mpf.make_addplot(
-        df[['adx', '+di', '-di']],
+        df[['adx', '+di', '-di']], 
         panel=5,
         width=1.2,
-        ylabel='ADX/DIs',
-        secondary_y=False
+        ylabel='ADX/DIs'
     ))
 
-    # ===== 5. VOLUME PANEL (4) =====
+    # 6. Volume Panel (4)
     volume_colors = np.where(df['close'] > df['open'], '#5cb85c', '#d9534f')
     addplots.append(mpf.make_addplot(
-        df['volume'],
-        type='bar',
+        df['volume'], 
+        type='bar', 
         panel=4,
-        color=volume_colors,
-        alpha=0.6,
+        color=volume_colors, 
+        alpha=0.6, 
         ylabel='Volume'
     ))
-    
+
     # ===== TRADE MARKERS =====
     if backtest and engine.trade_markers:
-        marker_series = pd.Series(
-            data=np.nan,
-            index=df.index.copy().tz_convert('America/New_York')
-        )
-        
+        marker_series = pd.Series(np.nan, index=df.index.tz_convert('America/New_York'))
         for trade in engine.trade_markers:
             trade_time = pd.to_datetime(trade['date']).tz_convert('America/New_York')
             if trade_time in marker_series.index:
                 marker_series[trade_time] = trade['price']
-        
-        addplots.append(mpf.make_addplot(
-            marker_series,
-            type='scatter',
-            markersize=100,
-            marker='$\\uparrow$',
-            color='lime',
-            panel=0
-        ))
-        addplots.append(mpf.make_addplot(
-            marker_series,
-            type='scatter',
-            markersize=100,
-            marker='$\\downarrow$', 
-            color='red',
-            panel=0
-        ))
+                
+        addplots.extend([
+            mpf.make_addplot(marker_series, type='scatter', markersize=100,
+                           marker='$\\uparrow$', color='lime', panel=0),
+            mpf.make_addplot(marker_series, type='scatter', markersize=100,
+                           marker='$\\downarrow$', color='red', panel=0)
+        ])
 
     # ===== STYLE CONFIGURATION =====
     mc = mpf.make_marketcolors(
-        up='#006400', down='#8B0000',
-        edge='inherit', wick='inherit',
+        up='#006400', 
+        down='#8B0000',
+        edge='inherit',
+        wick='inherit',
         volume={'up':'#006400', 'down':'#8B0000'}
     )
     
-    s = mpf.make_mpf_style(
+    style = mpf.make_mpf_style(
         marketcolors=mc,
         gridstyle=':',
         gridcolor='gainsboro',
         facecolor='white'
     )
 
-    # ===== EXECUTE PLOT =====
+    # ===== PLOT EXECUTION =====
     fig, axlist = mpf.plot(
         df,
         type='candle',
-        style=s,
+        style=style,
         addplot=addplots,
         volume=False,
-        panel_ratios=(12,6,4,4,4,4),  # Added ADX panel
-        figsize=(14, 24),  # Increased height
+        panel_ratios=(12,6,4,4,4,4),
+        figsize=(14, 24),
         returnfig=True
     )
-    
+
     # ===== PANEL ANNOTATIONS =====
     # MACD Panel
-    ax_macd = axlist[1]
-    ax_macd.axhline(0, color='gray', ls='--', alpha=0.7)
-    ax_macd.set_ylabel('MACD', rotation=90, labelpad=40)
-    
+    axlist[1].axhline(0, color='gray', ls='--', alpha=0.7)
+    axlist[1].set_ylabel('MACD', rotation=90, labelpad=40)
+
     # RSI Panel
-    ax_rsi = axlist[2]
-    ax_rsi.axhline(30, color='gray', ls='--', alpha=0.7)
-    ax_rsi.axhline(70, color='gray', ls='--', alpha=0.7)
-    ax_rsi.text(0.01, 0.95, 'Overbought (70)', transform=ax_rsi.transAxes, color='gray')
-    ax_rsi.text(0.01, 0.05, 'Oversold (30)', transform=ax_rsi.transAxes, color='gray')
+    axlist[2].text(0.01, 0.95, 'Overbought (70)', transform=axlist[2].transAxes, color='gray')
+    axlist[2].text(0.01, 0.05, 'Oversold (30)', transform=axlist[2].transAxes, color='gray')
 
     # Williams %R Panel
-    ax_will = axlist[3]
-    ax_will.axhline(-20, color='red', ls='--', alpha=0.7)
-    ax_will.axhline(-80, color='green', ls='--', alpha=0.7)
-    ax_will.text(0.01, 0.95, 'Overbought (-20)', transform=ax_will.transAxes, color='red')
-    ax_will.text(0.01, 0.05, 'Oversold (-80)', transform=ax_will.transAxes, color='green')
+    axlist[3].text(0.01, 0.95, 'Overbought (-20)', transform=axlist[3].transAxes, color='red')
+    axlist[3].text(0.01, 0.05, 'Oversold (-80)', transform=axlist[3].transAxes, color='green')
 
-    # Annotate ADX panel
-    ax_adx = axlist[5]
-    ax_adx.text(0.01, 0.95, 'Weak Trend (20)', transform=ax_adx.transAxes, color='gray')
-    ax_adx.text(0.01, 0.85, 'Strong Trend (40)', transform=ax_adx.transAxes, color='gray')
-    
+    # ADX Panel
+    axlist[5].text(0.01, 0.95, 'Weak Trend (20)', transform=axlist[5].transAxes, color='gray')
+    axlist[5].text(0.01, 0.85, 'Strong Trend (40)', transform=axlist[5].transAxes, color='gray')
+
+    # Final layout adjustments
+    plt.subplots_adjust(hspace=0.1)
+    for ax in axlist:
+        ax.set_xlabel('')
     plt.show()
 
 # =====================
