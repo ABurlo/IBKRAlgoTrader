@@ -18,6 +18,60 @@ from collections.abc import MutableMapping  # FIX: Added correct abstract base c
 import pytz
 
 # =====================
+# ADX CALCULATION (GLOBAL)
+# =====================
+def calculate_adx(df, period=14):
+    # Validate DataFrame structure
+    assert {'high', 'low', 'close'}.issubset(df.columns), "Missing OHLC columns"
+    
+    df = df.copy()
+    # Initialize required columns
+    for col in ['tr', '+dm', '-dm', '+dma', '-dma', 'tra', '+di', '-di', 'dx', 'adx']:
+        if col not in df.columns:
+            df[col] = 0.0
+
+    # True Range calculation
+    # Create shifted close column first
+    df['prev_close'] = df['close'].shift(1)
+
+    df['tr'] = df.apply(
+        lambda x: max(x.high - x.low,
+                    abs(x.high - x.prev_close),
+                    abs(x.low - x.prev_close)),
+        axis=1
+    )
+
+    # Directional Movement
+    df['+dm'] = np.where(
+        (df['high'].diff() > df['low'].diff().abs()) & 
+        (df['high'].diff() > 0),
+        df['high'].diff(), 0
+    )
+    df['-dm'] = np.where(
+        (df['low'].diff().abs() > df['high'].diff()) & 
+        (df['low'].diff() < 0),
+        df['low'].diff().abs(), 0
+    )
+
+    # Wilder's Smoothing
+    ema_alpha = 1/period
+    df['+dma'] = df['+dm'].ewm(alpha=ema_alpha, adjust=False).mean()
+    df['-dma'] = df['-dm'].ewm(alpha=ema_alpha, adjust=False).mean()
+    df['tra'] = df['tr'].ewm(alpha=ema_alpha, adjust=False).mean()
+
+    # Directional Indicators
+    epsilon = 1e-8
+    df['+di'] = (df['+dma'] / (df['tra'] + epsilon)) * 100
+    df['-di'] = (df['-dma'] / (df['tra'] + epsilon)) * 100
+
+    # DX and ADX
+    df['dx'] = (abs(df['+di'] - df['-di']) / 
+               (df['+di'] + df['-di'] + epsilon)) * 100
+    df['adx'] = df['dx'].ewm(alpha=ema_alpha, adjust=False).mean().fillna(0)
+    
+    return df[['adx', '+di', '-di']]
+
+# =====================
 # LINKED LIST DICTIONARY IMPLEMENTATION
 # =====================
 class LLNode:
@@ -99,10 +153,6 @@ def is_market_close(index):
 # =====================
 # PNL CALENDAR (FIXED)
 # =====================
-import pandas as pd
-import matplotlib.pyplot as plt
-import pytz
-
 def plot_pnl_calendar(engine, start_date, end_date, initial_balance, symbol):
     ny_tz = pytz.timezone('America/New_York')
 
@@ -134,8 +184,9 @@ def plot_pnl_calendar(engine, start_date, end_date, initial_balance, symbol):
 
         # Calculate offset for first day and number of weeks
         first_day_of_month = current_date.replace(day=1)
-        first_day_offset = first_day_of_month.weekday()  # 0 for Monday, 6 for Sunday
-        num_weeks = ((month_end.day + first_day_offset - 1) // 7) + 1
+        first_day_offset = first_day_of_month.weekday()
+        days_in_month = (current_date + pd.offsets.MonthEnd(1)).day
+        num_weeks = ((days_in_month + first_day_offset - 1) // 7) + 1
 
         # Plot each day
         for i, row in daily_pnl.iterrows():
@@ -232,11 +283,12 @@ def calculate_day_metrics(trades):
     win_loss_ratio = (wins / losses) if losses > 0 else float('inf')
 
     return {
-        'win_rate': round(win_rate, 2),
-        'win_loss_ratio': round(win_loss_ratio, 2) if win_loss_ratio < float('inf') else 'Infinity',
-        'num_trades': num_trades,
-        'pnl': round(pnl, 2)
-    }
+            'win_rate': round(win_rate, 2),
+            'win_loss_ratio': round(win_loss_ratio, 2) if win_loss_ratio < float('inf') else 'Infinity',
+            'num_trades': num_trades,
+            'pnl': round(pnl, 2)
+        }  # Remove trailing ...
+    
 
 # =====================
 # BACKTESTING ENGINE
@@ -321,15 +373,6 @@ class BacktestEngine:
         self.trade_history.append(trade)
         #logger.info(f"{action} executed: {trade}")
         return trade
-
-""" def close_position_eod(self, eod_price, timestamp):
-    
-    # Close any open positions at the end of the trading day.
-    
-    if self.current_position:
-        shares = self.current_position['shares']
-        trade = self.execute_trade(symbol, eod_price, shares, 'SELL', timestamp)
-        logger.info(f"EOD position closed: {trade}") """
 
 # Initialize engine globally
 engine = BacktestEngine()
@@ -455,7 +498,7 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
     if not backtest:
         bars = ib.reqHistoricalData(
             contract,
-            endDateTime='',  # Remove potential timezone info
+            endDateTime='',  
             durationStr='365 D',
             barSizeSetting='1 hour',
             whatToShow='TRADES',
@@ -463,24 +506,23 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
             formatDate=1,
             keepUpToDate=False
         )
-
-        # Convert BarDataList to DataFrame
+        
         if not bars:
             raise ValueError("No historical data received")
         
-        df = util.df(bars)  # Proper conversion to DataFrame
+        df = util.df(bars)
         df = df.dropna(subset=['volume'])
         df = df[df['volume'] > 0]
-        df['date'] = pd.to_datetime(df['date']).dt.tz_localize('America/New_York')  # Handle timezone properly
+        df['date'] = pd.to_datetime(df['date']).dt.tz_localize('America/New_York')
+        df = df.dropna(subset=['high', 'low', 'close'])
         
-        # ===== MACD CALCULATION =====
+        # Technical indicators
         exp12 = df['close'].ewm(span=12, adjust=False).mean()
         exp26 = df['close'].ewm(span=26, adjust=False).mean()
         df['MACD'] = exp12 - exp26
         df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
         df['Histogram'] = df['MACD'] - df['Signal']
-            
-        # Calculate RSI
+        
         delta = df['close'].diff()
         gain = delta.where(delta > 0, 0.0)
         loss = -delta.where(delta < 0, 0.0)
@@ -488,8 +530,7 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
         df['RSI'] = 100 - (100 / (1 + (avg_gain / avg_loss)))
         
-        # Calculate VWAP
-        df['trading_date'] = df['date'].dt.date
+        df['trading_date'] = df.index.date
         typical_price = (df['high'] + df['low'] + df['close']) / 3
         df['tp_vol'] = df['volume'] * typical_price
         df['cumulative_tp_vol'] = df.groupby('trading_date')['tp_vol'].cumsum()
@@ -506,7 +547,7 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         bars = ib.reqHistoricalData(
             contract,
             endDateTime='',
-            durationStr='30 D',
+            durationStr='60 D',
             barSizeSetting='1 hour',
             whatToShow='TRADES',
             useRTH=True,
@@ -517,31 +558,31 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         if not bars:
             raise ValueError("No historical data received")
         
-        df = util.df(bars)  # Proper conversion to DataFrame
-
+        df = util.df(bars)
         if df.empty:
             raise ValueError("Empty DataFrame received from IB")
-        
-        # VWAP calculation
+
+        df.columns = df.columns.str.strip().str.lower()
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'])
+            df.set_index('date', inplace=True)
+
+        adx_components = calculate_adx(df)
+        df = df.join(adx_components)
+        df[['adx', '+di', '-di']] = df[['adx', '+di', '-di']].fillna(0)
+
         df['vwap_numerator'] = df['volume'] * (df['high'] + df['low'] + df['close']) / 3
         df['vwap_denominator'] = df['volume']
-        
-        df['trading_date'] = df['date'].dt.date
+        df['trading_date'] = df.index.date
         df['VWAP'] = (df.groupby('trading_date')['vwap_numerator'].cumsum() /
-                      df.groupby('trading_date')['vwap_denominator'].cumsum())
+                     df.groupby('trading_date')['vwap_denominator'].cumsum())
         
-        df = df.drop(['vwap_numerator', 'vwap_denominator', 'trading_date'], axis=1)
-        df['Williams_%R'] = williams_r(df['high'], df['low'], df['close'])
-        
-        # ======= ADD THIS SECTION =======
-        # MACD calculation
         exp12 = df['close'].ewm(span=12, adjust=False).mean()
         exp26 = df['close'].ewm(span=26, adjust=False).mean()
         df['MACD'] = exp12 - exp26
         df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
         df['Histogram'] = df['MACD'] - df['Signal']
         
-        # RSI calculation
         delta = df['close'].diff()
         gain = delta.where(delta > 0, 0.0)
         loss = -delta.where(delta < 0, 0.0)
@@ -549,8 +590,10 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
         df['RSI'] = 100 - (100 / (1 + (avg_gain / avg_loss)))
         df['Williams_%R'] = williams_r(df['high'], df['low'], df['close'])
-        df['Williams_%R_diff'] = df['Williams_%R'].diff(3).fillna(0)  # Add this line
-        df.set_index('date', inplace=True)
+        df['Williams_%R_diff'] = df['Williams_%R'].diff(3).fillna(0)
+        df = df.drop(['vwap_numerator', 'vwap_denominator', 'trading_date'], axis=1)
+        
+        assert not df[['adx', '+di', '-di']].isnull().values.any(), "ADX NaN values present"
         return df
 
     return get_historical_data(ib, symbol, exchange, currency, False)
@@ -834,6 +877,19 @@ def plot_candlestick(df, backtest=False):
     addplots.append(mpf.make_addplot(pd.Series(-20, index=df.index), panel=3, color='red', linestyle='--'))
     addplots.append(mpf.make_addplot(pd.Series(-80, index=df.index), panel=3, color='green', linestyle='--'))
 
+    # ===== FIXED ADX PLOTTING =====
+    if 'adx' not in df.columns:
+        df['adx'] = 0
+    df['adx'] = df['adx'].fillna(method='ffill').fillna(0)
+
+    addplots.append(mpf.make_addplot(
+        df[['adx', '+di', '-di']],
+        panel=5,
+        width=1.2,
+        ylabel='ADX/DIs',
+        secondary_y=False
+    ))
+
     # ===== 5. VOLUME PANEL (4) =====
     volume_colors = np.where(df['close'] > df['open'], '#5cb85c', '#d9534f')
     addplots.append(mpf.make_addplot(
@@ -895,8 +951,8 @@ def plot_candlestick(df, backtest=False):
         style=s,
         addplot=addplots,
         volume=False,
-        panel_ratios=(12,6,4,4,4),  # Price:12, MACD:6, RSI:4, Williams %R:4, Volume:4 - doubled from (6,3,2,2,2)
-        figsize=(14, 20), # increased figure size
+        panel_ratios=(12,6,4,4,4,4),  # Added ADX panel
+        figsize=(14, 24),  # Increased height
         returnfig=True
     )
     
@@ -920,6 +976,11 @@ def plot_candlestick(df, backtest=False):
     ax_will.text(0.01, 0.95, 'Overbought (-20)', transform=ax_will.transAxes, color='red')
     ax_will.text(0.01, 0.05, 'Oversold (-80)', transform=ax_will.transAxes, color='green')
 
+    # Annotate ADX panel
+    ax_adx = axlist[5]
+    ax_adx.text(0.01, 0.95, 'Weak Trend (20)', transform=ax_adx.transAxes, color='gray')
+    ax_adx.text(0.01, 0.85, 'Strong Trend (40)', transform=ax_adx.transAxes, color='gray')
+    
     plt.show()
 
 # =====================
