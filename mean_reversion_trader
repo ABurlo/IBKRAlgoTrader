@@ -90,7 +90,7 @@ def is_market_close(index):
     market_close_time = time(16, 0)  # 4 PM ET
     
     # Create dummy datetime for comparison
-    dummy_date = datetime.today().date()
+    dummy_date = index.tz_convert(ny_tz).date()
     market_close = datetime.combine(dummy_date, market_close_time)
     comparison_time = datetime.combine(dummy_date, current_time)
     
@@ -270,39 +270,36 @@ class BacktestEngine:
         }
     
     # =====================
-    # UPDATED POSITION SIZING
+    # OPTIMIZED POSITION SIZING
     # =====================
     def calculate_position_size(self, row):
-        """Complete position sizing implementation"""
-        if 'meanrange' not in row:
-            raise KeyError("Missing MRC 'meanrange'")
-        risk_per_trade = self.balance * 0.02
-        volatility_measure = row['meanrange']
-        position_size = risk_per_trade / volatility_measure
-        return max(1, position_size)
+        """Combines ATR and MRC volatility measures"""
+        risk_capital = self.balance * 0.02  # 2% risk per trade
+        combined_volatility = np.sqrt(
+            (row['meanrange']**2) + (row['ATR']**2)
+        )
+        return max(1, risk_capital / combined_volatility)
     
+
     def composite_signal_score(self, row):
-        """Enhanced composite score with dynamic volatility scaling and proper normalization"""
-        # Volatility scaling using ATR (1-3x multiplier)
-        volatility_scaler = 1 + min(2, (row['ATR'] / row['close']) * 2)
+        """Dynamic volatility scaling with regime detection"""
+        # Volatility regime detection (1-3x multiplier)
+        volatility_regime = 1 + min(2, (row['ATR'] / row['close']) * 2.5)
         
-        # Component scores with bounded ranges and improved normalization
+        # Component scores with dynamic bounds
         scores = {
-            'rsi': max(-1, min(1, (40 - row['RSI']) / 20)),  # -1 (overbought) to 1 (oversold)
-            'williams': max(-1, min(1, (-80 - row['Williams_%R']) / 40)),  # -1 to 1 range
+            'rsi': max(-1, min(1, (35 - row['RSI']) / 15)),  # More sensitive to oversold
+            'williams': max(-1, min(1, (-85 - row['Williams_%R']) / 40)),
             'macd': self._normalize_macd(row['MACD'], row['Signal']),
-            'vwap': (row['VWAP'] - row['close']) / row['VWAP'] * 2,  # -2 to 2 range
+            'vwap': (row['VWAP'] - row['close']) / row['VWAP'] * 2.2,
             'adx': self._dynamic_adx_weight(row['adx'], row['+di'], row['-di']),
-            'volume': (row['volume'] - row['volume_ma']) / row['volume_ma']  # Volume momentum
+            'volume': (row['volume'] - row['volume_ma']) / row['volume_ma'] * 1.2
         }
         
-        # Apply weights and volatility scaling
-        weighted_score = sum(
-            self.indicator_weights[k] * scores[k] 
+        return sum(
+            self.indicator_weights[k] * scores[k] * volatility_regime
             for k in self.indicator_weights
-        ) * volatility_scaler
-    
-        return max(-1, min(1, weighted_score))  # Clamped output for stability
+        )
 
     def _normalize_macd(self, macd, signal):
         """Safe MACD normalization with signal consideration"""
@@ -430,22 +427,23 @@ def check_entry_conditions(df, index):
     """Fixed entry conditions with proper operators"""
     row = df.loc[index]
     
+    volume_confirm = (
+        (row['volume'] > row['volume_ma'] * 1.2) and
+        (row['volume_ma'] > df['volume_ma'].rolling(50).mean().iloc[-1])
+    )
+    
     entry_confluence = (
         (row['close'] < row['loband1']) and # Correct column name from MRC calculation
-        (row['RSI'] < 30) and
+        (row['RSI'] < 32) and
         (row['Williams_%R'] < -80) and
         (row['VWAP'] > row['close']) and
         (row['MACD'] < row['Signal']) and
         (row['adx'] < engine.adx_params['mean_reversion_threshold']) and
         (row['+di'] < row['-di']) and
-        (row['%K'] < 25) and
+        (row['%K'] < row['%D']) and
         (row['%D'] < 30) and
-        (row['%K'] > row['%D'])
-    )
-
-    volatility_confirmation = (
-        (row['meanrange'] > engine.volatility_filter['min_mrc'] * 1.5) and
-        np.abs(row['+di'] - row['-di']) > 5
+        volume_confirm and
+        not is_market_close(index)
     )
     
     # Volatility Filter using engine reference
@@ -823,6 +821,7 @@ def stochastic_oscillator(df, k_period=14, d_period=3):
     high_max = df['high'].rolling(k_period).max()
     
     df['%K'] = 100 * ((df['close'] - low_min) / (high_max - low_min))
+    denominator = np.where(high_max != low_min, high_max - low_min, 1)
     df['%K'] = df['%K'].fillna(50)  # Neutral value when no range
     df['%D'] = df['%K'].rolling(d_period).mean()
     return df
@@ -1090,6 +1089,7 @@ def main():
                     start_dt = pd.to_datetime(trade_history['timestamp'].min())
                     end_dt = pd.to_datetime(trade_history['timestamp'].max())
                     days = (end_dt - start_dt).days + 1
+                    if days < 1: days = 1  # Prevent division by zero
                     annualized_return = ((engine.balance/initial_balance) ** (252/days) - 1) * 100
                 else:
                     annualized_return = 0.0  # No trades or insufficient data
