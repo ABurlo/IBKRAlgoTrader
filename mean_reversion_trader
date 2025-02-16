@@ -12,7 +12,6 @@ import logging
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 from time import sleep
-import calplot
 from matplotlib.colors import ListedColormap
 from collections.abc import MutableMapping  # FIX: Added correct abstract base class import
 import pytz
@@ -78,7 +77,7 @@ class LLDict(MutableMapping):  # FIX: Replaced DictAbstract with MutableMapping
 # =====================
 # GLOBAL CONFIGURATION
 # =====================
-symbol = 'PLTR' # Random Stock Ticker Generator - API call IBKR random pos in array of NYSE/NASDAQ tickers list?
+symbol = 'GOOGL' # Random Stock Ticker Generator - API call IBKR random pos in array of NYSE/NASDAQ tickers list?
 initial_balance = 10000
 
 # =====================
@@ -252,47 +251,72 @@ class BacktestEngine:
             'confirmation_bars': 3
         }
         self.indicator_weights = {
-            'bollinger': 0.3,
-            'rsi': 0.2,
-            'williams': 0.2,
-            'macd': 0.15,  # Fixed static weight
-            'vwap': 0.15
+            'rsi': 0.25,
+            'williams': 0.25,
+            'macd': 0.2,
+            'vwap': 0.15,
+            'adx': 0.1,
+            'volume': 0.05  # New component
         }
-        
         self.volatility_filter = {
-            'min_atr': 0.02,  # 2% of price
-            'max_atr': 0.05   # 5% of price  
+            'min_mrc': 0.02,
+            'max_mrc': 0.05    
         }
-
+        self.adx_params = {
+            'mean_reversion_threshold': 25,
+            'low_volatility_threshold': 15,  # New filter
+            'trend_strength_exit': 40,
+            'rapid_trend_threshold': 15
+        }
+    
+    # =====================
+    # UPDATED POSITION SIZING
+    # =====================
     def calculate_position_size(self, row):
-        atr = row['Std_Dev']
-        if not (self.volatility_filter['min_atr'] < atr < self.volatility_filter['max_atr']):
-            return 0  # Skip trade if volatility outside acceptable range
-        risk_per_trade = self.balance * 0.02  # Reduce risk to 2%
-        return risk_per_trade / atr
+        """Complete position sizing implementation"""
+        if 'meanrange' not in row:
+            raise KeyError("Missing MRC 'meanrange'")
+        risk_per_trade = self.balance * 0.02
+        volatility_measure = row['meanrange']
+        position_size = risk_per_trade / volatility_measure
+        return max(1, position_size)
     
     def composite_signal_score(self, row):
-        """Calculate weighted composite signal score with safety checks"""
-        # Handle MACD validity dynamically
-        macd_weight = 0.15 if not np.isnan(row['MACD']) else 0
+        """Enhanced composite score with dynamic volatility scaling and proper normalization"""
+        # Volatility scaling using ATR (1-3x multiplier)
+        volatility_scaler = 1 + min(2, (row['ATR'] / row['close']) * 2)
         
+        # Component scores with bounded ranges and improved normalization
         scores = {
-            'bollinger': (row['Lower_Band'] - row['close'])/row['Lower_Band'],
-            'rsi': (35 - row['RSI'])/35,
-            'williams': (-80 - row['Williams_%R'])/80,
-            'macd': (row['MACD'] - row['Signal'])/abs(row['MACD']) if abs(row['MACD']) > 1e-8 else 0,
-            'vwap': (row['VWAP'] - row['close'])/row['VWAP']
+            'rsi': max(-1, min(1, (40 - row['RSI']) / 20)),  # -1 (overbought) to 1 (oversold)
+            'williams': max(-1, min(1, (-80 - row['Williams_%R']) / 40)),  # -1 to 1 range
+            'macd': self._normalize_macd(row['MACD'], row['Signal']),
+            'vwap': (row['VWAP'] - row['close']) / row['VWAP'] * 2,  # -2 to 2 range
+            'adx': self._dynamic_adx_weight(row['adx'], row['+di'], row['-di']),
+            'volume': (row['volume'] - row['volume_ma']) / row['volume_ma']  # Volume momentum
         }
         
-        # Apply dynamic weighting
-        return sum([
-            self.indicator_weights['bollinger'] * scores['bollinger'],
-            self.indicator_weights['rsi'] * scores['rsi'],
-            self.indicator_weights['williams'] * scores['williams'],
-            macd_weight * scores['macd'],  # Use dynamic weight here
-            self.indicator_weights['vwap'] * scores['vwap']
-        ])
+        # Apply weights and volatility scaling
+        weighted_score = sum(
+            self.indicator_weights[k] * scores[k] 
+            for k in self.indicator_weights
+        ) * volatility_scaler
+    
+        return max(-1, min(1, weighted_score))  # Clamped output for stability
 
+    def _normalize_macd(self, macd, signal):
+        """Safe MACD normalization with signal consideration"""
+        denominator = abs(macd) + abs(signal)
+        if denominator < 1e-8:
+            return 0
+        return (macd - signal) / denominator
+
+    def _dynamic_adx_weight(self, adx, plus_di, minus_di):
+        """ADX weighting that considers trend direction and strength"""
+        di_diff = abs(plus_di - minus_di)
+        trend_strength = max(0, (25 - min(adx, 25)) / 25)  # 0-1 based on ADX <25
+        direction_confidence = 1 - (di_diff / 100)  # 1 when DIs converge
+        return trend_strength * direction_confidence
 
     def apply_slippage(self, price, is_buy):
         """
@@ -300,12 +324,6 @@ class BacktestEngine:
         """
         slippage_factor = 1 + (self.slippage if is_buy else -self.slippage)
         return price * slippage_factor
-
-    def calculate_position_size(self, row):
-        risk_per_trade = self.balance * 0.04
-        atr = row['Std_Dev']
-        return risk_per_trade / atr if atr != 0 else 0
-
     
     def calculate_fees(self, shares):
         """
@@ -313,8 +331,16 @@ class BacktestEngine:
         """
         return abs(shares * self.fee_per_share)
 
-    # For the execute_trade method, ensure proper self reference:
+    # =====================
+    # RUNTIME VALIDATION (ADD TO BacktestEngine)
+    # =====================
     def execute_trade(self, symbol, price, shares, action, timestamp):
+        # Add validation for MRC columns
+        required_mrc_columns = ['meanline', 'meanrange', 'loband1']
+        missing = [col for col in required_mrc_columns if col not in self.current_row]
+        if missing:
+            raise KeyError(f"Missing MRC columns: {missing} - run calculate_mrc() first")
+        
         if np.isnan(self.current_row['VWAP']):
             logger.error("Skipping trade with invalid VWAP")
             return None
@@ -337,11 +363,10 @@ class BacktestEngine:
                         (1-vwap_weight) * current_row['close'])
         
         # Volatility damping factor
-        volatility_impact = 1 - (current_row['Std_Dev']/current_row['SMA_20'])
+        volatility_impact = 1 - (current_row['meanrange']/current_row['meanline'])
         shares *= volatility_impact
         fees = self.calculate_fees(shares)
         position_value = abs(shares * executed_price)
-
         trade = {
             'timestamp': timestamp,
             'action': action,
@@ -398,24 +423,71 @@ engine = BacktestEngine()
 # =====================
 # STRATEGY CONDITIONS
 # =====================
+# =====================
+# CORRECTED ENTRY/EXIT CONDITIONS
+# =====================
 def check_entry_conditions(df, index):
+    """Fixed entry conditions with proper operators"""
     row = df.loc[index]
-    # Mean Reversion Confluence Requirements
+    
     entry_confluence = (
-        (row['close'] < row['Lower_Band']) and          # Bollinger Band oversold
-        (row['RSI'] < 30) and                            # RSI oversold
-        (row['Williams_%R'] < -80) and                   # Williams %R oversold
-        (row['VWAP'] > row['close']) and                 # Price below VWAP
-        (row['MACD'] < row['Signal'])                    # Bearish MACD crossover
+        (row['close'] < row['loband1']) and # Correct column name from MRC calculation
+        (row['RSI'] < 30) and
+        (row['Williams_%R'] < -80) and
+        (row['VWAP'] > row['close']) and
+        (row['MACD'] < row['Signal']) and
+        (row['adx'] < engine.adx_params['mean_reversion_threshold']) and
+        (row['+di'] < row['-di']) and
+        (row['%K'] < 25) and
+        (row['%D'] < 30) and
+        (row['%K'] > row['%D'])
     )
-    return (
-        entry_confluence and
+
+    volatility_confirmation = (
+        (row['meanrange'] > engine.volatility_filter['min_mrc'] * 1.5) and
+        np.abs(row['+di'] - row['-di']) > 5
+    )
+    
+    # Volatility Filter using engine reference
+    volatility_ok = (
+        engine.volatility_filter['min_mrc'] < row['meanrange'] < 
+        engine.volatility_filter['max_mrc']
+    )
+
+    
+    # ADX Range Filtering (using shifted values)
+    adx_ok = (
+        (row['adx_shifted'] > engine.adx_params['low_volatility_threshold']) and
+        (row['adx_shifted'] < engine.adx_params['mean_reversion_threshold'])
+    )
+    
+    # FIXED (using MRC metrics)
+    volatility_confirmation = (
+        (row['meanrange'] > engine.volatility_filter['min_mrc'] * 1.5) and
+        np.abs(row['+di'] - row['-di']) > 5  # FIXED
+    )
+    
+    # Position & Balance Checks
+    position_ok = (
         engine.composite_signal_score(row) > 0.7 and
         engine.balance > 1000 and
-        not engine.current_position
+        not engine.current_position and
+        volatility_ok
+    )
+    
+    # Time Filter
+    time_ok = not is_market_close(index)
+    
+    return (
+        entry_confluence and 
+        position_ok and 
+        time_ok and 
+        adx_ok and  # New ADX range check
+        volatility_confirmation  # Additional filter
     )
 
 def check_exit_conditions(df, index):
+    """Enhanced exit conditions with ADX trend monitoring"""
     if not engine.current_position:
         return False
 
@@ -427,17 +499,56 @@ def check_exit_conditions(df, index):
         row['close'] > row['SMA_20'],                    # Price above SMA
         row['RSI'] > 40,                                 # RSI normalization
         row['Williams_%R'] > -60,                        # Williams %R recovery
-        row['close'] > row['VWAP']                       # Price above VWAP
+        row['close'] > row['VWAP'],                      # Price above VWAP
+        row['adx'] > 40,                                 # Strong trend emerging
+        row['+di'] > row['-di']                          # Bullish DI crossover
+        (row['%K'] > 75), 
+        (row['%D'] > 70), 
+        (row['%K'] < row['%D'])  # Bearish crossover
     ]
     
-    # Stop Loss Conditions
-    stop_loss = (
+    # FIXED (using MRC metrics)
+    stop_loss_conditions = (
+        row['close'] < entry_price * 0.98 or
+        row['meanrange'] > engine.volatility_filter['max_mrc'] * 1.5 or
+        np.abs(row['adx_shifted'] - row['adx_shifted'].shift(3)) > 15  # FIXED
+    )
+
+    return any(profit_conditions) or stop_loss_conditions
+
+# =====================
+# EXIT CONDITION IMPLEMENTATION 
+# =====================
+def check_exit_conditions(df, index):
+    """Enhanced exit conditions with ADX trend monitoring"""
+    if not engine.current_position:
+        return False
+
+    row = df.loc[index]
+    entry_price = engine.current_position['entry_price']
+    
+    # Profit Target Conditions
+    profit_conditions = [
+        row['close'] > row['SMA_20'],                    # Price above SMA
+        row['RSI'] > 40,                                 # RSI normalization
+        row['Williams_%R'] > -60,                        # Williams %R recovery
+        row['close'] > row['VWAP'],                      # Price above VWAP
+        row['adx'] > 40,                                 # Strong trend emerging
+        row['+di'] > row['-di']                          # Bullish DI crossover
+    ]
+    
+    # Dynamic Stop Loss System
+    stop_loss_conditions = (
         row['close'] < entry_price * 0.98 or             # 2% hard stop
-        row['Std_Dev'] > engine.volatility_filter['max_atr'] * 1.5
+        row['meanrange'] > engine.volatility_filter['max_mrc'] * 1.5 or
+        (row['adx'] - row['adx'].shift(3)) > 15          # Rapid trend strengthening
     )
     
-    return any(profit_conditions) or stop_loss
-
+    # Time-Based Exit (30-minute timeout)
+    position_age = (index - engine.current_position['timestamp']).total_seconds() / 60
+    time_exit = position_age > 30
+    
+    return any(profit_conditions) or stop_loss_conditions or time_exit
 
 # =====================
 # ENHANCED LOGGING WITH PROPER COLORIZATION
@@ -538,9 +649,48 @@ def log_trade(trade, symbol):
         logger.error(f"Failed to log trade: {str(e)}", exc_info=True)
 
 # =====================
-# DATA MANAGEMENT
+# DATA MANAGEMENT (UPDATED FOR MRC)
 # =====================
 nest_asyncio.apply()
+
+
+def calculate_mrc(df: pd.DataFrame, length=200) -> pd.DataFrame:
+    """Calculate Mean Reversion Channel with proper validation"""
+    df = df.copy()
+    
+    # Calculate HLC3 if missing
+    if 'hlc3' not in df.columns:
+        df['hlc3'] = (df['high'] + df['low'] + df['close']) / 3
+        
+    # Calculate meanline using supersmoother
+    df['meanline'] = supersmoother(df['hlc3'], length)
+    
+    # True Range calculation
+    tr = np.maximum(
+        df['high'] - df['low'],
+        np.maximum(
+            np.abs(df['high'] - df['close'].shift().bfill()),
+            np.abs(df['low'] - df['close'].shift().bfill())
+        )
+    )
+    df['meanrange'] = supersmoother(tr, length)
+    
+    # Create MRC bands
+    inner_mult = 1.0
+    outer_mult = 2.415
+    pi = np.pi
+    df['upband1'] = df['meanline'] + (df['meanrange'] * pi * inner_mult)
+    df['loband1'] = df['meanline'] - (df['meanrange'] * pi * inner_mult)
+    df['upband2'] = df['meanline'] + (df['meanrange'] * pi * outer_mult)
+    df['loband2'] = df['meanline'] - (df['meanrange'] * pi * outer_mult)
+
+    # Validate MRC columns
+    required_mrc_cols = ['meanline', 'upband1', 'loband1', 'upband2', 'loband2']
+    if not all(col in df.columns for col in required_mrc_cols):
+        missing = [col for col in required_mrc_cols if col not in df.columns]
+        raise ValueError(f"MRC calculation failed - missing columns: {missing}")
+    
+    return df
 
 def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=False):
     contract = Stock(symbol, exchange, currency)
@@ -548,7 +698,7 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         bars = ib.reqHistoricalData(
             contract,
             endDateTime='',
-            durationStr='30 D',
+            durationStr='7 D',
             barSizeSetting='1 hour',
             whatToShow='TRADES',
             useRTH=True,
@@ -563,72 +713,96 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         if df.empty:
             raise ValueError("Empty DataFrame received from IB")
 
-        required_columns = {
-            'open': 'open',
-            'high': 'high', 
-            'low': 'low',
-            'close': 'close',
-            'volume': 'volume'
-        }
+        # Clean column names first
         df = df.rename(columns={
             'open': 'open',
             'high': 'high',
             'low': 'low', 
             'close': 'close',
             'volume': 'volume'
-        })
-        
+        }).drop(columns=['average', 'barCount'], errors='ignore')
+
         if 'date' in df.columns:
             df['date'] = pd.to_datetime(df['date'])
             df.set_index('date', inplace=True)
 
+        # Add MRC before other indicators
+        df = calculate_mrc(df)
+        
+        # Add post-calculation validation
+        required_mrc_cols = ['meanline', 'upband1', 'loband1', 'upband2', 'loband2']
+        if not all(col in df.columns for col in required_mrc_cols):
+            missing = [col for col in required_mrc_cols if col not in df.columns]
+            raise ValueError(f"Post-MRC missing columns: {missing}")
+        
+        # Technical indicators
         adx_components = calculate_adx(df)
-        df = df.join(adx_components)
+        df = df.join(adx_components, lsuffix='', rsuffix='_drop').drop(columns=['adx_drop', '+di_drop', '-di_drop', 'adx_shifted_drop'], errors='ignore')
         df[['adx', '+di', '-di']] = df[['adx', '+di', '-di']].fillna(0)
 
-        df['vwap_numerator'] = df['volume'] * (df['high'] + df['low'] + df['close']) / 3
+        # Stochastic oscillator
+        df = stochastic_oscillator(df)
+        
+        # VWAP calculation
+        df['vwap_numerator'] = df['volume'] * df['hlc3']  # Use existing hlc3
         df['vwap_denominator'] = df['volume']
         df['trading_date'] = df.index.date
         df['VWAP'] = (df.groupby('trading_date')['vwap_numerator'].cumsum() /
                      df.groupby('trading_date')['vwap_denominator'].cumsum())
         
+        # MACD with noise filtering
         exp12 = df['close'].ewm(span=12, adjust=False).mean()
         exp26 = df['close'].ewm(span=26, adjust=False).mean()
-        df['MACD'] = exp12 - exp26
-        df['MACD'] = np.where(np.abs(exp12 - exp26) < 1e-8, 0, df['MACD'])  # Force near-zero to zero
-        df['MACD'] = df['MACD'].replace([np.inf, -np.inf], 0)  # Handle infinities
+        df['MACD'] = np.where(np.abs(exp12 - exp26) < 1e-8, 0, exp12 - exp26)
         df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
         df['Histogram'] = df['MACD'] - df['Signal']
         
+        # RSI calculation
         delta = df['close'].diff()
         gain = delta.where(delta > 0, 0.0)
         loss = -delta.where(delta < 0, 0.0)
         avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
-        avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()        
         df['RSI'] = 100 - (100 / (1 + (avg_gain / avg_loss)))
+        
+        # Williams %R
         df['Williams_%R'] = williams_r(df['high'], df['low'], df['close'])
         df['Williams_%R_diff'] = df['Williams_%R'].diff(3).fillna(0)
+        
+        df['ATR'] = df['high'] - df['low']  # Basic implementation - replace with proper ATR
+        df['volume_ma'] = df['volume'].rolling(20).mean()
+        
+        
+        # Feature engineering updates
         df = df.drop(['vwap_numerator', 'vwap_denominator', 'trading_date'], axis=1)
-        
-        df['SMA_20'] = df['close'].rolling(20).mean()
-        df['Std_Dev'] = df['close'].rolling(20).std()
-        df['Upper_Band'] = df['SMA_20'] + (df['Std_Dev'] * 2)
-        df['Lower_Band'] = df['SMA_20'] - (df['Std_Dev'] * 2)
-        df['Williams_%R_diff'] = df['Williams_%R'].diff(3).fillna(0)
-        
         df['RSI_shifted'] = df['RSI'].shift(1)
         df['MACD_shifted'] = df['MACD'].shift(1)
         df['Signal_shifted'] = df['Signal'].shift(1)
         df['Volume_MA_shifted'] = df['volume'].rolling(20).mean().shift(1)
+        df['adx_shifted'] = df['adx'].shift(1)
         
-        missing_indicator_mask = df[['adx', '+di', '-di']].isnull().any(axis=1)
-        if missing_indicator_mask.any():
-            logger.warning(f"Cleaning {missing_indicator_mask.sum()} rows")
-            df = df.dropna(subset=['adx', '+di', '-di'])
-        assert not df[['adx', '+di', '-di']].isnull().values.any(), "ADX NaN values present"
-        return df
+        # Validate core indicators for composite score
+        composite_required = ['ATR', 'volume_ma', 'adx', 'RSI', 'Williams_%R', 'MACD', 'VWAP']
+        missing = [col for col in composite_required if col not in df.columns]
+        if missing:
+            raise ValueError(f"Missing composite score columns: {missing}")
 
-    return get_historical_data(ib, symbol, exchange, currency, False)
+        # Cleanup MRC bands only if actually used elsewhere
+
+        mrc_bands = ['meanline', 'upband1', 'loband1', 'upband2', 'loband2']
+        df.dropna(subset=mrc_bands, inplace=True)
+        
+        if df.empty:
+            raise ValueError("Empty DataFrame after MRC processing")
+            
+        assert not df[['adx', '+di', '-di'] + required_mrc_cols].isnull().values.any(), \
+            "NaN values present in critical columns"
+            
+        required_mrc_cols = ['meanline', 'upband1', 'loband1', 'upband2', 'loband2']
+        if not all(col in df.columns for col in required_mrc_cols):
+            raise ValueError("MRC calculation failed - missing columns")
+
+        return df
 
 # =====================
 # WILLIAMS %R IMPLEMENTATION
@@ -643,35 +817,96 @@ def williams_r(high, low, close, lookback=14):
     wr = -100 * ((highest_high - close) / denominator)
     return wr.fillna(-50)  # Neutral value when no range
 
+def stochastic_oscillator(df, k_period=14, d_period=3):
+    """Calculate Stochastic Oscillator with NaN handling"""
+    low_min = df['low'].rolling(k_period).min()
+    high_max = df['high'].rolling(k_period).max()
+    
+    df['%K'] = 100 * ((df['close'] - low_min) / (high_max - low_min))
+    df['%K'] = df['%K'].fillna(50)  # Neutral value when no range
+    df['%D'] = df['%K'].rolling(d_period).mean()
+    return df
+
 # =====================
-# ADX CALCULATION
+# FIXED ADX CALCULATION (PANDAS SERIES)
 # =====================
 def calculate_adx(df, window=14):
-    """Calculate ADX with +DI/-DI"""
-    high, low, close = df['high'], df['low'], df['close']
+    """Fixed ADX calculation with proper initialization"""
+    high = df['high']
+    low = df['low']
+    close = df['close']
     
-    # Calculate +DM and -DM
-    plus_dm = high.diff().where(high.diff() > 0, 0)
-    minus_dm = low.diff().abs().where(low.diff() < 0, 0)
-    plus_dm[plus_dm < 0] = 0
-    minus_dm[minus_dm > 0] = 0
+    # Initialize DI series
+    plus_di = pd.Series(0.0, index=df.index)
+    minus_di = pd.Series(0.0, index=df.index)
     
-    # Calculate True Range
-    tr = pd.concat([
+    # True Range calculation
+    tr = np.maximum(
         high - low,
-        abs(high - close.shift()),
-        abs(low - close.shift())
-    ], axis=1).max(axis=1)
+        np.maximum(
+            np.abs(high - close.shift().bfill()),
+            np.abs(low - close.shift().bfill())
+        )
+    )
     
-    # Smooth values
-    atr = tr.ewm(alpha=1/window, adjust=False).mean()
-    plus_di = 100 * (plus_dm.ewm(alpha=1/window, adjust=False).mean() / atr)
-    minus_di = 100 * (minus_dm.ewm(alpha=1/window, adjust=False).mean() / atr)
+    # Directional Movement
+    up_move = high.diff()
+    down_move = -low.diff()
     
-    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
-    adx = dx.ewm(alpha=1/window, adjust=False).mean()
+    # Smoothed values
+    tr_smooth = tr.ewm(alpha=1/window, adjust=False).mean()
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
     
-    return pd.DataFrame({'adx': adx, '+di': plus_di, '-di': minus_di})
+    # Calculate DI values
+    plus_di = 100 * (plus_dm.ewm(alpha=1/window, adjust=False).mean() / tr_smooth)
+    minus_di = 100 * (minus_dm.ewm(alpha=1/window, adjust=False).mean() / tr_smooth)
+    
+    # DX and ADX calculation
+    di_diff = np.abs(plus_di - minus_di)
+    di_sum = (plus_di + minus_di).replace(0, 1e-8)
+    dx = 100 * (di_diff / di_sum)
+    adx = dx.ewm(alpha=1/window, adjust=False).mean().clip(0, 100)
+    
+    # Create shifted version
+    df['adx'] = adx
+    df['+di'] = plus_di
+    df['-di'] = minus_di
+    df['adx_shifted'] = df['adx'].shift(1).fillna(0)
+    
+    return df[['adx', '+di', '-di', 'adx_shifted']]
+
+# =====================
+# CORRECTED SUPER SMOOTHER
+# =====================
+def supersmoother(src: pd.Series, length: int) -> pd.Series:
+    """Fixed implementation using .iloc for positional access"""
+    a1 = np.exp(-np.sqrt(2)*np.pi/length)
+    b1 = 2*a1*np.cos(np.sqrt(2)*np.pi/length)
+    c3 = -a1**2
+    c2 = b1
+    c1 = 1 - c2 - c3
+    
+    ss = np.zeros_like(src)
+    # Proper positional access with .iloc
+    ss[0] = src.iloc[0]
+    ss[1] = src.iloc[1]
+    for i in range(2, len(src)):
+        ss[i] = c1*src.iloc[i] + c2*ss[i-1] + c3*ss[i-2]
+    return pd.Series(ss, index=src.index)
+
+
+def sak_smoothing(series: pd.Series, filter_type: str, length: int) -> pd.Series:
+    """Replaces existing technical indicators with unified filter"""
+    cycle = 2 * np.pi / length
+    alpha, beta, gamma = 0.0, 0.0, 0.0
+    
+    if filter_type == "Ehlers EMA":
+        alpha = (np.cos(cycle) + np.sin(cycle) - 1) / np.cos(cycle)
+        return series.ewm(alpha=alpha, adjust=False).mean()
+    
+    # Add other filter types as needed
+    return series  # Fallback to original series
 
 # =====================
 # VISUALIZATION ENGINE (FIXED PANEL ORDER)
@@ -681,11 +916,11 @@ def plot_candlestick(df, backtest=False):
     # ===== REORDERED ADDPLOTS =====
     addplots = []
 
-    # 1. Main Price Panel (0) - Add Bollinger Bands
+    # 1. Main Price Panel (0) - Add Lo-Hi Bands
     addplots.extend([
-        mpf.make_addplot(df['Upper_Band'], panel=0, color='orange', width=1.0, linestyle='--'),
-        mpf.make_addplot(df['SMA_20'], panel=0, color='blue', width=1.2),
-        mpf.make_addplot(df['Lower_Band'], panel=0, color='orange', width=1.0, linestyle='--')
+        mpf.make_addplot(df['upband1'], panel=0, color='darkorange', width=1.0),
+        mpf.make_addplot(df['loband1'], panel=0, color='darkorange', width=1.0),
+        mpf.make_addplot(df['meanline'], panel=0, color='royalblue', width=1.2)
     ])
 
     # 2. MACD Panel (1)
@@ -719,24 +954,32 @@ def plot_candlestick(df, backtest=False):
         mpf.make_addplot(df['+di'], panel=5, color='green', width=1.5, alpha=0.75),
         mpf.make_addplot(df['-di'], panel=5, color='red', width=1.5, alpha=0.75)
     ])
-    
-    if 'Upper_Band' in df.columns and 'Lower_Band' in df.columns:
-        addplots.extend([
-        mpf.make_addplot(df['Upper_Band'], panel=0, color='orange', width=1.0, linestyle='--'),
-        mpf.make_addplot(df['Lower_Band'], panel=0, color='orange', width=1.0, linestyle='--')
-    ])
-    else:
-        logger.error("Bollinger Band columns missing from DataFrame")
 
+    # 7. Stochastic (6)
+    addplots.append(mpf.make_addplot(df['%K'], panel=6, color='blue', width=1.2, ylabel='Stochastic'))
+    addplots.append(mpf.make_addplot(df['%D'], panel=6, color='orange', width=1.2))
+    addplots.extend([
+        mpf.make_addplot(pd.Series(80, index=df.index), panel=6, color='red', linestyle='--', width=1.0),
+        mpf.make_addplot(pd.Series(20, index=df.index), panel=6, color='green', linestyle='--', width=1.0)
+    ])
+    
     # ===== REVISED LEGEND HANDLING =====
     legends = {
-        0: [("VWAP", "purple"), ("20 SMA", "blue"), ("Bollinger Bands", "orange")],
+        0: [("VWAP", "purple"), ("20 SMA", "blue"), ("MRC Bands", "orange")],
         1: [("MACD", "#1f77b4"), ("Signal", "#ff7f0e"), ("Histogram", "#5cb85c")],
         2: [("Volume (Up)", "#5cb85c"), ("Volume (Down)", "#d9534f")],
         3: [("RSI", "#4B0082"), ("30/70 Bands", "gray")],
         4: [("Williams %R", "blue"), ("-20 Overbought", "red"), ("-80 Oversold", "green")],
-        5: [("ADX", "blue"), ("+DI", "green"), ("-DI", "red")]
+        5: [("ADX (Trend Strength)", "blue"),("+DI (Bullish Pressure)", "green"), ("-DI (Bearish Pressure)", "red") , ("25 (Mean Reversion Zone)", "gray")]
     }
+    
+    # Add ADX threshold line
+    addplots.append(
+        mpf.make_addplot(pd.Series(25, index=df.index), 
+                        panel=5, color='gray', 
+                        linestyle='--', width=1.0)
+    )
+
 
     style = mpf.make_mpf_style(
         marketcolors=mpf.make_marketcolors(up='#006400', down='#8B0000', edge='inherit', wick='inherit',
@@ -752,7 +995,7 @@ def plot_candlestick(df, backtest=False):
         style=style,
         addplot=addplots,
         volume=False,
-        panel_ratios=(12, 6, 4, 4, 4, 4),
+        panel_ratios=(12, 6, 4, 4, 4, 4, 4),
         figsize=(14, 24),
         returnfig=True
     )
@@ -801,16 +1044,15 @@ def run_backtest(df):
                     current_dt
                 )
                 log_trade(trade, symbol)
+                
+            if 'adx_shifted' not in df.columns:
+                raise KeyError("Missing adx_shifted column in DataFrame")
 
         except Exception as e:
             logger.error(f"Error processing {current_dt}: {str(e)}")
             continue
 
     return df
-
-# =====================
-# 
-# =====================
 
 # =====================
 # MAIN EXECUTION
