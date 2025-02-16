@@ -224,7 +224,6 @@ def calculate_day_metrics(trades):
         'num_trades': num_trades,
         'pnl': round(pnl, 2)
     }
-
     
 # =====================
 # BACKTESTING ENGINE
@@ -434,7 +433,7 @@ def check_entry_conditions(df, index):
     
     entry_confluence = (
         (row['close'] < row['loband1']) and # Correct column name from MRC calculation
-        (row['RSI'] < 32) and
+        (df['close'] < df['loband1']) & (df['RSI'] < df['rsi_threshold']) and
         (row['Williams_%R'] < -80) and
         (row['VWAP'] > row['close']) and
         (row['MACD'] < row['Signal']) and
@@ -693,8 +692,8 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         bars = ib.reqHistoricalData(
             contract,
             endDateTime='',
-            durationStr='7 D',
-            barSizeSetting='1 hour',
+            durationStr='1 D',
+            barSizeSetting='5 mins',
             whatToShow='TRADES',
             useRTH=True,
             formatDate=1,
@@ -778,6 +777,8 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         
         scaling_factor = 0.5  # Adjust based on your data
         df['meanrange'] *= scaling_factor
+        
+        df['rsi_threshold'] = df['RSI'].rolling(window=3024, min_periods=1).quantile(0.2)
         
         # Validate core indicators for composite score
         composite_required = ['ATR', 'volume_ma', 'adx', 'RSI', 'Williams_%R', 'MACD', 'VWAP']
@@ -906,10 +907,149 @@ def sak_smoothing(series: pd.Series, filter_type: str, length: int) -> pd.Series
     # Add other filter types as needed
     return series  # Fallback to original series
 
+from bokeh.plotting import figure, show
+from bokeh.models import ColumnDataSource, Span, HoverTool
+from bokeh.layouts import column
+import numpy as np
+
+def bokeh_candlestick(df, backtest=False):
+    source = ColumnDataSource(df)
+    
+    # ====== 1. Price Panel ======
+    price_tools = "pan,wheel_zoom,box_zoom,reset,save"
+    p1 = figure(x_axis_type="datetime", tools=price_tools, 
+                width=1400, height=400, title="Price Analysis",
+                toolbar_location="above")
+    
+    # Candlesticks
+    w = 60 * 60 * 24 * 1000 * 0.6  # 60% of day width in milliseconds
+    inc = df['close'] > df['open']
+    dec = df['open'] > df['close']
+    
+    p1.segment(df.index, df.high, df.index, df.low, color="black")
+    p1.vbar(df.index[inc], w, df.open[inc], df.close[inc], fill_color="#006400", line_color="black")
+    p1.vbar(df.index[dec], w, df.open[dec], df.close[dec], fill_color="#8B0000", line_color="black")
+
+    # Price bands
+    p1.line(df.index, df['upband1'], color='darkorange', line_width=1.5, legend_label="Upper Band 1")
+    p1.line(df.index, df['loband1'], color='darkorange', line_width=1.5, legend_label="Lower Band 1")
+    p1.line(df.index, df['upband2'], color='red', line_width=1.5, legend_label="Upper Band 2")
+    p1.line(df.index, df['loband2'], color='red', line_width=1.5, legend_label="Lower Band 2")
+    p1.line(df.index, df['meanline'], color='blue', line_width=2, legend_label="Mean Line")
+
+    # ====== 2. MACD Panel ======
+    p2 = figure(x_range=p1.x_range, width=1400, height=150,
+                title="MACD", toolbar_location=None)
+    
+    # MACD components
+    p2.line(df.index, df['MACD'], color='blue', line_width=1.5, legend_label="MACD")
+    p2.line(df.index, df['Signal'], color='orange', line_width=1.5, legend_label="Signal")
+    
+    # Histogram
+    hist_colors = np.where(df['Histogram'] >= 0, '#5cb85c', '#D83B2D')
+    p2.vbar(x=df.index, top=df['Histogram'], width=w*0.7, color=hist_colors)
+
+    # ====== 3. Volume Panel ======
+    p3 = figure(x_range=p1.x_range, width=1400, height=100,
+                title="Volume", toolbar_location=None)
+    
+    vol_colors = np.where(df.close > df.open, '#5cb85c', '#d9534f')
+    p3.vbar(x=df.index, top=df['volume'], width=w*0.7, color=vol_colors)
+
+    # ====== 4. RSI Panel ======
+    p4 = figure(x_range=p1.x_range, width=1400, height=150,
+                title="RSI", toolbar_location=None)
+    
+    p4.line(df.index, df['RSI'], color='#4B0082', line_width=1.5)
+    
+    for level in [30, 50, 70]:
+        span = Span(location=level,
+                    dimension='width',
+                    line_color='gray',
+                    line_dash='dashed')
+        p4.add_layout(span)
+
+    # ====== 5. Williams %R Panel ======
+    p5 = figure(x_range=p1.x_range, width=1400, height=150,
+                title="Williams %R", toolbar_location=None)
+    
+    p5.line(df.index, df['Williams_%R'], color='blue', line_width=1.5)
+    
+    for level in [-20, -80]:
+        span = Span(location=level,
+                    dimension='width',
+                    line_color='red' if level == -20 else 'green',
+                    line_dash='dashed')
+        p5.add_layout(span)
+
+    # ====== 6. ADX Panel ======
+    p6 = figure(x_range=p1.x_range, width=1400, height=150,
+                title="ADX/DIs", toolbar_location=None)
+    
+    p6.line(df.index, df['adx'], color='blue', line_width=2)
+    p6.line(df.index, df['+di'], color='green', line_width=1.5)
+    p6.line(df.index, df['-di'], color='red', line_width=1.5)
+    
+    adx_span = Span(location=25,
+                    dimension='width',
+                    line_color='gray',
+                    line_dash='dashed')
+    p6.add_layout(adx_span)
+
+    # ====== 7. Stochastic Panel ======
+    p7 = figure(x_range=p1.x_range, width=1400, height=150,
+                title="Stochastic Oscillator", toolbar_location=None)
+    
+    p7.line(df.index, df['%K'], color='blue', line_width=1.5)
+    p7.line(df.index, df['%D'], color='orange', line_width=1.5)
+    
+    for level in [20, 80]:
+        span = Span(location=level,
+                    dimension='width',
+                    line_color='green' if level == 20 else 'red',
+                    line_dash='dashed')
+        p7.add_layout(span)
+
+    # ===== Hover Tool for Price Panel =====
+    hover = HoverTool(
+        tooltips=[
+            ("Date", "@index{%F}"),
+            ("Open", "@open{0.2f}"),
+            ("High", "@high{0.2f}"),
+            ("Low", "@low{0.2f}"),
+            ("Close", "@close{0.2f}"),
+            ("Volume", "@volume{0}"),
+        ],
+        formatters={'@index': 'datetime'},
+        mode='vline'
+    )
+    
+    p1.add_tools(hover)
+
+    # ===== Styling and Layout =====
+    for panel in [p1, p2, p3, p4, p5, p6, p7]:
+        panel.background_fill_color = "white"
+        panel.grid.grid_line_alpha = 0.3
+
+        # Link x-axis ranges across all panels
+        panel.x_range = p1.x_range
+
+        panel.yaxis.axis_label_text_font_style = "bold"
+        panel.xaxis.axis_label_text_font_style = "bold"
+
+        panel.xgrid.grid_line_color = 'gainsboro'
+        panel.ygrid.grid_line_color = 'gainsboro'
+
+        panel.outline_line_color = "black"
+
+    layout = column(p1, p2, p3, p4, p5, p6, p7)
+
+    show(layout)
+
 # =====================
 # VISUALIZATION ENGINE (FIXED PANEL ORDER)
 # =====================
-def plot_candlestick(df, backtest=False):
+'''def plot_candlestick(df, backtest=False):
     """Generates panels in correct order: Price, MACD, Volume, RSI, Williams %R, ADX"""
     # ===== REORDERED ADDPLOTS =====
     addplots = []
@@ -1021,7 +1161,7 @@ def plot_candlestick(df, backtest=False):
                 bbox_to_anchor=(1.05, 1)  # Fixed position outside of chart area
             )
     logger.info(f"Loaded historical data with {len(df)} rows")
-    plt.show()
+    plt.show()'''
 
 # =====================
 # EXECUTION HANDLERS (Critical Fix)
@@ -1075,7 +1215,7 @@ def main():
         # Backtest mode
         daily_data = get_historical_data(ib, symbol, backtest=True)
         run_backtest(daily_data)
-        plot_candlestick(daily_data, backtest=True)
+        bokeh_candlestick(daily_data, backtest=True)
 
     except Exception as e:
         logger.error(f"Execution error: {str(e)}")
