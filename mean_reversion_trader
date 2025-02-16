@@ -77,7 +77,7 @@ class LLDict(MutableMapping):  # FIX: Replaced DictAbstract with MutableMapping
 # =====================
 # GLOBAL CONFIGURATION
 # =====================
-symbol = 'GOOGL' # Random Stock Ticker Generator - API call IBKR random pos in array of NYSE/NASDAQ tickers list?
+symbol = 'AAPL' # Random Stock Ticker Generator - API call IBKR random pos in array of NYSE/NASDAQ tickers list?
 initial_balance = 10000
 
 # =====================
@@ -654,7 +654,7 @@ def log_trade(trade, symbol):
 nest_asyncio.apply()
 
 
-def calculate_mrc(df: pd.DataFrame, length=50) -> pd.DataFrame:
+def calculate_mrc(df: pd.DataFrame, length=75) -> pd.DataFrame:  # Increased length
     """Calculate Mean Reversion Channel."""
     df = df.copy()
 
@@ -676,7 +676,7 @@ def calculate_mrc(df: pd.DataFrame, length=50) -> pd.DataFrame:
     df['meanrange'] = supersmoother(tr, length)
 
     # Apply scaling factor to meanrange
-    scaling_factor = 0.5  # Adjust as needed
+    scaling_factor = 0.3  # Adjust as needed
     df['meanrange'] *= scaling_factor
 
     # Create MRC bands with adjusted multipliers
