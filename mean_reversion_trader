@@ -654,17 +654,17 @@ def log_trade(trade, symbol):
 nest_asyncio.apply()
 
 
-def calculate_mrc(df: pd.DataFrame, length=200) -> pd.DataFrame:
-    """Calculate Mean Reversion Channel with proper validation"""
+def calculate_mrc(df: pd.DataFrame, length=50) -> pd.DataFrame:
+    """Calculate Mean Reversion Channel."""
     df = df.copy()
-    
+
     # Calculate HLC3 if missing
     if 'hlc3' not in df.columns:
         df['hlc3'] = (df['high'] + df['low'] + df['close']) / 3
-        
+
     # Calculate meanline using supersmoother
     df['meanline'] = supersmoother(df['hlc3'], length)
-    
+
     # True Range calculation
     tr = np.maximum(
         df['high'] - df['low'],
@@ -674,22 +674,19 @@ def calculate_mrc(df: pd.DataFrame, length=200) -> pd.DataFrame:
         )
     )
     df['meanrange'] = supersmoother(tr, length)
-    
-    # Create MRC bands
-    inner_mult = 1.0
-    outer_mult = 2.415
-    pi = np.pi
-    df['upband1'] = df['meanline'] + (df['meanrange'] * pi * inner_mult)
-    df['loband1'] = df['meanline'] - (df['meanrange'] * pi * inner_mult)
-    df['upband2'] = df['meanline'] + (df['meanrange'] * pi * outer_mult)
-    df['loband2'] = df['meanline'] - (df['meanrange'] * pi * outer_mult)
 
-    # Validate MRC columns
-    required_mrc_cols = ['meanline', 'upband1', 'loband1', 'upband2', 'loband2']
-    if not all(col in df.columns for col in required_mrc_cols):
-        missing = [col for col in required_mrc_cols if col not in df.columns]
-        raise ValueError(f"MRC calculation failed - missing columns: {missing}")
-    
+    # Apply scaling factor to meanrange
+    scaling_factor = 0.5  # Adjust as needed
+    df['meanrange'] *= scaling_factor
+
+    # Create MRC bands with adjusted multipliers
+    inner_mult = 1.0
+    outer_mult = 2.0
+    df['upband1'] = df['meanline'] + (df['meanrange'] * inner_mult)
+    df['loband1'] = df['meanline'] - (df['meanrange'] * inner_mult)
+    df['upband2'] = df['meanline'] + (df['meanrange'] * outer_mult)
+    df['loband2'] = df['meanline'] - (df['meanrange'] * outer_mult)
+
     return df
 
 def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=False):
@@ -780,6 +777,9 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         df['Signal_shifted'] = df['Signal'].shift(1)
         df['Volume_MA_shifted'] = df['volume'].rolling(20).mean().shift(1)
         df['adx_shifted'] = df['adx'].shift(1)
+        
+        scaling_factor = 0.5  # Adjust based on your data
+        df['meanrange'] *= scaling_factor
         
         # Validate core indicators for composite score
         composite_required = ['ATR', 'volume_ma', 'adx', 'RSI', 'Williams_%R', 'MACD', 'VWAP']
@@ -880,19 +880,18 @@ def calculate_adx(df, window=14):
 # CORRECTED SUPER SMOOTHER
 # =====================
 def supersmoother(src: pd.Series, length: int) -> pd.Series:
-    """Fixed implementation using .iloc for positional access"""
-    a1 = np.exp(-np.sqrt(2)*np.pi/length)
-    b1 = 2*a1*np.cos(np.sqrt(2)*np.pi/length)
+    """Improved Supersmoother implementation."""
+    a1 = np.exp(-np.sqrt(2) * np.pi / length)
+    b1 = 2 * a1 * np.cos(np.sqrt(2) * np.pi / length)
     c3 = -a1**2
     c2 = b1
     c1 = 1 - c2 - c3
-    
+
     ss = np.zeros_like(src)
-    # Proper positional access with .iloc
     ss[0] = src.iloc[0]
     ss[1] = src.iloc[1]
     for i in range(2, len(src)):
-        ss[i] = c1*src.iloc[i] + c2*ss[i-1] + c3*ss[i-2]
+        ss[i] = c1 * src.iloc[i] + c2 * ss[i - 1] + c3 * ss[i - 2]
     return pd.Series(ss, index=src.index)
 
 
@@ -917,12 +916,21 @@ def plot_candlestick(df, backtest=False):
     addplots = []
 
     # 1. Main Price Panel (0) - Add Lo-Hi Bands
-    addplots.extend([
-        mpf.make_addplot(df['upband1'], panel=0, color='darkorange', width=1.0),
-        mpf.make_addplot(df['loband1'], panel=0, color='darkorange', width=1.0),
-        mpf.make_addplot(df['meanline'], panel=0, color='royalblue', width=1.2)
-    ])
+    addplots = [
+        mpf.make_addplot(df["upband1"], panel=0, color="darkorange", width=0.8),
+        mpf.make_addplot(df["loband1"], panel=0, color="darkorange", width=0.8),
+        mpf.make_addplot(df["upband2"], panel=0, color="red", width=0.8),
+        mpf.make_addplot(df["loband2"], panel=0, color="red", width=0.8),
+        mpf.make_addplot(df["meanline"], panel=0, color="blue", width=1.5),
+    ]
 
+    style = mpf.make_mpf_style(
+        marketcolors=mpf.make_marketcolors(up="#006400", down="#8B0000"),
+        gridstyle=":",
+        gridcolor="gainsboro",
+        facecolor="white",
+    )
+    
     # 2. MACD Panel (1)
     macd_hist_colors = np.where(df['Histogram'] >= 0, '#5cb85c', '#D83B2D')
     addplots.extend([
