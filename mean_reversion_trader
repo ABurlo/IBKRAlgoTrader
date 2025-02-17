@@ -77,7 +77,7 @@ class LLDict(MutableMapping):  # FIX: Replaced DictAbstract with MutableMapping
 # =====================
 # GLOBAL CONFIGURATION
 # =====================
-symbol = 'AAPL' # Random Stock Ticker Generator - API call IBKR random pos in array of NYSE/NASDAQ tickers list?
+symbol = 'GOOGL' # Random Stock Ticker Generator - API call IBKR random pos in array of NYSE/NASDAQ tickers list?
 initial_balance = 10000
 
 # =====================
@@ -104,10 +104,12 @@ def plot_pnl_calendar(engine, start_date, end_date, initial_balance, symbol):
     ny_tz = pytz.timezone('America/New_York')
 
     # Convert start and end dates to NY timezone
-    start_date = pd.Timestamp(start_date).tz_convert(ny_tz).normalize()
-    end_date = pd.Timestamp(end_date).tz_convert(ny_tz).normalize()
+        # Convert using original timezone-aware series
+    start_date = engine.trade_history['timestamp'].min().tz_convert(ny_tz)
+    end_date = engine.trade_history['timestamp'].max().tz_localize('UTC').tz_convert(ny_tz)
 
-    current_date = start_date
+  # Processing loop remains the same but with tz-aware dates
+    current_date = start_date.normalize()
     while current_date <= end_date:
         # Calculate the end of the current month
         next_month = current_date.replace(day=1) + pd.DateOffset(months=1)
@@ -224,12 +226,33 @@ def calculate_day_metrics(trades):
         'num_trades': num_trades,
         'pnl': round(pnl, 2)
     }
+
     
 # =====================
 # BACKTESTING ENGINE
 # =====================
 class BacktestEngine:
-    def __init__(self):
+    def __init__(self, mode='neutral'):
+        self.mode = mode
+        self.mode_config = {
+            'aggressive': {
+                'rsi_entry': 28, 'williams_entry': -85, 'position_risk': 0.03,
+                'volatility_mult': 1.8, 'profit_target': 1.8, 'stop_loss': 0.96,
+                'adx_threshold': 22, 'di_ratio': 1.25, 'macd_crossover': 1.15
+            },
+            'neutral': {
+                'rsi_entry': 32, 'williams_entry': -80, 'position_risk': 0.02,
+                'volatility_mult': 1.5, 'profit_target': 1.5, 'stop_loss': 0.94,
+                'adx_threshold': 25, 'di_ratio': 1.35, 'macd_crossover': 1.05
+            },
+            'conservative': {
+                'rsi_entry': 35, 'williams_entry': -75, 'position_risk': 0.01,
+                'volatility_mult': 1.2, 'profit_target': 1.2, 'stop_loss': 0.92,
+                'adx_threshold': 28, 'di_ratio': 1.5, 'macd_crossover': 1.0
+            }
+        }
+        self.validate_mode_config()
+        # Initialize other engine components
         self.current_row = None  # Track current market data
         self.balance = initial_balance
         self.positions = LLDict()
@@ -237,6 +260,7 @@ class BacktestEngine:
         self.current_position = None
         self.fee_per_share = 0.0035
         self.slippage = 0.0002
+        self.volatility_filter = {'min_mrc': 0.02, 'max_mrc': 0.05}
         self.trade_markers = []
         self.daily_pnl = {}
         self.entry_conditions = {
@@ -268,16 +292,31 @@ class BacktestEngine:
             'rapid_trend_threshold': 15
         }
     
+    def validate_mode_config(self):
+        required_keys = ['rsi_entry', 'williams_entry', 'position_risk',
+                        'volatility_mult', 'profit_target', 'stop_loss',
+                        'adx_threshold', 'di_ratio', 'macd_crossover']
+        for mode, config in self.mode_config.items():
+            missing = [k for k in required_keys if k not in config]
+            if missing:
+                raise ValueError(f"Missing config keys in {mode}: {missing}")
+
     # =====================
-    # OPTIMIZED POSITION SIZING
+    # OPTIMIZED POSITION SIZING? CHECK WHICH WORKS!
     # =====================
+    '''def calculate_position_size(self, row):
+        mode_params = self.mode_config[self.mode]
+        risk_capital = self.balance * mode_params['position_risk']
+        combined_vol = (row['meanrange'] * mode_params['volatility_mult'] + 
+                    row['ATR']) / 2
+        return max(1, risk_capital / combined_vol)'''
+        
     def calculate_position_size(self, row):
-        """Combines ATR and MRC volatility measures"""
-        risk_capital = self.balance * 0.02  # 2% risk per trade
-        combined_volatility = np.sqrt(
-            (row['meanrange']**2) + (row['ATR']**2)
-        )
-        return max(1, risk_capital / combined_volatility)
+        mp = self.mode_config[self.mode]
+        risk_capital = self.balance * mp['position_risk']
+        combined_vol = (row['meanrange'] * mp['volatility_mult'] + row['ATR']) / 2
+        return max(1, risk_capital / combined_vol)
+    
     
 
     def composite_signal_score(self, row):
@@ -334,6 +373,12 @@ class BacktestEngine:
         # Add validation for MRC columns
         required_mrc_columns = ['meanline', 'meanrange', 'loband1']
         missing = [col for col in required_mrc_columns if col not in self.current_row]
+        
+        trade_date = pd.Timestamp(timestamp, tz='UTC').tz_convert('America/New_York')
+
+        if trade_date.date() not in self.daily_pnl:
+            self.daily_pnl[trade_date.date()] = 0.0
+        
         if missing:
             raise KeyError(f"Missing MRC columns: {missing} - run calculate_mrc() first")
         
@@ -379,7 +424,8 @@ class BacktestEngine:
         if shares < 0.01:
             raise ValueError(f"Invalid share quantity: {shares}")
 
-        trade_date = pd.Timestamp(timestamp).date()
+        trade_date = timestamp.tz_convert('America/New_York').date()
+
         if trade_date not in self.daily_pnl:
             self.daily_pnl[trade_date] = 0.0
             
@@ -417,9 +463,6 @@ class BacktestEngine:
 engine = BacktestEngine()
 
 # =====================
-# STRATEGY CONDITIONS
-# =====================
-# =====================
 # CORRECTED ENTRY/EXIT CONDITIONS
 # =====================
 def check_entry_conditions(df, index):
@@ -433,7 +476,7 @@ def check_entry_conditions(df, index):
     
     entry_confluence = (
         (row['close'] < row['loband1']) and # Correct column name from MRC calculation
-        (df['close'] < df['loband1']) & (df['RSI'] < df['rsi_threshold']) and
+        (row['RSI'] < 32) and
         (row['Williams_%R'] < -80) and
         (row['VWAP'] > row['close']) and
         (row['MACD'] < row['Signal']) and
@@ -512,42 +555,7 @@ def check_exit_conditions(df, index):
     )
 
     return any(profit_conditions) or stop_loss_conditions
-
-# =====================
-# EXIT CONDITION IMPLEMENTATION 
-# =====================
-def check_exit_conditions(df, index):
-    """Enhanced exit conditions with ADX trend monitoring"""
-    if not engine.current_position:
-        return False
-
-    row = df.loc[index]
-    entry_price = engine.current_position['entry_price']
     
-    # Profit Target Conditions
-    profit_conditions = [
-        row['close'] > row['SMA_20'],                    # Price above SMA
-        row['RSI'] > 40,                                 # RSI normalization
-        row['Williams_%R'] > -60,                        # Williams %R recovery
-        row['close'] > row['VWAP'],                      # Price above VWAP
-        row['adx'] > 40,                                 # Strong trend emerging
-        row['+di'] > row['-di']                          # Bullish DI crossover
-    ]
-    
-    # Dynamic Stop Loss System
-    stop_loss_conditions = (
-        row['close'] < entry_price * 0.98 or             # 2% hard stop
-        row['meanrange'] > engine.volatility_filter['max_mrc'] * 1.5 or
-        (row['adx'] - row['adx'].shift(3)) > 15          # Rapid trend strengthening
-    )
-    
-    # Time-Based Exit (30-minute timeout)
-    position_age = (index - engine.current_position['timestamp']).total_seconds() / 60
-    time_exit = position_age > 30
-    
-    return any(profit_conditions) or stop_loss_conditions or time_exit
-
-# =====================
 # ENHANCED LOGGING WITH PROPER COLORIZATION
 # =====================
 class TradeFormatter(logging.Formatter):
@@ -620,7 +628,8 @@ def log_trade(trade, symbol):
     """Robust logging with improved color handling"""
     try:
         # Validate required fields and parse timestamp
-        trade_time = pd.to_datetime(trade['timestamp'], utc=True).tz_convert('America/New_York')
+        trade_time = pd.Timestamp('timestamp').tz_convert('America/New_York')
+
         
         # Build log message with direct color formatting
         log_parts = [
@@ -651,7 +660,7 @@ def log_trade(trade, symbol):
 nest_asyncio.apply()
 
 
-def calculate_mrc(df: pd.DataFrame, length=75) -> pd.DataFrame:  # Increased length
+def calculate_mrc(df: pd.DataFrame, length=100) -> pd.DataFrame:  # Increased length
     """Calculate Mean Reversion Channel."""
     df = df.copy()
 
@@ -673,7 +682,7 @@ def calculate_mrc(df: pd.DataFrame, length=75) -> pd.DataFrame:  # Increased len
     df['meanrange'] = supersmoother(tr, length)
 
     # Apply scaling factor to meanrange
-    scaling_factor = 0.3  # Adjust as needed
+    scaling_factor = 0.4  # Adjust as needed
     df['meanrange'] *= scaling_factor
 
     # Create MRC bands with adjusted multipliers
@@ -688,12 +697,13 @@ def calculate_mrc(df: pd.DataFrame, length=75) -> pd.DataFrame:  # Increased len
 
 def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=False):
     contract = Stock(symbol, exchange, currency)
+    ib.qualifyContracts(contract) 
     if backtest:
         bars = ib.reqHistoricalData(
             contract,
             endDateTime='',
-            durationStr='1 D',
-            barSizeSetting='5 mins',
+            durationStr='30 D',
+            barSizeSetting='1 hour',
             whatToShow='TRADES',
             useRTH=True,
             formatDate=1,
@@ -717,7 +727,7 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         }).drop(columns=['average', 'barCount'], errors='ignore')
 
         if 'date' in df.columns:
-            df['date'] = pd.to_datetime(df['date'])
+            df['date'] = pd.to_datetime(df['date']).dt.tz_convert('America/New_York')
             df.set_index('date', inplace=True)
 
         # Add MRC before other indicators
@@ -766,7 +776,6 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         df['ATR'] = df['high'] - df['low']  # Basic implementation - replace with proper ATR
         df['volume_ma'] = df['volume'].rolling(20).mean()
         
-        
         # Feature engineering updates
         df = df.drop(['vwap_numerator', 'vwap_denominator', 'trading_date'], axis=1)
         df['RSI_shifted'] = df['RSI'].shift(1)
@@ -777,8 +786,6 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         
         scaling_factor = 0.5  # Adjust based on your data
         df['meanrange'] *= scaling_factor
-        
-        df['rsi_threshold'] = df['RSI'].rolling(window=3024, min_periods=1).quantile(0.2)
         
         # Validate core indicators for composite score
         composite_required = ['ATR', 'volume_ma', 'adx', 'RSI', 'Williams_%R', 'MACD', 'VWAP']
@@ -800,9 +807,9 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         required_mrc_cols = ['meanline', 'upband1', 'loband1', 'upband2', 'loband2']
         if not all(col in df.columns for col in required_mrc_cols):
             raise ValueError("MRC calculation failed - missing columns")
-
+        
         return df
-
+        
 # =====================
 # WILLIAMS %R IMPLEMENTATION
 # =====================
@@ -828,17 +835,13 @@ def stochastic_oscillator(df, k_period=14, d_period=3):
     return df
 
 # =====================
-# FIXED ADX CALCULATION (PANDAS SERIES)
+# CORRECTED ADX CALCULATION (REMOVED MEANLINE OVERWRITE)
 # =====================
 def calculate_adx(df, window=14):
-    """Fixed ADX calculation with proper initialization"""
+    """Fixed ADX calculation without meanline overwrite"""
     high = df['high']
     low = df['low']
     close = df['close']
-    
-    # Initialize DI series
-    plus_di = pd.Series(0.0, index=df.index)
-    minus_di = pd.Series(0.0, index=df.index)
     
     # True Range calculation
     tr = np.maximum(
@@ -874,6 +877,11 @@ def calculate_adx(df, window=14):
     df['-di'] = minus_di
     df['adx_shifted'] = df['adx'].shift(1).fillna(0)
     
+    # REMOVED THE MEANLINE OVERWRITE HERE
+    # Add during DataFrame initialization:
+    df['buy_signal'] = False
+    df['sell_signal'] = False
+    
     return df[['adx', '+di', '-di', 'adx_shifted']]
 
 # =====================
@@ -907,153 +915,23 @@ def sak_smoothing(series: pd.Series, filter_type: str, length: int) -> pd.Series
     # Add other filter types as needed
     return series  # Fallback to original series
 
-from bokeh.plotting import figure, show
-from bokeh.models import ColumnDataSource, Span, HoverTool
-from bokeh.layouts import column
-import numpy as np
-
-def bokeh_candlestick(df, backtest=False):
-    source = ColumnDataSource(df)
-    
-    # ====== 1. Price Panel ======
-    price_tools = "pan,wheel_zoom,box_zoom,reset,save"
-    p1 = figure(x_axis_type="datetime", tools=price_tools, 
-                width=1400, height=400, title="Price Analysis",
-                toolbar_location="above")
-    
-    # Candlesticks
-    w = 60 * 60 * 24 * 1000 * 0.6  # 60% of day width in milliseconds
-    inc = df['close'] > df['open']
-    dec = df['open'] > df['close']
-    
-    p1.segment(df.index, df.high, df.index, df.low, color="black")
-    p1.vbar(df.index[inc], w, df.open[inc], df.close[inc], fill_color="#006400", line_color="black")
-    p1.vbar(df.index[dec], w, df.open[dec], df.close[dec], fill_color="#8B0000", line_color="black")
-
-    # Price bands
-    p1.line(df.index, df['upband1'], color='darkorange', line_width=1.5, legend_label="Upper Band 1")
-    p1.line(df.index, df['loband1'], color='darkorange', line_width=1.5, legend_label="Lower Band 1")
-    p1.line(df.index, df['upband2'], color='red', line_width=1.5, legend_label="Upper Band 2")
-    p1.line(df.index, df['loband2'], color='red', line_width=1.5, legend_label="Lower Band 2")
-    p1.line(df.index, df['meanline'], color='blue', line_width=2, legend_label="Mean Line")
-
-    # ====== 2. MACD Panel ======
-    p2 = figure(x_range=p1.x_range, width=1400, height=150,
-                title="MACD", toolbar_location=None)
-    
-    # MACD components
-    p2.line(df.index, df['MACD'], color='blue', line_width=1.5, legend_label="MACD")
-    p2.line(df.index, df['Signal'], color='orange', line_width=1.5, legend_label="Signal")
-    
-    # Histogram
-    hist_colors = np.where(df['Histogram'] >= 0, '#5cb85c', '#D83B2D')
-    p2.vbar(x=df.index, top=df['Histogram'], width=w*0.7, color=hist_colors)
-
-    # ====== 3. Volume Panel ======
-    p3 = figure(x_range=p1.x_range, width=1400, height=100,
-                title="Volume", toolbar_location=None)
-    
-    vol_colors = np.where(df.close > df.open, '#5cb85c', '#d9534f')
-    p3.vbar(x=df.index, top=df['volume'], width=w*0.7, color=vol_colors)
-
-    # ====== 4. RSI Panel ======
-    p4 = figure(x_range=p1.x_range, width=1400, height=150,
-                title="RSI", toolbar_location=None)
-    
-    p4.line(df.index, df['RSI'], color='#4B0082', line_width=1.5)
-    
-    for level in [30, 50, 70]:
-        span = Span(location=level,
-                    dimension='width',
-                    line_color='gray',
-                    line_dash='dashed')
-        p4.add_layout(span)
-
-    # ====== 5. Williams %R Panel ======
-    p5 = figure(x_range=p1.x_range, width=1400, height=150,
-                title="Williams %R", toolbar_location=None)
-    
-    p5.line(df.index, df['Williams_%R'], color='blue', line_width=1.5)
-    
-    for level in [-20, -80]:
-        span = Span(location=level,
-                    dimension='width',
-                    line_color='red' if level == -20 else 'green',
-                    line_dash='dashed')
-        p5.add_layout(span)
-
-    # ====== 6. ADX Panel ======
-    p6 = figure(x_range=p1.x_range, width=1400, height=150,
-                title="ADX/DIs", toolbar_location=None)
-    
-    p6.line(df.index, df['adx'], color='blue', line_width=2)
-    p6.line(df.index, df['+di'], color='green', line_width=1.5)
-    p6.line(df.index, df['-di'], color='red', line_width=1.5)
-    
-    adx_span = Span(location=25,
-                    dimension='width',
-                    line_color='gray',
-                    line_dash='dashed')
-    p6.add_layout(adx_span)
-
-    # ====== 7. Stochastic Panel ======
-    p7 = figure(x_range=p1.x_range, width=1400, height=150,
-                title="Stochastic Oscillator", toolbar_location=None)
-    
-    p7.line(df.index, df['%K'], color='blue', line_width=1.5)
-    p7.line(df.index, df['%D'], color='orange', line_width=1.5)
-    
-    for level in [20, 80]:
-        span = Span(location=level,
-                    dimension='width',
-                    line_color='green' if level == 20 else 'red',
-                    line_dash='dashed')
-        p7.add_layout(span)
-
-    # ===== Hover Tool for Price Panel =====
-    hover = HoverTool(
-        tooltips=[
-            ("Date", "@index{%F}"),
-            ("Open", "@open{0.2f}"),
-            ("High", "@high{0.2f}"),
-            ("Low", "@low{0.2f}"),
-            ("Close", "@close{0.2f}"),
-            ("Volume", "@volume{0}"),
-        ],
-        formatters={'@index': 'datetime'},
-        mode='vline'
-    )
-    
-    p1.add_tools(hover)
-
-    # ===== Styling and Layout =====
-    for panel in [p1, p2, p3, p4, p5, p6, p7]:
-        panel.background_fill_color = "white"
-        panel.grid.grid_line_alpha = 0.3
-
-        # Link x-axis ranges across all panels
-        panel.x_range = p1.x_range
-
-        panel.yaxis.axis_label_text_font_style = "bold"
-        panel.xaxis.axis_label_text_font_style = "bold"
-
-        panel.xgrid.grid_line_color = 'gainsboro'
-        panel.ygrid.grid_line_color = 'gainsboro'
-
-        panel.outline_line_color = "black"
-
-    layout = column(p1, p2, p3, p4, p5, p6, p7)
-
-    show(layout)
-
 # =====================
 # VISUALIZATION ENGINE (FIXED PANEL ORDER)
 # =====================
-'''def plot_candlestick(df, backtest=False):
+def plot_candlestick(df, backtest=False):
     """Generates panels in correct order: Price, MACD, Volume, RSI, Williams %R, ADX"""
     # ===== REORDERED ADDPLOTS =====
     addplots = []
 
+    addplots.append(
+        mpf.make_addplot(df['buy_signal'], type='scatter', 
+                        markersize=100, marker='^', color='lime', panel=0)
+    )
+    addplots.append(
+        mpf.make_addplot(df['sell_signal'], type='scatter',
+                        markersize=100, marker='v', color='red', panel=0)
+    )
+    
     # 1. Main Price Panel (0) - Add Lo-Hi Bands
     addplots = [
         mpf.make_addplot(df["upband1"], panel=0, color="darkorange", width=0.8),
@@ -1117,7 +995,8 @@ def bokeh_candlestick(df, backtest=False):
         2: [("Volume (Up)", "#5cb85c"), ("Volume (Down)", "#d9534f")],
         3: [("RSI", "#4B0082"), ("30/70 Bands", "gray")],
         4: [("Williams %R", "blue"), ("-20 Overbought", "red"), ("-80 Oversold", "green")],
-        5: [("ADX (Trend Strength)", "blue"),("+DI (Bullish Pressure)", "green"), ("-DI (Bearish Pressure)", "red") , ("25 (Mean Reversion Zone)", "gray")]
+        5: [("ADX (Trend Strength)", "blue"),("+DI (Bullish Pressure)", "green"), ("-DI (Bearish Pressure)", "red") , ("25 (Mean Reversion Zone)", "gray")],
+        6: [("Stochastic", "blue"),("XX", "green"), ("YY", "red") , ("ZZ", "gray")]
     }
     
     # Add ADX threshold line
@@ -1161,7 +1040,7 @@ def bokeh_candlestick(df, backtest=False):
                 bbox_to_anchor=(1.05, 1)  # Fixed position outside of chart area
             )
     logger.info(f"Loaded historical data with {len(df)} rows")
-    plt.show()'''
+    plt.show()
 
 # =====================
 # EXECUTION HANDLERS (Critical Fix)
@@ -1202,9 +1081,28 @@ def run_backtest(df):
     return df
 
 # =====================
+# MODE SELECTION INTERFACE
+# =====================
+def select_trading_mode():
+    print("\nSelect Trading Strategy Mode:")
+    print("1. Aggressive")
+    print("2. Neutral (Default)")
+    print("3. Conservative")
+    
+    choice = input("Enter choice (1-3): ").strip()
+    modes = {
+        '1': 'aggressive',
+        '2': 'neutral',
+        '3': 'conservative'
+    }
+    return modes.get(choice, 'neutral')
+
+# =====================
 # MAIN EXECUTION
 # =====================
 def main():
+    selected_mode = select_trading_mode()
+    engine = BacktestEngine(mode=selected_mode)
     ib = IB()
     ib.connect('127.0.0.1', 7497, clientId=1)
     initial_balance = engine.balance  # Get initial balance from engine
@@ -1215,7 +1113,7 @@ def main():
         # Backtest mode
         daily_data = get_historical_data(ib, symbol, backtest=True)
         run_backtest(daily_data)
-        bokeh_candlestick(daily_data, backtest=True)
+        plot_candlestick(daily_data, backtest=True)
 
     except Exception as e:
         logger.error(f"Execution error: {str(e)}")
@@ -1312,17 +1210,24 @@ def main():
                               if not np.isnan(avg_loss) else "Average Loss: $0.00")
                     logger.info(f"Profit Factor: Infinite" 
                               if profit_factor == float('inf') else f"Profit Factor: {profit_factor:.2f}")
+                    
+                    pd.DataFrame(engine.trade_history).to_csv('trade_debug.csv')
 
-                # Plotting logic remains unchanged
-                if 'timestamp' in trade_history.columns and not trade_history['timestamp'].empty:
-                    trade_history['timestamp'] = pd.to_datetime(trade_history['timestamp'], utc=True)
-                    start_date = pd.Timestamp(trade_history['timestamp'].min()).tz_convert('UTC').replace(
-                        hour=0, minute=0, second=0, microsecond=0)
-                    end_date = pd.Timestamp(trade_history['timestamp'].max()).tz_convert('UTC').replace(
-                        hour=23, minute=59, second=59, microsecond=999)
-                    '''plot_pnl_calendar(engine, start_date, end_date, initial_balance, symbol)'''
-                else:
-                    logger.warning("No trade history or missing timestamp data. Skipping PNL calendar plot.")
+                    if 'timestamp' in trade_history.columns and not trade_history['timestamp'].empty:
+                        # Convert to UTC timezone-aware datetime
+                        trade_history['timestamp'] = pd.to_datetime(trade_history['timestamp'], utc=True)
+                        
+                        # Get timezone-aware min/max directly from the series
+                        start_date = trade_history['timestamp'].min().replace(
+                            hour=0, minute=0, second=0, microsecond=0
+                        )
+                        end_date = trade_history['timestamp'].max().replace(
+                            hour=23, minute=59, second=59, microsecond=999
+                        )
+                        
+                        '''plot_pnl_calendar(engine, start_date, end_date, initial_balance, symbol)'''
+                    else:
+                        logger.warning("No trade history or missing timestamp data. Skipping PNL calendar plot.")
 
 if __name__ == '__main__':
     main()
