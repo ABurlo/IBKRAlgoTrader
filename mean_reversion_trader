@@ -302,19 +302,15 @@ class BacktestEngine:
                 raise ValueError(f"Missing config keys in {mode}: {missing}")
 
     # =====================
-    # OPTIMIZED POSITION SIZING? CHECK WHICH WORKS!
+    # OPTIMIZED POSITION SIZING
     # =====================
-    '''def calculate_position_size(self, row):
-        mode_params = self.mode_config[self.mode]
-        risk_capital = self.balance * mode_params['position_risk']
-        combined_vol = (row['meanrange'] * mode_params['volatility_mult'] + 
-                    row['ATR']) / 2
-        return max(1, risk_capital / combined_vol)'''
-        
     def calculate_position_size(self, row):
         mp = self.mode_config[self.mode]
         risk_capital = self.balance * mp['position_risk']
-        combined_vol = (row['meanrange'] * mp['volatility_mult'] + row['ATR']) / 2
+        combined_vol = (
+            row['meanrange'] * mp['volatility_mult'] +  # t-1 data
+            row['ATR']                                   # t-1 data
+        ) / 2
         return max(1, risk_capital / combined_vol)
     
     
@@ -387,8 +383,7 @@ class BacktestEngine:
             return None
         
         # Full trade execution logic
-        executed_price = (0.7 * self.current_row['VWAP'] + 
-                        0.3 * self.current_row['close'])
+        executed_price = price
         
         if np.isnan(self.current_row['RSI']):
             logger.error("Skipping trade with invalid RSI")
