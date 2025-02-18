@@ -646,7 +646,6 @@ def log_trade(trade, symbol):
 # =====================
 nest_asyncio.apply()
 
-
 def calculate_mrc(df: pd.DataFrame, length=100) -> pd.DataFrame:  # Increased length
     """Calculate Mean Reversion Channel."""
     df = df.copy()
