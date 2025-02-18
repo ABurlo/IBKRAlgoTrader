@@ -465,27 +465,23 @@ engine = BacktestEngine()
 # =====================
 # CORRECTED ENTRY/EXIT CONDITIONS
 # =====================
+# =====================
+# CORRECTED ENTRY/EXIT CONDITIONS (FIXED LOOK AHEAD)
+# =====================
 def check_entry_conditions(df, index):
-    """Fixed entry conditions with proper operators"""
+    """Use SHIFTED VALUES for all indicators"""
     row = df.loc[index]
     
-    volume_confirm = (
-        (row['volume'] > row['volume_ma'] * 1.2) and
-        (row['volume_ma'] > df['volume_ma'].rolling(50).mean().iloc[-1])
-    )
-    
     entry_confluence = (
-        (row['close'] < row['loband1']) and # Correct column name from MRC calculation
-        (row['RSI'] < 32) and
-        (row['Williams_%R'] < -80) and
-        (row['VWAP'] > row['close']) and
-        (row['MACD'] < row['Signal']) and
-        (row['adx'] < engine.adx_params['mean_reversion_threshold']) and
-        (row['+di'] < row['-di']) and
-        (row['%K'] < row['%D']) and
-        (row['%D'] < 30) and
-        volume_confirm and
-        not is_market_close(index)
+        (row['close_shifted'] < row['loband1_shifted']) and  # Use shifted values
+        (row['RSI_shifted'] < 32) and
+        (row['Williams_%R_shifted'] < -80) and
+        (row['VWAP_shifted'] > row['close_shifted']) and 
+        (row['MACD_shifted'] < row['Signal_shifted']) and
+        (row['adx_shifted'] < engine.adx_params['mean_reversion_threshold']) and
+        (row['+di_shifted'] < row['-di_shifted']) and
+        (row['%K_shifted'] < row['%D_shifted']) and
+        (row['%D_shifted'] < 30)
     )
     
     # Volatility Filter using engine reference
@@ -527,24 +523,20 @@ def check_entry_conditions(df, index):
     )
 
 def check_exit_conditions(df, index):
-    """Enhanced exit conditions with ADX trend monitoring"""
+    """Use SHIFTED VALUES for exit decisions"""
     if not engine.current_position:
         return False
 
     row = df.loc[index]
     entry_price = engine.current_position['entry_price']
     
-    # Profit Target Conditions
     profit_conditions = [
-        row['close'] > row['SMA_20'],                    # Price above SMA
-        row['RSI'] > 40,                                 # RSI normalization
-        row['Williams_%R'] > -60,                        # Williams %R recovery
-        row['close'] > row['VWAP'],                      # Price above VWAP
-        row['adx'] > 40,                                 # Strong trend emerging
-        row['+di'] > row['-di']                          # Bullish DI crossover
-        (row['%K'] > 75), 
-        (row['%D'] > 70), 
-        (row['%K'] < row['%D'])  # Bearish crossover
+        row['close_shifted'] > row['SMA_20_shifted'],  # Use shifted SMA
+        row['RSI_shifted'] > 40,
+        row['Williams_%R_shifted'] > -60,
+        row['close_shifted'] > row['VWAP_shifted'],
+        row['adx_shifted'] > 40,
+        row['+di_shifted'] > row['-di_shifted']
     ]
     
     # FIXED (using MRC metrics)
@@ -761,13 +753,16 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
         df['Histogram'] = df['MACD'] - df['Signal']
         
-        # RSI calculation
+        # Calculate RSI before stochastic oscillator
         delta = df['close'].diff()
         gain = delta.where(delta > 0, 0.0)
         loss = -delta.where(delta < 0, 0.0)
         avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
         avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()        
         df['RSI'] = 100 - (100 / (1 + (avg_gain / avg_loss)))
+
+        # Now calculate stochastic oscillator (which uses RSI)
+        df = stochastic_oscillator(df)
         
         # Williams %R
         df['Williams_%R'] = williams_r(df['high'], df['low'], df['close'])
@@ -778,12 +773,22 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         
         # Feature engineering updates
         df = df.drop(['vwap_numerator', 'vwap_denominator', 'trading_date'], axis=1)
+        
+        # ADD SHIFTED COLUMNS AFTER INDICATOR CALCULATION
+        df['Volume_MA_shifted'] = df['volume'].rolling(20).mean().shift(1)
         df['RSI_shifted'] = df['RSI'].shift(1)
+        df['Williams_%R_shifted'] = df['Williams_%R'].shift(1)
+        df['VWAP_shifted'] = df['VWAP'].shift(1)
         df['MACD_shifted'] = df['MACD'].shift(1)
         df['Signal_shifted'] = df['Signal'].shift(1)
-        df['Volume_MA_shifted'] = df['volume'].rolling(20).mean().shift(1)
         df['adx_shifted'] = df['adx'].shift(1)
-        
+        df['+di_shifted'] = df['+di'].shift(1)
+        df['-di_shifted'] = df['-di'].shift(1)
+        df['%K_shifted'] = df['%K'].shift(1)
+        df['%D_shifted'] = df['%D'].shift(1)
+        df['loband1_shifted'] = df['loband1'].shift(1)
+        df['upband1_shifted'] = df['upband1'].shift(1)
+        df['close_shifted'] = df['close'].shift(1)
         scaling_factor = 0.5  # Adjust based on your data
         df['meanrange'] *= scaling_factor
         
@@ -823,6 +828,9 @@ def williams_r(high, low, close, lookback=14):
     wr = -100 * ((highest_high - close) / denominator)
     return wr.fillna(-50)  # Neutral value when no range
 
+# ======================
+# STOCHASTIC OSCILLATOR
+# ======================
 def stochastic_oscillator(df, k_period=14, d_period=3):
     """Calculate Stochastic Oscillator with NaN handling"""
     low_min = df['low'].rolling(k_period).min()
@@ -832,10 +840,11 @@ def stochastic_oscillator(df, k_period=14, d_period=3):
     denominator = np.where(high_max != low_min, high_max - low_min, 1)
     df['%K'] = df['%K'].fillna(50)  # Neutral value when no range
     df['%D'] = df['%K'].rolling(d_period).mean()
+
     return df
 
 # =====================
-# CORRECTED ADX CALCULATION (REMOVED MEANLINE OVERWRITE)
+# ADX CALCULATION
 # =====================
 def calculate_adx(df, window=14):
     """Fixed ADX calculation without meanline overwrite"""
@@ -885,7 +894,7 @@ def calculate_adx(df, window=14):
     return df[['adx', '+di', '-di', 'adx_shifted']]
 
 # =====================
-# CORRECTED SUPER SMOOTHER
+# SUPER SMOOTHER
 # =====================
 def supersmoother(src: pd.Series, length: int) -> pd.Series:
     """Improved Supersmoother implementation."""
@@ -916,7 +925,7 @@ def sak_smoothing(series: pd.Series, filter_type: str, length: int) -> pd.Series
     return series  # Fallback to original series
 
 # =====================
-# VISUALIZATION ENGINE (FIXED PANEL ORDER)
+# VISUALIZATION ENGINE
 # =====================
 def plot_candlestick(df, backtest=False):
     """Generates panels in correct order: Price, MACD, Volume, RSI, Williams %R, ADX"""
@@ -1045,38 +1054,47 @@ def plot_candlestick(df, backtest=False):
 # =====================
 # EXECUTION HANDLERS (Critical Fix)
 # =====================
+# =====================
+# BACKTEST ENGINE MODIFICATIONS (FIXED LOOKAHEAD)
+# =====================
 def run_backtest(df):
-    for current_dt in df.index:
-        try:
-            engine.current_row = df.loc[current_dt]  # Set current row
-            if check_entry_conditions(df, current_dt):
-                row = df.loc[current_dt]
-                position_size = engine.calculate_position_size(row)
-                shares = max(0.01, position_size / row['close'])
-
-                trade = engine.execute_trade(
-                    symbol, row['close'], shares, 'BUY', current_dt
-                )
+    # Start from index 1 to prevent lookback at beginning
+    for i in range(1, len(df.index)):
+        current_dt = df.index[i]
+        prev_dt = df.index[i-1]
+        
+        # Use PREVIOUS BAR'S DATA for decision making
+        engine.current_row = df.loc[prev_dt]
+        
+        # ENTRY CHECK (using previous data)
+        if check_entry_conditions(df, prev_dt):
+            # Execute at CURRENT BAR'S OPEN PRICE
+            current_row = df.loc[current_dt]
+            position_size = engine.calculate_position_size(engine.current_row)
+            shares = max(0.01, position_size / current_row['open'])  # Use open price
+            
+            trade = engine.execute_trade(
+                symbol, 
+                current_row['open'],  # Execute at open price
+                shares, 
+                'BUY', 
+                current_dt
+            )
+            if trade:
                 log_trade(trade, symbol)
 
-            # Evaluate exit conditions
-            if engine.current_position and check_exit_conditions(df, current_dt):
-                row = df.loc[current_dt]
-                trade = engine.execute_trade(
-                    symbol,
-                    row['close'],
-                    engine.current_position['shares'],
-                    'SELL',
-                    current_dt
-                )
+        # EXIT CHECK (using previous data)
+        if engine.current_position and check_exit_conditions(df, prev_dt):
+            current_row = df.loc[current_dt]
+            trade = engine.execute_trade(
+                symbol,
+                current_row['open'],  # Exit at open price
+                engine.current_position['shares'],
+                'SELL',
+                current_dt
+            )
+            if trade:
                 log_trade(trade, symbol)
-                
-            if 'adx_shifted' not in df.columns:
-                raise KeyError("Missing adx_shifted column in DataFrame")
-
-        except Exception as e:
-            logger.error(f"Error processing {current_dt}: {str(e)}")
-            continue
 
     return df
 
