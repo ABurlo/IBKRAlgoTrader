@@ -16,7 +16,6 @@ from matplotlib.colors import ListedColormap
 from collections.abc import MutableMapping  # FIX: Added correct abstract base class import
 import pytz
 import re
-
 # =====================
 # LINKED LIST DICTIONARY IMPLEMENTATION
 # =====================
@@ -77,7 +76,7 @@ class LLDict(MutableMapping):  # FIX: Replaced DictAbstract with MutableMapping
 # =====================
 # GLOBAL CONFIGURATION
 # =====================
-symbol = 'GOOGL' # Random Stock Ticker Generator - API call IBKR random pos in array of NYSE/NASDAQ tickers list?
+symbol = 'MSFT' # Random Stock Ticker Generator - API call IBKR random pos in array of NYSE/NASDAQ tickers list?
 initial_balance = 10000
 MIN_REQUIRED_BANDS = 2
 gradient_levels = [0.5, 1.0, 1.5, 2.0]  # Adjust these multipliers as needed
@@ -633,12 +632,9 @@ def log_trade(trade, symbol):  # Added symbol param:
         logger.error(f"Failed to log trade: {str(e)}", exc_info=True)
 
 # =====================
-# DATA MANAGEMENT (UPDATED FOR MRC)
+# DATA MANAGEMENT
 # =====================
 nest_asyncio.apply()
-
-import matplotlib.pyplot as plt
-import numpy as np
 
 def calculate_mrc_with_gradient(df: pd.DataFrame, length, gradient_levels):
     # Calculate True Range (TR)
@@ -665,7 +661,6 @@ def calculate_mrc_with_gradient(df: pd.DataFrame, length, gradient_levels):
         df[f'loband_{level}_shifted'] = df[f'loband_{level}'].shift(1)
         df[f'upband_{level}_shifted'] = df[f'upband_{level}'].shift(1)
 
-    
     # After calculating MRC bands
     for level in gradient_levels:
         df[f'loband_{level}_shifted'] = df[f'loband_{level}'].shift(1)
@@ -673,33 +668,65 @@ def calculate_mrc_with_gradient(df: pd.DataFrame, length, gradient_levels):
     
     return df
 
-def plot_mrc_gradient(ax, df, gradient_levels, colors):
-    """Fixed gradient plotting with proper band references"""
-    sorted_levels = sorted(gradient_levels)
+# Configure plot style before plotting
+import seaborn as sns
+sns.set_style("whitegrid")  # <-- Official Seaborn method
+sns.set_context("notebook")  # Optional: set scaling
+sns.set_palette("tab10")     # Optional: set color scheme
+plt.rcParams.update({
+    'font.size': 10,
+    'axes.labelcolor': '#333333',
+    'axes.titlepad': 12,
+    'grid.color': '#eeeeee',
+    'figure.dpi': 300
+})
+
+def plot_mrc_gradient(ax, df):
+    """Enhanced MRC gradient visualization with perceptual color mapping"""
+    # Configure gradient parameters
+    levels = sorted(gradient_levels, reverse=True)
+    cmap = plt.get_cmap('viridis')  # Perceptually uniform colorpimap
+    norm = plt.Normalize(vmin=min(gradient_levels), vmax=max(gradient_levels))
     
-    for i in range(len(sorted_levels) - 1):
-        curr_level = sorted_levels[i]
-        next_level = sorted_levels[i+1]
+    # Create gradient bands with smooth transitions
+    for i in range(len(levels) - 1):
+        upper = df['meanline'] + df['meanrange'] * levels[i]
+        lower = df['meanline'] - df['meanrange'] * levels[i]
+        next_upper = df['meanline'] + df['meanrange'] * levels[i+1]
+        next_lower = df['meanline'] - df['meanrange'] * levels[i+1]
         
-        # Lower band gradient
-        ax.fill_between(
-            df.index,
-            df[f'loband_{curr_level}'],
-            df[f'loband_{next_level}'],
-            color=colors[i],
-            alpha=0.3,
-            edgecolor='none'
-        )
+        # Calculate band color based on gradient level
+        band_color = cmap(norm(levels[i]))
         
-        # Upper band gradient
-        ax.fill_between(
-            df.index,
-            df[f'upband_{curr_level}'],
-            df[f'upband_{next_level}'],
-            color=colors[i],
-            alpha=0.3,
-            edgecolor='none'
-        )
+        # Upper band with edge highlighting
+        ax.fill_between(df.index, upper, next_upper, 
+                       color=band_color, alpha=0.25,
+                       edgecolor=band_color, linewidth=0.5)
+        
+        # Lower band with edge highlighting
+        ax.fill_between(df.index, lower, next_lower,
+                       color=band_color, alpha=0.25,
+                       edgecolor=band_color, linewidth=0.5)
+
+    # Add colorbar for gradient interpretation
+    sm = ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ax=ax, orientation='vertical',
+                       pad=0.01, shrink=0.8)
+    cbar.set_label('MRC Gradient Level', rotation=270, labelpad=15)
+    cbar.ax.yaxis.set_ticks(gradient_levels)
+    
+    # Add dynamic zero line with contrasting style
+    zero_line = df['meanline']
+    ax.plot(df.index, zero_line, color='#404040', linestyle='--', 
+           linewidth=1.5, alpha=0.8, zorder=3,
+           path_effects=[pe.Stroke(linewidth=2.5, foreground='white'),
+                         pe.Normal()])
+
+    # Apply perceptually balanced text contrast
+    ax.tick_params(colors='#333333')
+    ax.yaxis.label.set_color('#333333')
+
 
 def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=False):
     contract = Stock(symbol, exchange, currency)
@@ -708,7 +735,7 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         bars = ib.reqHistoricalData(
             contract,
             endDateTime='',
-            durationStr='30 D',
+            durationStr='7 D',
             barSizeSetting='1 hour',
             whatToShow='TRADES',
             useRTH=True,
@@ -826,7 +853,7 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         df['%K_shifted'] = df['%K'].shift(1)
         df['%D_shifted'] = df['%D'].shift(1)
         df['close_shifted'] = df['close'].shift(1)
-        scaling_factor = 1.0  # Adjust based on your data
+        scaling_factor = 2.0  # Adjust based on your data
         df['meanrange'] *= scaling_factor
         
         # Validate core indicators for composite score
@@ -962,20 +989,17 @@ def sak_smoothing(series: pd.Series, filter_type: str, length: int) -> pd.Series
 def plot_candlestick(df, backtest=False):
     if df.empty:
         raise ValueError("Cannot plot empty DataFrame")
-        # Standardize timezone first
-    plot_df = df.copy()
-    if plot_df.index.tz != pytz.timezone('America/New_York'):
-        plot_df.index = plot_df.index.tz_convert('America/New_York')
     
-    """Generates panels in correct order: Price, MACD, Volume, RSI, Williams %R, ADX, with MRC Gradient."""
+    # Ensure timezone consistency
+    if df.index.tz is None:
+        df.index = df.index.tz_localize('UTC').tz_convert('America/New_York')
+    else:
+        df.index = df.index.tz_convert('America/New_York')
+
     import matplotlib.pyplot as plt
     from matplotlib.patches import Patch
+    import mplfinance as mpf
 
-    plot_df = df.copy()
-    if plot_df.index.tz is not None:
-        plot_df.index = plot_df.index.tz_convert('America/New_York')
-    else:
-        plot_df.index = plot_df.index.tz_convert('America/New_York')
     # ===== REORDERED ADDPLOTS =====
     addplots = []
 
@@ -994,7 +1018,7 @@ def plot_candlestick(df, backtest=False):
         mpf.make_addplot(df[f'loband_{gradient_levels[0]}'], panel=0, color="darkorange"),
         mpf.make_addplot(df[f'upband_{gradient_levels[0]}'], panel=0, color="darkorange"),
         mpf.make_addplot(df[f'upband_{gradient_levels[1]}'], panel=0, color="red")
-])
+    ])
 
     # Style for the candlestick chart
     style = mpf.make_mpf_style(
@@ -1046,18 +1070,6 @@ def plot_candlestick(df, backtest=False):
                          color='red', width=1.5, alpha=0.75)
     ])
 
-    # 7. Stochastic Oscillator Panel (6)
-    addplots.append(mpf.make_addplot(df['%K'], panel=6,
-                                     color='blue', width=1.2, ylabel='Stochastic'))
-    addplots.append(mpf.make_addplot(df['%D'], panel=6,
-                                     color='orange', width=1.2))
-    addplots.extend([
-        mpf.make_addplot(pd.Series(80, index=df.index), panel=6,
-                         color='red', linestyle='--', width=1.0),
-        mpf.make_addplot(pd.Series(20, index=df.index), panel=6,
-                         color='green', linestyle='--', width=1.0)
-    ])
-
     # ===== MRC GRADIENT HANDLING =====
     
     def plot_mrc_gradient(ax):
@@ -1095,17 +1107,10 @@ def plot_candlestick(df, backtest=False):
         style=style,
         addplot=addplots,
         volume=False,
-        panel_ratios=(12, 6, 4, 4, 4, 4, 4),
+        panel_ratios=(12, 6, 4, 4, 4, 4),
         figsize=(14, 24),
         returnfig=True
     )
-    
-    addplots.extend([
-    mpf.make_addplot(df["upband_0.5"], panel=0, color="darkorange"),
-    mpf.make_addplot(df["loband_0.5"], panel=0, color="darkorange"),
-    mpf.make_addplot(df["upband_1.0"], panel=0, color="red")
-])
-    
 
     # Apply MRC Gradient to the Main Price Panel (Panel Index: 0)
     main_ax = axlist[0]
@@ -1119,8 +1124,7 @@ def plot_candlestick(df, backtest=False):
         2: [("Volume (Up)", "#5cb85c"), ("Volume (Down)", "#d9534f")],
         3: [("RSI", "#4B0082"), ("30/70 Bands", "gray")],
         4: [("Williams %R", "blue"), ("-20 Overbought", "red"), ("-80 Oversold", "green")],
-        5: [("ADX (Trend Strength)", "blue"),("+DI (Bullish Pressure)", "green"), ("-DI (Bearish Pressure)", "red")],
-        6: [("Stochastic Oscillator", "blue")]
+        5: [("ADX (Trend Strength)", "blue"),("+DI (Bullish Pressure)", "green"), ("-DI (Bearish Pressure)", "red")]
     }
 
     for panel_idx, ax in enumerate(axlist):
