@@ -101,7 +101,7 @@ def is_market_close(index):
     time_delta = timedelta(minutes=10)
     
     # Create aware datetime objects for comparison
-    dummy_date = index[0].date()
+    dummy_date = index.date()
     market_close_dt = ny_tz.localize(datetime.combine(dummy_date, market_close_time))
     
     return (market_close_dt - time_delta) <= index <= market_close_dt
@@ -111,53 +111,56 @@ def is_market_close(index):
 # =====================
 def plot_pnl_calendar(engine, start_date, end_date, initial_balance, symbol):
     ny_tz = pytz.timezone('America/New_York')
+    
+    # Convert trade history to DataFrame FIRST
+    trade_df = pd.DataFrame(engine.trade_history)
+    
+    # Safely get start/end dates
+    if not trade_df.empty and 'timestamp' in trade_df.columns:
+        trade_df['timestamp'] = pd.to_datetime(trade_df['timestamp'])
+        trade_df['timestamp'] = trade_df['timestamp'].dt.tz_convert('America/New_York')
+        
+        start_date = trade_df['timestamp'].min().normalize()
+        end_date = trade_df['timestamp'].max().normalize()
+    else:
+        logger.warning("No trades available for calendar")
+        return
 
-    # Convert start and end dates to NY timezone
-        # Convert using original timezone-aware series
-    start_date = engine.trade_history['timestamp'].min().tz_convert('America/New_York')
-    end_date = engine.trade_history['timestamp'].max().tz_convert('America/New_York')
-
-  # Processing loop remains the same but with tz-aware dates
+    # Processing loop with proper timezone handling
     current_date = start_date.normalize()
     while current_date <= end_date:
-        # Calculate the end of the current month
+        # Date calculations remain unchanged
         next_month = current_date.replace(day=1) + pd.DateOffset(months=1)
         month_end = min(next_month - pd.Timedelta(days=1), end_date)
-
-        # Generate all dates in the current month
         all_dates = pd.date_range(start=current_date, end=month_end, freq='D', tz=ny_tz)
 
-        # Process daily PnL data
+        # Daily PNL processing with explicit timezone
         daily_pnl = pd.DataFrame.from_dict(engine.daily_pnl, orient='index', columns=['pnl'])
-        daily_pnl.index = pd.to_datetime(daily_pnl.index).tz_localize('UTC').tz_convert(ny_tz)
+        daily_pnl.index = pd.to_datetime(daily_pnl.index).tz_convert(ny_tz)
         daily_pnl = daily_pnl.reindex(all_dates, fill_value=0).reset_index()
         daily_pnl.rename(columns={'index': 'date'}, inplace=True)
 
-        # Add title to the calendar dynamically
-        title = f"{symbol} Trading Performance {current_date.strftime('%B %Y')}"
-
-        # Visualization with details
+        # Visualization setup remains the same
         fig, ax = plt.subplots(figsize=(16, 28))
         ax.set_facecolor('#f0f0f0')
-
-        # Calculate offset for first day and number of weeks
+        
+        # Date positioning logic unchanged
         first_day_of_month = current_date.replace(day=1)
         first_day_offset = first_day_of_month.weekday()
         days_in_month = (current_date + pd.offsets.MonthEnd(1)).day
         num_weeks = ((days_in_month + first_day_offset - 1) // 7) + 1
 
-        # Plot each day
+        # Modified trade filtering using DataFrame
         for i, row in daily_pnl.iterrows():
             date = row['date']
-            col = date.weekday()  # Day of the week (Monday=0, Sunday=6)
+            col = date.weekday()
             day_of_month = date.day
             week_num = (day_of_month + first_day_offset - 1) // 7
             row_pos = -week_num
 
-            # Check if the day is Saturday (5) or Sunday (6)
+            # Weekend handling remains
             if col in [5, 6]:
-                color = '#000000'  # Solid black
-                # Plot cell rectangle
+                color = '#000000'
                 ax.add_patch(plt.Rectangle(
                     (col, row_pos), 1, 1,
                     facecolor=color,
@@ -165,22 +168,22 @@ def plot_pnl_calendar(engine, start_date, end_date, initial_balance, symbol):
                     lw=0.5
                 ))
             else:
-                # Filter trades for the specific date
-                trades = [t for t in engine.trade_history if pd.Timestamp(t['timestamp']).date() == date.date()]
-
-                # Calculate metrics for the day
-                metrics = calculate_day_metrics(trades)
-
-                # If no trades occurred, set the color to grey
+                # FIX #2 GOES HERE: Proper trade filtering
+                # Convert both timestamps to date for comparison
+                day_trades = trade_df[
+                    trade_df['timestamp'].dt.date == date.date()
+                ].to_dict('records')
+                
+                metrics = calculate_day_metrics(day_trades)
+                
+                # Color logic remains unchanged
                 if metrics['num_trades'] == 0:
-                    color = '#d3d3d3'  # Default grey for no trades
+                    color = '#d3d3d3'
                 else:
-                    # Determine cell color intensity based on PnL
                     max_abs_pnl = abs(daily_pnl['pnl']).max()
                     color_intensity = min(1, abs(row.pnl) / max_abs_pnl) if max_abs_pnl > 0 else 0
                     color = f"#{int((0.8-color_intensity)*255):02x}ff{int((0.8-color_intensity)*255):02x}"
 
-                # Plot cell rectangle
                 ax.add_patch(plt.Rectangle(
                     (col, row_pos), 1, 1,
                     facecolor=color,
@@ -188,25 +191,24 @@ def plot_pnl_calendar(engine, start_date, end_date, initial_balance, symbol):
                     lw=0.5
                 ))
 
-                # Add text for metrics
-                ax.text(col + 0.05, row_pos + 0.85, str(day_of_month), ha='left', va='top', fontsize=8)
+                ax.text(col + 0.05, row_pos + 0.85, str(day_of_month), 
+                       ha='left', va='top', fontsize=8)
                 ax.text(col + 0.5, row_pos + 0.5,
-                        f"${row.pnl:.2f}\nW%: {metrics['win_rate']:.2f}%\nTrades: {metrics['num_trades']}",
-                        ha='center', va='center', fontsize=6)
+                       f"${row.pnl:.2f}\nW%: {metrics['win_rate']:.2f}%\nTrades: {metrics['num_trades']}",
+                       ha='center', va='center', fontsize=6)
 
-        # Configure axis limits and labels
+        # Axis configuration remains
         ax.set_xlim(-0.5, 6.5)
-        ax.set_ylim(-num_weeks - 0.5, 0.5)  # Dynamically adjust y-axis based on num_weeks
-
+        ax.set_ylim(-num_weeks - 0.5, 0.5)
         ax.set_xticks(range(7))
         ax.set_xticklabels(['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'])
         ax.set_yticks([])
 
-        plt.suptitle(title, fontsize=16)
+        plt.suptitle(f"{symbol} Trading Performance {current_date.strftime('%B %Y')}", 
+                    fontsize=16)
         plt.tight_layout()
         plt.show()
 
-        # Move to next month
         current_date = next_month
 
 def calculate_day_metrics(trades):
@@ -217,6 +219,12 @@ def calculate_day_metrics(trades):
     pnl = 0.0
     
     for t in trades:
+        # Add type check and conversion
+        if isinstance(t, dict) and 'timestamp' in t:
+            ts = pd.to_datetime(t['timestamp'])
+        else:
+            logger.error("Invalid trade format in calculate_day_metrics")
+            continue
         trade_pnl = t.get('pnl', 0.0)
         pnl += float(trade_pnl)
         
@@ -240,6 +248,11 @@ def calculate_day_metrics(trades):
 # =====================
 # BACKTESTING ENGINE
 # =====================
+# Added to BacktestEngine
+@property
+def max_position_size(self):
+    return self.balance * 0.25  # Never risk >25% of capital
+
 class BacktestEngine:
     def __init__(self, mode='neutral'):
         self.mode = mode
@@ -440,7 +453,7 @@ engine = BacktestEngine()
 def check_entry_conditions(df, index):
     """Use SHIFTED VALUES for all indicators with timezone validation"""
     # Validate timestamp first
-    if index.tz != pytz.timezone('America/New_York'):
+    if str(index.tz) != 'America/New_York':
         raise ValueError(f"Invalid timezone in entry check: {index.tz}")
     
     try:
@@ -451,7 +464,7 @@ def check_entry_conditions(df, index):
 
     # Core entry logic
     entry_confluence = (
-        (row['close_shifted'] < row['loband1'].shift(1)) and
+        (row['close_shifted'] < row['loband1_shifted']) and  # Changed
         (row['RSI_shifted'] < 32) and
         (row['Williams_%R_shifted'] < -80) and
         (row['VWAP_shifted'] > row['close_shifted']) and 
@@ -483,8 +496,8 @@ def check_entry_conditions(df, index):
 
 def check_exit_conditions(df, index):
     """Exit logic with shifted values and timezone safety"""
-    if index.tz != pytz.timezone('America/New_York'):
-        raise ValueError(f"Invalid timezone in exit check: {index.tz}")
+    if str(index.tz) != 'America/New_York':
+        raise ValueError(f"Invalid timezone in entry check: {index.tz}")
         
     if not engine.current_position:
         return False
@@ -584,12 +597,14 @@ logger = logging.getLogger(__name__)
 # =====================
 # MODIFIED LOG_TRADE FUNCTION
 # =====================
-def log_trade(trade, symbol):
+def log_trade(trade, symbol):  # Added symbol param:
     """Robust logging with improved color handling"""
     try:
         # Convert trade timestamp properly
-        trade_time = pd.to_datetime(trade['timestamp'], utc=True)
-        trade_time = trade_time.tz_convert('America/New_York')
+        timestamp = trade['timestamp']
+        if timestamp.tz is None:  # Handle naive timestamps
+            timestamp = timestamp.tz_localize('UTC')
+        trade_time = timestamp.tz_convert('America/New_York')
         
         # Use .floor() instead of .date for timezone-aware datetimes
         trade_day = trade_time.floor('D')  
@@ -759,6 +774,9 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         df['hlc3'] = (df['high'] + df['low'] + df['close']) / 3
         df = calculate_mrc_with_gradient(df, length=100)
 
+        df['loband1_shifted'] = df['loband1'].shift(1)
+        df['upband1_shifted'] = df['upband1'].shift(1)
+        
         # Clean column names first
         df = df.rename(columns={
             'open': 'open',
@@ -1003,6 +1021,8 @@ def sak_smoothing(series: pd.Series, filter_type: str, length: int) -> pd.Series
 # VISUALIZATION ENGINE
 # =====================
 def plot_candlestick(df, backtest=False):
+    if df.empty:
+        raise ValueError("Cannot plot empty DataFrame")
         # Standardize timezone first
     plot_df = df.copy()
     if plot_df.index.tz != pytz.timezone('America/New_York'):
@@ -1206,7 +1226,7 @@ def run_backtest(df):
     if df.index.tz is None:
         df.index = df.index.tz_localize('UTC').tz_convert('America/New_York')
     # 1. Timezone Enforcement
-    df.index = enforce_ny_timezone(df.index).validate_timestamps(df)
+    df.index = enforce_ny_timezone(df.index)
     
     # 2. Pre-backtest Checks
     required_columns = ['open', 'high', 'low', 'close', 'volume', 
