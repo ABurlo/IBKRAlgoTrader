@@ -464,7 +464,7 @@ def check_entry_conditions(df, index):
 
     # Core entry logic
     entry_confluence = (
-        (row['close_shifted'] < row['loband1_shifted']) and  # Changed
+        (row['close_shifted'] < row[f'loband_{gradient_levels[0]}_shifted']) and  # Changed
         (row['RSI_shifted'] < 32) and
         (row['Williams_%R_shifted'] < -80) and
         (row['VWAP_shifted'] > row['close_shifted']) and 
@@ -640,103 +640,66 @@ nest_asyncio.apply()
 import matplotlib.pyplot as plt
 import numpy as np
 
-def calculate_mrc_with_gradient(df: pd.DataFrame, length=100, gradient_levels=[1.0, 2.0]):
-    """
-    Robust Mean Reversion Channel with Gradient Band Generation
-    """
-    # =====================
-    # 1. Data Validation
-    # =====================
-    min_required_length = max(150, int(length * 1.5))
-    if len(df) < min_required_length:
-        raise ValueError(f"Need minimum {min_required_length} data points (current: {len(df)})")
-    
-    # =====================
-    # 2. Core Calculations
-    # =====================
-    # HLC3 with forward/backward filling
-    df['hlc3'] = (df['high'].ffill().bfill() + 
-                 df['low'].ffill().bfill() + 
-                 df['close'].ffill().bfill()) / 3
-    
-    # Meanline calculation with safety
+def calculate_mrc_with_gradient(df: pd.DataFrame, length, gradient_levels):
+    # Calculate True Range (TR)
+    df['prev_close'] = df['close'].shift(1).ffill()
+    df['tr1'] = df['high'] - df['low']
+    df['tr2'] = abs(df['high'] - df['prev_close'])
+    df['tr3'] = abs(df['low'] - df['prev_close'])
+    df['tr'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)
+    df.drop(['tr1', 'tr2', 'tr3', 'prev_close'], axis=1, inplace=True, errors='ignore')
+
+    # Calculate meanline and meanrange
     df['meanline'] = supersmoother(df['hlc3'], length).bfill().ffill()
+    df['meanrange'] = df['tr'].rolling(20).mean().bfill().ffill()
     
-    # True Range with volatility floor
-    tr = np.maximum(
-        df['high'] - df['low'],
-        np.maximum(
-            abs(df['high'] - df['close'].shift().bfill()),
-            abs(df['low'] - df['close'].shift().bfill())
-        )
-    ).clip(lower=0.0001)
+    # Generate gradient bands with explicit level naming
+    for level in gradient_levels:
+        df[f'upband_{level}'] = df['meanline'] + (df['meanrange'] * level)
+        df[f'loband_{level}'] = df['meanline'] - (df['meanrange'] * level)
     
-    # Mean range calculation with fallback
-    try:
-        df['meanrange'] = supersmoother(tr, length).bfill().ffill()
-    except Exception as e:
-        df['meanrange'] = tr.rolling(20).mean().bfill().ffill()
+    for level in gradient_levels:
+        df[f'upband_{level}'] = df['meanline'] + (df['meanrange'] * level)
+        df[f'loband_{level}'] = df['meanline'] - (df['meanrange'] * level)
+        # Add shifted versions
+        df[f'loband_{level}_shifted'] = df[f'loband_{level}'].shift(1)
+        df[f'upband_{level}_shifted'] = df[f'upband_{level}'].shift(1)
+
     
-    df['meanrange'] = df['meanrange'].replace(0, 0.0001)
-    
-    # =====================
-    # 3. Band Generation
-    # =====================
-    required_bands = ['meanline', 'upband1', 'loband1', 'upband2', 'loband2']
-    
-    # Force band creation using first 2 gradient levels
-    for i, level in enumerate(gradient_levels[:2], 1):
-        df[f'upband{i}'] = df['meanline'] + (df['meanrange'] * level).bfill().ffill()
-        df[f'loband{i}'] = df['meanline'] - (df['meanrange'] * level).bfill().ffill()
-    
-    # =====================
-    # 4. Post-Validation
-    # =====================
-    missing = [col for col in required_bands if col not in df.columns]
-    if missing:
-        # Fallback to close-based bands
-        df['meanline'] = df.get('meanline', df['close'])
-        base_vol = df['meanrange'].mean() or df['close'].std()
-        
-        for i in [1, 2]:
-            df[f'upband{i}'] = df['meanline'] + (base_vol * gradient_levels[i-1])
-            df[f'loband{i}'] = df['meanline'] - (base_vol * gradient_levels[i-1])
+    # After calculating MRC bands
+    for level in gradient_levels:
+        df[f'loband_{level}_shifted'] = df[f'loband_{level}'].shift(1)
+        df[f'upband_{level}_shifted'] = df[f'upband_{level}'].shift(1)
     
     return df
 
-
 def plot_mrc_gradient(ax, df, gradient_levels, colors):
-    """
-    Plots MRC gradient shading on a given axis.
-    :param ax: Matplotlib axis to plot on.
-    :param df: DataFrame containing MRC bands.
-    :param gradient_levels: List of deviation multipliers for gradient.
-    :param colors: List of colors for each gradient level.
-    """
-    for i in range(len(gradient_levels) - 1):
-        upper_band = df[f'upband_{gradient_levels[i]}']
-        lower_band = df[f'loband_{gradient_levels[i]}']
-        next_upper_band = df[f'upband_{gradient_levels[i + 1]}']
-        next_lower_band = df[f'loband_{gradient_levels[i + 1]}']
-
-        # Plot filled area between bands with gradient color
+    """Fixed gradient plotting with proper band references"""
+    sorted_levels = sorted(gradient_levels)
+    
+    for i in range(len(sorted_levels) - 1):
+        curr_level = sorted_levels[i]
+        next_level = sorted_levels[i+1]
+        
+        # Lower band gradient
         ax.fill_between(
             df.index,
-            lower_band,
-            next_lower_band,
+            df[f'loband_{curr_level}'],
+            df[f'loband_{next_level}'],
             color=colors[i],
-            alpha=0.5,
-            edgecolor=None
+            alpha=0.3,
+            edgecolor='none'
         )
+        
+        # Upper band gradient
         ax.fill_between(
             df.index,
-            upper_band,
-            next_upper_band,
+            df[f'upband_{curr_level}'],
+            df[f'upband_{next_level}'],
             color=colors[i],
-            alpha=0.5,
-            edgecolor=None
+            alpha=0.3,
+            edgecolor='none'
         )
-
 
 def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=False):
     contract = Stock(symbol, exchange, currency)
@@ -772,10 +735,7 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
     
         # Calculate HLC3 first before MRC
         df['hlc3'] = (df['high'] + df['low'] + df['close']) / 3
-        df = calculate_mrc_with_gradient(df, length=100)
-
-        df['loband1_shifted'] = df['loband1'].shift(1)
-        df['upband1_shifted'] = df['upband1'].shift(1)
+        df = calculate_mrc_with_gradient(df, length=100, gradient_levels=gradient_levels)
         
         # Clean column names first
         df = df.rename(columns={
@@ -785,6 +745,17 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
             'close': 'close',
             'volume': 'volume'
         }).drop(columns=['average', 'barCount'], errors='ignore')
+        
+        # Validate MRC outputs
+        required_bands = [f'upband_{l}' for l in gradient_levels] + \
+                 [f'loband_{l}' for l in gradient_levels]
+
+        missing = [b for b in required_bands if b not in df.columns]
+        if missing:
+            raise ValueError(f"Missing MRC bands: {missing}")
+
+        assert not df[['meanline', 'meanrange']].isnull().values.any(), \
+            "NaNs in MRC base calculations"
 
         def safe_tz_convert(series):
             if series.dt.tz is None:
@@ -794,14 +765,6 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
 
         df['date'] = safe_tz_convert(pd.to_datetime(df['date']))
     
-        # Add post-calculation validation
-        required_mrc_cols = ['meanline', 'upband1', 'loband1', 'upband2', 'loband2']
-        missing = [col for col in required_mrc_cols if col not in df.columns]
-        if missing:
-            logger.warning(f"MRC fallback activated for: {missing}")
-            for col in missing:
-                df[col] = df['close']  # Temporary fallback
-        
         # Technical indicators
         adx_components = calculate_adx(df)
         df = df.join(adx_components, lsuffix='', rsuffix='_drop').drop(columns=['adx_drop', '+di_drop', '-di_drop', 'adx_shifted_drop'], errors='ignore')
@@ -821,22 +784,6 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         df = calculate_mrc_with_gradient(df, length=100)
     except Exception as e:
         logger.error(f"MRC Failure: {str(e)}")
-    
-    # Guaranteed band initialization
-    band_defaults = {
-        'meanline': df['close'],
-        'upband1': df['close'] * 1.01,
-        'loband1': df['close'] * 0.99,
-        'upband2': df['close'] * 1.02,
-        'loband2': df['close'] * 0.98
-    }
-    
-    for band in band_defaults:
-        if band not in df.columns:
-            df[band] = band_defaults[band]
-    
-    # Final validation checkpoint
-        assert all(b in df.columns for b in band_defaults), "Band fallback failed"
     
         # MACD with noise filtering
         exp12 = df['close'].ewm(span=12, adjust=False).mean()
@@ -878,8 +825,6 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         df['-di_shifted'] = df['-di'].shift(1)
         df['%K_shifted'] = df['%K'].shift(1)
         df['%D_shifted'] = df['%D'].shift(1)
-        df['loband1_shifted'] = df['loband1'].shift(1)
-        df['upband1_shifted'] = df['upband1'].shift(1)
         df['close_shifted'] = df['close'].shift(1)
         scaling_factor = 1.0  # Adjust based on your data
         df['meanrange'] *= scaling_factor
@@ -891,19 +836,13 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
             raise ValueError(f"Missing composite score columns: {missing}")
 
         # Cleanup MRC bands only if actually used elsewhere
-
-        mrc_bands = ['meanline', 'upband1', 'loband1', 'upband2', 'loband2']
-        df[mrc_bands] = df[mrc_bands].ffill().bfill()
         
         if df.empty:
             raise ValueError("Empty DataFrame after MRC processing")
             
-        assert not df[['adx', '+di', '-di'] + required_mrc_cols].isnull().values.any(), \
+        assert not df[['adx', '+di', '-di']].isnull().values.any(), \
             "NaN values present in critical columns"
-            
-        required_mrc_cols = ['meanline', 'upband1', 'loband1', 'upband2', 'loband2']
-        if not all(col in df.columns for col in required_mrc_cols):
-            raise ValueError("MRC calculation failed - missing columns")
+        
         
         return df
         
@@ -989,20 +928,20 @@ def calculate_adx(df, window=14):
 # SUPER SMOOTHER
 # =====================
 def supersmoother(src: pd.Series, length: int) -> pd.Series:
+    """SuperSmoother filter implementation for meanline calculation"""
     if len(src) < 3:
-        return src.ffill().bfill()  # Return original if insufficient data
+        return src.ffill().bfill()
     a1 = np.exp(-np.sqrt(2) * np.pi / length)
     b1 = 2 * a1 * np.cos(np.sqrt(2) * np.pi / length)
     c3 = -a1**2
     c2 = b1
     c1 = 1 - c2 - c3
-
+    
     ss = np.zeros_like(src)
     ss[0] = src.iloc[0]
     ss[1] = src.iloc[1]
     for i in range(2, len(src)):
-        ss[i] = c1 * src.iloc[i] + c2 * ss[i - 1] + c3 * ss[i - 2]
-    
+        ss[i] = c1 * src.iloc[i] + c2 * ss[i-1] + c3 * ss[i-2]
     return pd.Series(ss, index=src.index).bfill().ffill()
 
 def sak_smoothing(series: pd.Series, filter_type: str, length: int) -> pd.Series:
@@ -1052,12 +991,10 @@ def plot_candlestick(df, backtest=False):
 
     # 1. Main Price Panel (0) - Add Lo-Hi Bands and Meanline
     addplots.extend([
-        mpf.make_addplot(df["meanline"], panel=0, color="blue", width=1.5),
-        mpf.make_addplot(df["upband1"], panel=0, color="darkorange", width=0.8),
-        mpf.make_addplot(df["loband1"], panel=0, color="darkorange", width=0.8),
-        mpf.make_addplot(df["upband2"], panel=0, color="red", width=0.8),
-        mpf.make_addplot(df["loband2"], panel=0, color="red", width=0.8),
-    ])
+        mpf.make_addplot(df[f'loband_{gradient_levels[0]}'], panel=0, color="darkorange"),
+        mpf.make_addplot(df[f'upband_{gradient_levels[0]}'], panel=0, color="darkorange"),
+        mpf.make_addplot(df[f'upband_{gradient_levels[1]}'], panel=0, color="red")
+])
 
     # Style for the candlestick chart
     style = mpf.make_mpf_style(
@@ -1149,8 +1086,6 @@ def plot_candlestick(df, backtest=False):
                 alpha=0.3
             )
 
-    
-    assert not df[['meanline', 'upband1', 'loband1']].isnull().values.any(), "NaNs in MRC bands"
     assert isinstance(df.index, pd.DatetimeIndex), "Index is not datetime"
     
     # Create the figure and axes
@@ -1164,6 +1099,12 @@ def plot_candlestick(df, backtest=False):
         figsize=(14, 24),
         returnfig=True
     )
+    
+    addplots.extend([
+    mpf.make_addplot(df["upband_0.5"], panel=0, color="darkorange"),
+    mpf.make_addplot(df["loband_0.5"], panel=0, color="darkorange"),
+    mpf.make_addplot(df["upband_1.0"], panel=0, color="red")
+])
     
 
     # Apply MRC Gradient to the Main Price Panel (Panel Index: 0)
@@ -1218,6 +1159,12 @@ def enforce_ny_timezone(dt_obj):
 # BACKTEST ENGINE MODIFICATIONS (FIXED LOOKAHEAD)
 # =====================
 def run_backtest(df):
+        # Add validation at start
+    required_bands = [f'upband_{l}' for l in gradient_levels] + \
+                    [f'loband_{l}' for l in gradient_levels]
+    missing = [b for b in required_bands if b not in df.columns]
+    if missing:
+        raise ValueError(f"Missing MRC bands: {missing}")
      # Ensure datetime index
     if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index, errors='coerce')
