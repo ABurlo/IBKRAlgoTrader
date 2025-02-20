@@ -666,6 +666,15 @@ def calculate_mrc_with_gradient(df: pd.DataFrame, length, gradient_levels):
         df[f'loband_{level}_shifted'] = df[f'loband_{level}'].shift(1)
         df[f'upband_{level}_shifted'] = df[f'upband_{level}'].shift(1)
     
+        # Add proper shifted calculations
+    df['meanrange_shifted'] = df['meanrange'].shift(1).bfill()
+    
+    # Calculate bands using SHIFTED meanrange
+    for level in gradient_levels:
+        df[f'upband_{level}'] = df['meanline'] + (df['meanrange_shifted'] * level)
+        df[f'loband_{level}'] = df['meanline'] - (df['meanrange_shifted'] * level)
+    
+    return df
     return df
 
 # Configure plot style before plotting
@@ -707,6 +716,13 @@ def plot_mrc_gradient(ax, df):
         ax.fill_between(df.index, lower, next_lower,
                        color=band_color, alpha=0.25,
                        edgecolor=band_color, linewidth=0.5)
+        
+        ax.plot(df.index, df['meanline'], 
+        color='#404040', 
+        linestyle='--',
+        linewidth=1.5,
+        zorder=3,  # Ensure line appears above bands
+        path_effects=[pe.Stroke(linewidth=2.5, foreground='white'), pe.Normal()])
 
     # Add colorbar for gradient interpretation
     sm = ScalarMappable(cmap=cmap, norm=norm)
@@ -735,7 +751,7 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         bars = ib.reqHistoricalData(
             contract,
             endDateTime='',
-            durationStr='7 D',
+            durationStr='30 D',
             barSizeSetting='1 hour',
             whatToShow='TRADES',
             useRTH=True,
@@ -998,7 +1014,11 @@ def plot_candlestick(df, backtest=False):
 
     import matplotlib.pyplot as plt
     from matplotlib.patches import Patch
+    from matplotlib.colors import Normalize
+    from matplotlib.cm import ScalarMappable
     import mplfinance as mpf
+    import matplotlib.patheffects as pe
+    import numpy as np
 
     # ===== REORDERED ADDPLOTS =====
     addplots = []
@@ -1068,38 +1088,40 @@ def plot_candlestick(df, backtest=False):
                          color='green', width=1.5, alpha=0.75),
         mpf.make_addplot(df['-di'], panel=5,
                          color='red', width=1.5, alpha=0.75)
-    ])
-
-    # ===== MRC GRADIENT HANDLING =====
-    
+    ]) # ===== MRC GRADIENT IMPROVEMENTS =====
+     # ===== RAINBOW VOLATILITY MRC GRADIENT =====
     def plot_mrc_gradient(ax):
-        """Plots gradient shading for MRC bands."""
-        levels = sorted(gradient_levels, reverse=True)
-        colors = ['#4B0082', '#6A5ACD', '#9370DB']  # Gradient colors
+        """Rainbow-colored volatility gradient following price bands"""
+        cmap = plt.get_cmap('rainbow')  # Changed to rainbow colormap
+        volatility = df['meanrange_shifted'].values
+        norm = Normalize(vmin=volatility.min(), vmax=volatility.max())
         
-        for i in range(len(gradient_levels) - 1):
-            upper_band = df[f'meanline'] + df[f'meanrange'] * gradient_levels[i]
-            lower_band = df[f'meanline'] - df[f'meanrange'] * gradient_levels[i]
-            next_upper_band = df[f'meanline'] + df[f'meanrange'] * gradient_levels[i + 1]
-            next_lower_band = df[f'meanline'] - df[f'meanrange'] * gradient_levels[i + 1]
+        # Dynamic window sizing for smooth gradients
+        window_size = max(50, len(df)//100)  # Auto-adjust based on data length
+        segments = np.arange(0, len(df), window_size)
 
-            ax.fill_between(
-                df.index,
-                lower_band,
-                next_lower_band,
-                color=colors[i],
-                alpha=0.3
-            )
-            ax.fill_between(
-                df.index,
-                upper_band,
-                next_upper_band,
-                color=colors[i],
-                alpha=0.3
-            )
+        for level in sorted(gradient_levels, reverse=True):
+            upper = df['meanline'] + df['meanrange_shifted'] * level
+            lower = df['meanline'] - df['meanrange_shifted'] * level
+            
+            # Create gradient bands that follow local volatility
+            for i in range(len(segments)-1):
+                start, end = segments[i], segments[i+1]
+                segment_vol = np.nanmean(volatility[start:end])
+                
+                ax.fill_between(df.index[start:end],
+                                upper[start:end],
+                                lower[start:end],
+                                color=cmap(norm(segment_vol)),
+                                alpha=0.3,
+                                zorder=1,
+                                edgecolor='none')
 
-    assert isinstance(df.index, pd.DatetimeIndex), "Index is not datetime"
-    
+        # Add colorbar to main axis
+        sm = ScalarMappable(cmap=cmap, norm=norm)
+        sm.set_array([])
+        plt.colorbar(sm, ax=ax).set_label('Volatility Multiples', rotation=270, labelpad=20)
+
     # Create the figure and axes
     fig, axlist = mpf.plot(
         df,
@@ -1112,12 +1134,19 @@ def plot_candlestick(df, backtest=False):
         returnfig=True
     )
 
-    # Apply MRC Gradient to the Main Price Panel (Panel Index: 0)
+    # Apply rainbow MRC gradient to main price panel
     main_ax = axlist[0]
     plot_mrc_gradient(main_ax)
 
+    # Add meanline with contrast stroke
+    main_ax.plot(df.index, df['meanline'], 
+                color='black', 
+                linestyle='--',
+                linewidth=1.8,
+                zorder=3,
+                path_effects=[pe.Stroke(linewidth=3, foreground='white'), pe.Normal()])
+
     # ===== LEGEND HANDLING =====
-    
     legends = {
         0: [("VWAP", "purple"), ("20 SMA", "blue"), ("MRC Bands", "orange")],
         1: [("MACD", "#1f77b4"), ("Signal", "#ff7f0e"), ("Histogram", "#5cb85c")],
@@ -1163,12 +1192,13 @@ def enforce_ny_timezone(dt_obj):
 # BACKTEST ENGINE MODIFICATIONS (FIXED LOOKAHEAD)
 # =====================
 def run_backtest(df):
-        # Add validation at start
+        # Add this validation first
     required_bands = [f'upband_{l}' for l in gradient_levels] + \
-                    [f'loband_{l}' for l in gradient_levels]
+                     [f'loband_{l}' for l in gradient_levels]
     missing = [b for b in required_bands if b not in df.columns]
     if missing:
         raise ValueError(f"Missing MRC bands: {missing}")
+        # Add validation at start
      # Ensure datetime index
     if not isinstance(df.index, pd.DatetimeIndex):
         df.index = pd.to_datetime(df.index, errors='coerce')
