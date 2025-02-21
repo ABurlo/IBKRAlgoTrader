@@ -19,21 +19,20 @@ import re
 import matplotlib.patheffects as pe
 from matplotlib.cm import ScalarMappable
 import seaborn as sns
+from matplotlib.dates import DateFormatter  # Add this line
 
 # =====================
 # GLOBAL CONFIGURATION
 # =====================
-
-class GlobalConfig():
+class GlobalConfig:
     nest_asyncio.apply()
-GlobalConfig.symbol = 'MSFT'
-currency = 'USD'  # Explicitly set currency
+GlobalConfig.symbol = 'ORCL'
+currency = 'USD'
 initial_balance = 10000
 MIN_REQUIRED_BANDS = 2
 gradient_levels = [0.5, 1.0, 1.5, 2.0]
-colors = ['#FF0000', '#FFA500', '#00FF00', '#0000FF']  # Hot (red) to cold (blue) spectrum
+colors = ['#FF0000', '#FFA500', '#00FF00', '#0000FF']
 
-# Configure plot style
 sns.set_style("whitegrid")
 sns.set_context("notebook")
 sns.set_palette("tab10")
@@ -46,6 +45,15 @@ plt.rcParams.update({
     'axes.facecolor': 'white',
     'figure.facecolor': 'white'
 })
+
+MRC_GRADIENT_STYLE = 'full_spectrum'
+full_spectrum_colors = ['#FF0000', '#FFA500', '#00FF00', '#0000FF']
+
+def create_colormap(colors_list):
+    return LinearSegmentedColormap.from_list('custom_mrc', colors_list, N=len(gradient_levels))
+
+full_spectrum_cmap = create_colormap(full_spectrum_colors)
+mrc_cmap = full_spectrum_cmap
 
 # MRC Gradient Style Options
 MRC_GRADIENT_STYLE = 'full_spectrum'  # Fixed to full spectrum (hot-cold)
@@ -117,14 +125,28 @@ class LLDict(MutableMapping):
     def __len__(self):
         return self._size
 
+# Add missing function
+def enforce_ny_timezone(timestamp):
+    ny_tz = pytz.timezone('America/New_York')
+    if not isinstance(timestamp, pd.Timestamp):
+        timestamp = pd.to_datetime(timestamp)
+    if timestamp.tzinfo is None:
+        logger.debug(f"Localizing naive timestamp {timestamp} to NY timezone")
+        return ny_tz.localize(timestamp)
+    else:
+        logger.debug(f"Converting tz-aware timestamp {timestamp} to NY timezone")
+        return timestamp.tz_convert(ny_tz)
+
 # =====================
 # MARKET CLOSURE WARNING
 # =====================
 def is_market_close(index):
     ny_tz = pytz.timezone('America/New_York')
-    if index.tz is None:
+    if index.tzinfo is None:
+        logger.debug(f"Localizing naive index {index} to NY timezone")
         index = index.tz_localize(ny_tz)
     else:
+        logger.debug(f"Converting tz-aware index {index} to NY timezone")
         index = index.tz_convert(ny_tz)
     
     current_time = index.time
@@ -238,17 +260,16 @@ class BacktestEngine:
         self.mode = mode
         self.mode_config = {
             'aggressive': {'rsi_entry': 28, 'williams_entry': -85, 'position_risk': 0.03, 'volatility_mult': 1.8, 
-                          'profit_target': 1.8, 'stop_loss': 0.96, 'adx_threshold': 22, 'di_ratio': 1.25, 
-                          'macd_crossover': 1.15},
+                         'profit_target': 1.8, 'stop_loss': 0.96, 'adx_threshold': 22, 'di_ratio': 1.25, 
+                         'macd_crossover': 1.15},
             'neutral': {'rsi_entry': 32, 'williams_entry': -80, 'position_risk': 0.02, 'volatility_mult': 1.5, 
                        'profit_target': 1.5, 'stop_loss': 0.94, 'adx_threshold': 25, 'di_ratio': 1.35, 
                        'macd_crossover': 1.05},
             'conservative': {'rsi_entry': 35, 'williams_entry': -75, 'position_risk': 0.01, 'volatility_mult': 1.2, 
-                            'profit_target': 1.2, 'stop_loss': 0.92, 'adx_threshold': 28, 'di_ratio': 1.5, 
-                            'macd_crossover': 1.0}
+                           'profit_target': 1.2, 'stop_loss': 0.92, 'adx_threshold': 28, 'di_ratio': 1.5, 
+                           'macd_crossover': 1.0}
         }
         self.validate_mode_config()
-        
         self.balance = initial_balance
         self.positions = LLDict()
         self.trade_history = []
@@ -711,6 +732,151 @@ def stochastic_oscillator(df, k_period=14, d_period=3):
     df['%D'] = df['%K'].rolling(d_period).mean()
     return df
 
+def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=False):
+    contract = Stock(symbol, exchange, currency)
+    ib.qualifyContracts(contract)
+    if backtest:
+        logger.info(f"Requesting historical data for {symbol}")
+        bars = ib.reqHistoricalData(
+            contract, endDateTime='', durationStr='30 D', barSizeSetting='1 hour',
+            whatToShow='TRADES', useRTH=True, formatDate=2, keepUpToDate=False)  # UTC timestamps
+        
+        if not bars:
+            logger.error("No historical data received from IBKR")
+            raise ValueError("No historical data received")
+        
+        df = util.df(bars)
+        if df.empty:
+            logger.error("Empty DataFrame received from IB")
+            raise ValueError("Empty DataFrame received from IB")
+
+        # Set index and convert to NY timezone
+        df['date'] = pd.to_datetime(df['date'])
+        df.set_index('date', inplace=True)
+        if df.index.tzinfo is None:
+            logger.debug("Index is naive, localizing to UTC then converting to NY")
+            df.index = df.index.tz_localize('UTC').tz_convert('America/New_York')
+        else:
+            logger.debug(f"Index is tz-aware ({df.index.tzinfo}), converting to NY")
+            df.index = df.index.tz_convert('America/New_York')
+
+        # Ensure OHLCV columns are present and numeric
+        required_cols = ['open', 'high', 'low', 'close', 'volume']
+        for col in required_cols:
+            if col not in df.columns:
+                logger.error(f"Missing column {col} in historical data")
+                raise ValueError(f"Missing column {col}")
+            df[col] = pd.to_numeric(df[col], errors='coerce').replace([np.inf, -np.inf, np.nan], np.nan).ffill().bfill()
+            if df[col].isna().all() or (df[col] == 0).all():
+                logger.error(f"Column {col} contains all NaNs or zeros after cleaning")
+                raise ValueError(f"Invalid data in column {col}")
+
+        # Calculate additional columns
+        df['hlc3'] = (df['high'] + df['low'] + df['close']) / 3
+        df = calculate_mrc_with_gradient(df)
+        df = df.drop(columns=['average', 'barCount'], errors='ignore')
+        
+        df = calculate_adx(df)
+        df = stochastic_oscillator(df)
+        
+        df['vwap_numerator'] = df['volume'] * df['hlc3']
+        df['vwap_denominator'] = df['volume']
+        df['trading_date'] = df.index.date
+        df['VWAP'] = (df.groupby('trading_date')['vwap_numerator'].cumsum() /
+                      df.groupby('trading_date')['vwap_denominator'].cumsum())
+        
+        exp12 = df['close'].ewm(span=12, adjust=False).mean()
+        exp26 = df['close'].ewm(span=26, adjust=False).mean()
+        df['MACD'] = np.where(np.abs(exp12 - exp26) < 1e-8, 0, exp12 - exp26)
+        df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+        df['Histogram'] = df['MACD'] - df['Signal']
+        
+        delta = df['close'].diff()
+        gain = delta.where(delta > 0, 0.0)
+        loss = -delta.where(delta < 0, 0.0)
+        avg_gain = gain.ewm(alpha=1/14, adjust=False).mean().replace(0, np.nan).fillna(0.01)
+        avg_loss = loss.ewm(alpha=1/14, adjust=False).mean().replace(0, np.nan).fillna(0.01)
+        df['RSI'] = 100 - (100 / (1 + (avg_gain / avg_loss).replace(0, np.nan))).fillna(50)
+        
+        df['Williams_%R'] = williams_r(df['high'], df['low'], df['close'])
+        df['ATR'] = df['tr'].rolling(14).mean().replace([np.inf, -np.inf, np.nan, 0], np.nan).ffill().bfill()
+        df['volume_ma'] = df['volume'].rolling(20).mean().replace([np.inf, -np.inf, np.nan, 0], np.nan).ffill().bfill()
+        df['SMA_20'] = df['close'].rolling(window=20).mean().replace([np.inf, -np.inf, np.nan, 0], np.nan).ffill().bfill()
+        
+        indicator_cols = ['MACD', 'Signal', 'Histogram', 'RSI', 'Williams_%R', 'adx', '+di', '-di', '%K', '%D']
+        for col in indicator_cols:
+            df[col] = df[col].replace([np.inf, -np.inf, np.nan, 0], np.nan).astype(float).ffill().bfill()
+            if col in ['+di', '-di']:
+                df[col] = df[col].replace(0, np.nan).ffill().bfill()
+
+        shifted_cols = ['close', 'RSI', 'Williams_%R', 'VWAP', 'MACD', 'Signal', 
+                        'adx', '+di', '-di', '%K', '%D', 'volume_ma', 'SMA_20']
+        for col in shifted_cols:
+            df[f'{col}_shifted'] = df[col].shift(1).replace([np.inf, -np.inf, np.nan, 0], np.nan).ffill().bfill()
+        for level in gradient_levels:
+            df[f'upband_{level}_shifted'] = df[f'upband_{level}'].shift(1).replace([np.inf, -np.inf, np.nan, 0], np.nan).ffill().bfill()
+            df[f'loband_{level}_shifted'] = df[f'loband_{level}'].shift(1).replace([np.inf, -np.inf, np.nan, 0], np.nan).ffill().bfill()
+        
+        df = df.drop(['vwap_numerator', 'vwap_denominator', 'trading_date'], axis=1)
+        
+        logger.info(f"Processed historical data with {len(df)} rows")
+        logger.debug(f"OHLCV sample: \n{df[required_cols].head()}")
+        return df
+
+def plot_mrc_gradient(ax, df):
+    meanline = df['meanline'].replace([np.inf, -np.inf, np.nan, 0], np.nan).ffill().bfill()
+    if meanline.empty or meanline.isna().all():
+        logger.error("Meanline data is empty or contains only NaN values")
+        return
+    
+    ax.plot(df.index, meanline, color='purple', linestyle='-', width=1.8, zorder=3,
+            path_effects=[pe.Stroke(width=3, foreground='white'), pe.Normal()])
+    
+    norm = Normalize(vmin=min(gradient_levels), vmax=max(gradient_levels))
+    for i, level in enumerate(gradient_levels):
+        color = mrc_cmap(norm(level))
+        upper_band = df[f'upband_{level}'].replace([np.inf, -np.inf, np.nan, 0], np.nan).ffill().bfill()
+        lower_band = df[f'loband_{level}'].replace([np.inf, -np.inf, np.nan, 0], np.nan).ffill().bfill()
+        if upper_band.empty or upper_band.isna().all() or lower_band.empty or lower_band.isna().all():
+            logger.error(f"Band data for level {level} is empty or contains only NaN values")
+            continue
+        ax.plot(df.index, upper_band, color=color, linestyle='-' if level != 0.5 else ':', width=1.5, zorder=2,
+                alpha=0.8 if level != 0.5 else 0.7)
+        ax.plot(df.index, lower_band, color=color, linestyle='-' if level != 0.5 else ':', width=1.5, zorder=2,
+                alpha=0.8 if level != 0.5 else 0.7)
+    
+    ax.plot(df.index, df[f'upband_{gradient_levels[0]}'].replace([np.inf, -np.inf, np.nan, 0], np.nan).ffill().bfill(),
+            color='cyan', linestyle=':', width=1.5, zorder=2, alpha=0.7)
+    ax.plot(df.index, df[f'loband_{gradient_levels[0]}'].replace([np.inf, -np.inf, np.nan, 0], np.nan).ffill().bfill(),
+            color='cyan', linestyle=':', width=1.5, zorder=2, alpha=0.7)
+
+    ax.set_xlim(df.index[0], df.index[-1])
+    ax.set_ylim(df['close'].min() * 0.95, df['close'].max() * 1.05)
+
+#
+# HELPER FUNCTIONS
+#
+def calculate_rsi(close, period=14):
+    delta = close.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def calculate_macd(close, fast=12, slow=26, signal=9):
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    macd = ema_fast - ema_slow
+    signal_line = macd.ewm(span=signal, adjust=False).mean()
+    histogram = macd - signal_line
+    return macd, signal_line, histogram
+
+# Add other indicator functions (Williams %R, ADX, etc.) as needed
+def calculate_williams_r(high, low, close, period=14):
+    highest_high = high.rolling(window=period).max()
+    lowest_low = low.rolling(window=period).min()
+    return -100 * (highest_high - close) / (highest_high - lowest_low)
+
 def calculate_adx(df, window=14):
     high = df['high']
     low = df['low']
@@ -731,127 +897,32 @@ def calculate_adx(df, window=14):
     df['+di'] = plus_di
     df['-di'] = minus_di
     df['adx_shifted'] = adx.shift(1).fillna(0)
-    return df[['adx', '+di', '-di', 'adx_shifted']]
+    return df  # Explicitly return the modified DataFrame
 
-def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=False):
-    contract = Stock(symbol, exchange, currency)
-    ib.qualifyContracts(contract)
-    if backtest:
-        logger.info(f"Requesting historical data for {symbol}")
-        bars = ib.reqHistoricalData(
-            contract, endDateTime='', durationStr='14 D', barSizeSetting='1 hour',
-            whatToShow='TRADES', useRTH=True, formatDate=1, keepUpToDate=False)
-        
-        if not bars:
-            logger.error("No historical data received from IBKR")
-            raise ValueError("No historical data received")
-        
-        df = util.df(bars)
-        if df.empty:
-            logger.error("Empty DataFrame received from IB")
-            raise ValueError("Empty DataFrame received from IB")
 
-        logger.debug(f"Raw DataFrame shape: {df.shape}")
-        logger.debug(f"Raw DataFrame columns: {df.columns.tolist()}")
-        logger.debug(f"Raw DataFrame index: {df.index}")
+def calculate_plus_di(high, low, close, period=14):
+    plus_dm = (high - high.shift()).where((high - high.shift()) > (low.shift() - low), 0)
+    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(window=period).mean()
+    return 100 * plus_dm.rolling(window=period).mean() / atr
 
-        # Use the 'date' column to set the correct index (timestamps in UTC for consistency)
-        df['date'] = pd.to_datetime(df['date'], format='%Y%m%d %H:%M:%S %Z').dt.tz_convert('UTC')
-        df.set_index('date', inplace=True)
-        
-        # Ensure all required columns exist and handle missing values
-        required_cols = ['open', 'high', 'low', 'close', 'volume']
-        for col in required_cols:
-            if col not in df.columns:
-                df[col] = df['close'].ffill().bfill()
-            df[col] = df[col].replace([np.inf, -np.inf, np.nan, 0], np.nan).astype(float).ffill().bfill()
-            logger.debug(f"Column {col} first few values: {df[col].head()}")
+def calculate_minus_di(high, low, close, period=14):
+    minus_dm = (low.shift() - low).where((low.shift() - low) > (high - high.shift()), 0)
+    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(window=period).mean()
+    return 100 * minus_dm.rolling(window=period).mean() / atr
 
-        df['hlc3'] = (df['high'] + df['low'] + df['close']) / 3
-        df = calculate_mrc_with_gradient(df)
-        df = df.drop(columns=['average', 'barCount'], errors='ignore')
-        
-        calculate_adx(df)
-        df = stochastic_oscillator(df)
-        
-        df['vwap_numerator'] = df['volume'] * df['hlc3']
-        df['vwap_denominator'] = df['volume']
-        df['trading_date'] = df.index.date
-        df['VWAP'] = (df.groupby('trading_date')['vwap_numerator'].cumsum() /
-                      df.groupby('trading_date')['vwap_denominator'].cumsum())
-        
-        exp12 = df['close'].ewm(span=12, adjust=False).mean()
-        exp26 = df['close'].ewm(span=26, adjust=False).mean()
-        df['MACD'] = np.where(np.abs(exp12 - exp26) < 1e-8, 0, exp12 - exp26)
-        df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-        df['Histogram'] = df['MACD'] - df['Signal']
-        
-        delta = df['close'].diff()
-        gain = delta.where(delta > 0, 0.0)
-        loss = -delta.where(delta < 0, 0.0)
-        avg_gain = gain.ewm(alpha=1/14, adjust=False).mean().replace(0, np.nan).fillna(0.01)  # Avoid zero
-        avg_loss = loss.ewm(alpha=1/14, adjust=False).mean().replace(0, np.nan).fillna(0.01)  # Avoid zero
-        df['RSI'] = 100 - (100 / (1 + (avg_gain / avg_loss).replace(0, np.nan))).fillna(50)  # Handle zero division
-        
-        df['Williams_%R'] = williams_r(df['high'], df['low'], df['close'])
-        df['ATR'] = df['tr'].rolling(14).mean().replace([np.inf, -np.inf, np.nan, 0], np.nan).ffill().bfill()
-        df['volume_ma'] = df['volume'].rolling(20).mean().replace([np.inf, -np.inf, np.nan, 0], np.nan).ffill().bfill()
-        df['SMA_20'] = df['close'].rolling(window=20).mean().replace([np.inf, -np.inf, np.nan, 0], np.nan).ffill().bfill()
-        
-        # Clean indicator columns with stricter NaN handling
-        indicator_cols = ['MACD', 'Signal', 'Histogram', 'RSI', 'Williams_%R', 'adx', '+di', '-di', '%K', '%D']
-        for col in indicator_cols:
-            df[col] = df[col].replace([np.inf, -np.inf, np.nan, 0], np.nan).astype(float).ffill().bfill()
-            if col in ['+di', '-di']:
-                df[col] = df[col].replace(0, np.nan).ffill().bfill()
-            logger.debug(f"Indicator column {col} first few values: {df[col].head()}")
+def calculate_stoch(high, low, close, k_period=14, d_period=3):
+    lowest_low = low.rolling(window=k_period).min()
+    highest_high = high.rolling(window=k_period).max()
+    k = 100 * (close - lowest_low) / (highest_high - lowest_low)
+    d = k.rolling(window=d_period).mean()
+    return k, d
 
-        shifted_cols = ['close', 'RSI', 'Williams_%R', 'VWAP', 'MACD', 'Signal', 
-                        'adx', '+di', '-di', '%K', '%D', 'volume_ma', 'SMA_20']
-        for col in shifted_cols:
-            df[f'{col}_shifted'] = df[col].shift(1).replace([np.inf, -np.inf, np.nan, 0], np.nan).ffill().bfill()
-        for level in gradient_levels:
-            df[f'upband_{level}_shifted'] = df[f'upband_{level}'].shift(1).replace([np.inf, -np.inf, np.nan, 0], np.nan).ffill().bfill()
-            df[f'loband_{level}_shifted'] = df[f'loband_{level}'].shift(1).replace([np.inf, -np.inf, np.nan, 0], np.nan).ffill().bfill()
-        
-        df = df.drop(['vwap_numerator', 'vwap_denominator', 'trading_date'], axis=1)
-        
-        logger.debug(f"Final DataFrame shape: {df.shape}")
-        logger.debug(f"Final DataFrame columns: {df.columns.tolist()}")
-        logger.debug(f"Final DataFrame index: {df.index}")
-        logger.info(f"Processed historical data with {len(df)} rows")
-        return df
-
-def plot_mrc_gradient(ax, df):
-    # Handle NaN values in meanline and bands
-    meanline = df['meanline'].replace([np.inf, -np.inf, np.nan, 0], np.nan).ffill().bfill()
-    if meanline.empty or meanline.isna().all():
-        logger.error("Meanline data is empty or contains only NaN values")
-        return
-    
-    ax.plot(df.index, meanline, color='purple', linestyle='-', linewidth=1.8, zorder=3,
-            path_effects=[pe.Stroke(linewidth=3, foreground='white'), pe.Normal()])
-    
-    norm = Normalize(vmin=min(gradient_levels), vmax=max(gradient_levels))
-    for i, level in enumerate(gradient_levels):
-        color = mrc_cmap(norm(level))
-        upper_band = df[f'upband_{level}'].replace([np.inf, -np.inf, np.nan, 0], np.nan).ffill().bfill()
-        lower_band = df[f'loband_{level}'].replace([np.inf, -np.inf, np.nan, 0], np.nan).ffill().bfill()
-        if upper_band.empty or upper_band.isna().all() or lower_band.empty or lower_band.isna().all():
-            logger.error(f"Band data for level {level} is empty or contains only NaN values")
-            continue
-        ax.plot(df.index, upper_band, color=color, linestyle='-' if level != 0.5 else ':', linewidth=1.5, zorder=2,
-                alpha=0.8 if level != 0.5 else 0.7)
-        ax.plot(df.index, lower_band, color=color, linestyle='-' if level != 0.5 else ':', linewidth=1.5, zorder=2,
-                alpha=0.8 if level != 0.5 else 0.7)
-    
-    ax.plot(df.index, df[f'upband_{gradient_levels[0]}'].replace([np.inf, -np.inf, np.nan, 0], np.nan).ffill().bfill(),
-            color='cyan', linestyle=':', linewidth=1.5, zorder=2, alpha=0.7)
-    ax.plot(df.index, df[f'loband_{gradient_levels[0]}'].replace([np.inf, -np.inf, np.nan, 0], np.nan).ffill().bfill(),
-            color='cyan', linestyle=':', linewidth=1.5, zorder=2, alpha=0.7)
-
-    ax.set_xlim(df.index[0], df.index[-1])
-    ax.set_ylim(df['close'].min() * 0.95, df['close'].max() * 1.05)  # Adjust y-limits for better visibility
+def calculate_vwap(high, low, close, volume):
+    typical_price = (high + low + close) / 3
+    vwap = (typical_price * volume).cumsum() / volume.cumsum()
+    return vwap
 
 # =====================
 # VISUALIZATION ENGINE
@@ -861,133 +932,85 @@ def plot_candlestick(df, backtest=False, symbol=GlobalConfig.symbol):
         logger.error("Cannot plot empty DataFrame")
         raise ValueError("Cannot plot empty DataFrame")
     
-    # Ensure index is properly formatted and convert to UTC for mplfinance compatibility
-    df.index = pd.to_datetime(df.index).tz_convert('UTC')
-    
-    # Debug the DataFrame
-    logger.debug(f"Plotting DataFrame shape: {df.shape}")
-    logger.debug(f"Plotting DataFrame columns: {df.columns.tolist()}")
-    logger.debug(f"Plotting DataFrame index: {df.index}")
-    logger.debug(f"Sample OHLCV data: {df[['open', 'high', 'low', 'close', 'volume']].head()}")
-    logger.debug(f"Data types: {df.dtypes}")
-    logger.debug(f"NaN count per column: {df.isna().sum()}")
-    logger.debug(f"Zero count per column: {(df == 0).sum()}")
+    logger.debug(f"DataFrame for plotting:\n{df[['open', 'high', 'low', 'close', 'volume']].head()}")
+    logger.debug(f"Index timezone: {df.index.tz}")
 
-    # Verify index is a DatetimeIndex and timezone-aware (UTC)
-    if not isinstance(df.index, pd.DatetimeIndex) or df.index.tz is None:
-        logger.error("Invalid DataFrame index format for plotting")
-        raise ValueError("DataFrame index must be a timezone-aware DatetimeIndex (UTC)")
+    # Validate OHLCV data
+    required_cols = ['open', 'high', 'low', 'close', 'volume']
+    for col in required_cols:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+        if df[col].isna().all() or (df[col] <= 0).all():
+            logger.error(f"Column {col} contains invalid data")
+            raise ValueError(f"Invalid data in {col}")
+        df[col] = df[col].replace([np.inf, -np.inf, np.nan], np.nan).interpolate().ffill().bfill()
 
-    # Check for required columns and handle NaN or infinite values
-    required_ohlcv = ['open', 'high', 'low', 'close', 'volume']
-    required_indicators = ['MACD', 'Signal', 'Histogram', 'RSI', 'Williams_%R', 'adx', '+di', '-di', '%K', '%D']
-    missing_ohlcv = [col for col in required_ohlcv if col not in df.columns]
-    missing_indicators = [col for col in required_indicators if col not in df.columns]
-    if missing_ohlcv:
-        logger.error(f"Missing required OHLCV columns for plotting: {missing_ohlcv}")
-        raise ValueError(f"Missing required OHLCV columns: {missing_ohlcv}")
-    if missing_indicators:
-        logger.warning(f"Missing some indicator columns for plotting: {missing_indicators}")
-        # Optionally fill missing indicators with zeros or skip them
-        for col in missing_indicators:
-            if col not in df.columns:
-                df[col] = 0.0  # Default to zero if missing
-
-    # Clean data: ensure numeric and handle NaN/infinite/zero values for OHLCV and indicators
-    for col in required_ohlcv + required_indicators:
-        df[col] = pd.to_numeric(df[col], errors='coerce').replace([np.inf, -np.inf, 0], np.nan)
-        if df[col].isna().any():
-            logger.warning(f"Column {col} contains NaN values before filling: {df[col].isna().sum()} NaNs")
-            # Use interpolation for OHLCV, and forward/backward fill for indicators
-            if col in required_ohlcv:
-                df[col] = df[col].interpolate(method='linear').ffill().bfill()
-            else:
-                df[col] = df[col].ffill().bfill()
-        logger.debug(f"Column {col} after cleaning: {df[col].head()}")
-
-    # Create addplots for indicators
-    addplots = [
-        mpf.make_addplot(df['loband_0.5'], panel=0, color="cyan", linestyle=':', alpha=0.7, label='MRC Low 0.5'),
-        mpf.make_addplot(df['upband_0.5'], panel=0, color="cyan", linestyle=':', alpha=0.7, label='MRC High 0.5'),
-        mpf.make_addplot(df['MACD'], panel=1, color='#1f77b4', width=1.2, ylabel='MACD'),
-        mpf.make_addplot(df['Signal'], panel=1, color='#ff7f0e', width=1.2, label='Signal'),
-        mpf.make_addplot(df['Histogram'], type='bar', panel=1,
-                        color=np.where(df['Histogram'] >= 0, '#5cb85c', '#D83B2D'), alpha=0.6, width=0.7, label='Histogram'),
-        mpf.make_addplot(df['volume'], type='bar', panel=2,
-                        color=np.where(df['close'] > df['open'], '#5cb85c', '#d9534f'), alpha=0.6, ylabel='Volume'),
-        mpf.make_addplot(df['RSI'], panel=3, color='#4B0082', width=1.2, ylim=(0, 100), ylabel='RSI'),
-        mpf.make_addplot(pd.Series(30, index=df.index), panel=3, color='gray', linestyle='--', label='RSI 30'),
-        mpf.make_addplot(pd.Series(70, index=df.index), panel=3, color='gray', linestyle='--', label='RSI 70'),
-        mpf.make_addplot(df['Williams_%R'], panel=4, color='blue', width=1.2, ylabel='Williams %R', ylim=(-100, 0)),
-        mpf.make_addplot(pd.Series(-20, index=df.index), panel=4, color='red', linestyle='--', label='Williams -20'),
-        mpf.make_addplot(pd.Series(-80, index=df.index), panel=4, color='green', linestyle='--', label='Williams -80'),
-        mpf.make_addplot(df['adx'], panel=5, color='blue', width=1.5, ylabel='ADX/DIs'),
-        mpf.make_addplot(df['+di'], panel=5, color='green', width=1.5, alpha=0.75, label='+DI'),
-        mpf.make_addplot(df['-di'], panel=5, color='red', width=1.5, alpha=0.75, label='-DI'),
-        mpf.make_addplot(df['%K'], panel=6, color='blue', width=1.2, ylabel='Stochastic', ylim=(0, 100)),
-        mpf.make_addplot(df['%D'], panel=6, color='orange', width=1.2, label='%D'),
-        mpf.make_addplot(pd.Series(20, index=df.index), panel=6, color='green', linestyle='--', label='Stoch 20'),
-        mpf.make_addplot(pd.Series(80, index=df.index), panel=6, color='red', linestyle='--', label='Stoch 80'),
-    ]
-    
-    # Define style for consistent appearance
     style = mpf.make_mpf_style(
-        marketcolors=mpf.make_marketcolors(up="#00FF00", down="#FF0000", edge='inherit'),
+        marketcolors=mpf.make_marketcolors(up="#00FF00", down="#FF0000", edge='black', wick='black', volume='gray'),
         gridstyle=":", gridcolor="gray", facecolor="white",
         base_mpf_style="classic"
     )
-    
-    # Plot with mplfinance, ensuring candlesticks and all panels are visible
+
+    # Prepare addplots for all MRC levels and indicators
+    addplots = []
+    if all(f'loband_{level}' in df.columns for level in gradient_levels):
+        norm = Normalize(vmin=min(gradient_levels), vmax=max(gradient_levels))
+        for level in gradient_levels:
+            color = mrc_cmap(norm(level))
+            addplots.append(mpf.make_addplot(df[f'upband_{level}'], panel=0, color=color, linestyle='-', alpha=0.8))
+            addplots.append(mpf.make_addplot(df[f'loband_{level}'], panel=0, color=color, linestyle='-', alpha=0.8))
+        addplots.append(mpf.make_addplot(df['meanline'], panel=0, color='purple', linestyle='-', width=1.8))
+
+    if all(col in df.columns for col in ['MACD', 'Signal', 'Histogram']):
+        addplots.extend([
+            mpf.make_addplot(df['MACD'], panel=1, color='#1f77b4', width=1.2, ylabel='MACD'),
+            mpf.make_addplot(df['Signal'], panel=1, color='#ff7f0e', width=1.2),
+            mpf.make_addplot(df['Histogram'], type='bar', panel=1, color=np.where(df['Histogram'] >= 0, '#5cb85c', '#d62728'), alpha=0.6),
+        ])
+    if 'RSI' in df.columns:
+        addplots.append(mpf.make_addplot(df['RSI'], panel=2, color='#4B0082', width=1.2, ylim=(0, 100), ylabel='RSI'))
+    if 'Williams_%R' in df.columns:
+        addplots.append(mpf.make_addplot(df['Williams_%R'], panel=3, color='#9467bd', width=1.2, ylim=(-100, 0), ylabel='Williams %R'))
+    if all(col in df.columns for col in ['%K', '%D']):
+        addplots.extend([
+            mpf.make_addplot(df['%K'], panel=4, color='#8c564b', width=1.2, ylabel='Stochastic'),
+            mpf.make_addplot(df['%D'], panel=4, color='#e377c2', width=1.2),
+        ])
+
+    logger.debug(f"Addplots prepared: {len(addplots)} items")
+    for ap in addplots:
+        logger.debug(f"Addplot: {ap}")
+
+    panel_count = 1 + sum(1 for _ in range(1, 5) if any(ap['panel'] == _ for ap in addplots))
+    panel_ratios = tuple([10] + [5] * (panel_count - 1)) if panel_count > 1 else (10,)
+    logger.debug(f"Panel count: {panel_count}, Panel ratios: {panel_ratios}")
+
     try:
-        logger.debug("Attempting to plot OHLCV and indicators with mplfinance")
         fig, axlist = mpf.plot(
-            df, 
-            type='candle',  # Explicitly set to candlestick
+            df,
+            type='candle',
             style=style,
-            volume=True,  # Ensure volume bars are plotted
-            addplot=addplots,  # All additional plots (indicators and MRC)
-            panel_ratios=(10, 5, 4, 4, 4, 4, 4),  # 7 panels: candlestick (0), MACD (1), Volume (2), RSI (3), Williams (4), ADX (5), Stochastic (6)
-            figsize=(16, 24),
+            volume=True,
+            addplot=addplots,
+            panel_ratios=panel_ratios,
+            figsize=(16, 12 + 2 * (panel_count - 1)),
             title=f'{symbol} Candlestick Chart (Backtest: {backtest})',
-            xrotation=45,
             returnfig=True
         )
     except Exception as e:
-        logger.error(f"Error plotting with mplfinance: {str(e)}")
+        logger.error(f"mplfinance plotting failed: {str(e)}", exc_info=True)
         raise
 
-    # Plot MRC gradient bands on the main candlestick panel (panel 0)
-    main_ax = axlist[0]
-    try:
-        plot_mrc_gradient(main_ax, df)
-    except Exception as e:
-        logger.error(f"Error in plot_mrc_gradient: {str(e)}")
-
-    # Enhance axis formatting for all panels
+    logger.debug(f"Number of axes: {len(axlist)}")
     for ax in axlist:
-        ax.grid(True, color='gray', linestyle=':', linewidth=0.5)
+        ax.grid(True, color='gray', linestyle=':', width=0.5)
         ax.set_facecolor('white')
         ax.tick_params(colors='black', labelsize=8)
-        ax.xaxis.label.set_color('black')
-        ax.yaxis.label.set_color('black')
-        for spine in ax.spines.values():
-            spine.set_edgecolor('black')
-        
-        # Set x-axis formatter for datetime
-        from matplotlib.dates import DateFormatter
         ax.xaxis.set_major_locator(plt.MaxNLocator(10))
         ax.xaxis.set_major_formatter(DateFormatter('%Y-%m-%d %H:%M'))
 
-    # Add legend to each panel
-    for i, ax in enumerate(axlist):
-        ax.legend(loc='best', frameon=True, facecolor='white', edgecolor='black', fontsize=8)
-
-    # Remove plt.tight_layout() to avoid warnings and ensure mplfinance handles layout
-    logger.info(f"Loaded historical data with {len(df)} rows for plotting")
+    logger.info("Candlestick chart plotted successfully")
+    plt.tight_layout()
     plt.show()
-
-    # Check mplfinance version for compatibility
-    logger.debug(f"mplfinance version: {mpf.__version__}")
 
 # =====================
 # MODE SELECTION
@@ -1001,6 +1024,45 @@ def select_trading_mode():
     modes = {'1': 'aggressive', '2': 'neutral', '3': 'conservative'}
     return modes.get(choice, 'neutral')
 
+def run_backtest(df, mode):  # Add mode parameter
+    global engine
+    engine = BacktestEngine(mode=mode)  # Use passed mode
+    
+    # Calculate indicators
+    df['RSI'] = calculate_rsi(df['close'], period=14)
+    df['Williams_%R'] = calculate_williams_r(df['high'], df['low'], df['close'], period=14)
+    df['MACD'], df['Signal'], df['Histogram'] = calculate_macd(df['close'])
+    df = calculate_adx(df, window=14)
+    df['+di'] = calculate_plus_di(df['high'], df['low'], df['close'], period=14)
+    df['-di'] = calculate_minus_di(df['high'], df['low'], df['close'], period=14)
+    df['%K'], df['%D'] = calculate_stoch(df['high'], df['low'], df['close'], k_period=14, d_period=3)
+    df['VWAP'] = calculate_vwap(df['high'], df['low'], df['close'], df['volume'])
+    df['volume_ma'] = df['volume'].rolling(window=20).mean()
+
+    # Shift indicators
+    df['RSI_shifted'] = df['RSI'].shift(1)
+    df['Williams_%R_shifted'] = df['Williams_%R'].shift(1)
+    df['MACD_shifted'] = df['MACD'].shift(1)
+    df['Signal_shifted'] = df['Signal'].shift(1)
+    df['adx_shifted'] = df['adx'].shift(1)
+    df['+di_shifted'] = df['+di'].shift(1)
+    df['-di_shifted'] = df['-di'].shift(1)
+    df['%K_shifted'] = df['%K'].shift(1)
+    df['%D_shifted'] = df['%D'].shift(1)
+    df['VWAP_shifted'] = df['VWAP'].shift(1)
+    df['close_shifted'] = df['close'].shift(1)
+
+    # Run backtest logic
+    for index, row in df.iterrows():
+        if not is_market_close(index):
+            if check_entry_conditions(df, index):
+                execute_entry(row['close'], index, engine.calculate_position_size(row))
+            elif engine.current_position and check_exit_conditions(df, index):
+                execute_exit(row['close'], index)
+
+    logger.info(f"Backtest completed with {len(engine.trade_history)} trades")
+    return engine, df
+
 # =====================
 # MAIN EXECUTION
 # =====================
@@ -1013,27 +1075,15 @@ def main():
     try:
         ib.connect('127.0.0.1', 7497, clientId=1)
         logger.info("Connected to IBKR")
-        initial_balance = engine.balance
         
-        daily_data = get_historical_data(ib, symbol, backtest=True)
+        daily_data = get_historical_data(ib, GlobalConfig.symbol, backtest=True)
         if daily_data is None or daily_data.empty:
-            logger.error("Failed to retrieve historical data")
             raise ValueError("Failed to retrieve historical data")
         
-        daily_data = run_backtest(daily_data)
+        engine, daily_data = run_backtest(daily_data, selected_mode)
         logger.info(f"Backtest completed with {len(engine.trade_history)} trades")
         plot_candlestick(daily_data, backtest=True)
         
-        if engine.trade_history:
-            trade_df = pd.DataFrame(engine.trade_history)
-            total_pnl = trade_df['pnl'].sum()
-            logger.info(f"Total PnL: ${total_pnl:.2f}")
-            logger.info(f"Final Balance: ${engine.balance:.2f}")
-            trade_df.to_csv('trade_history.csv')
-            
-            start_date = pd.to_datetime(trade_df['timestamp'].min()).tz_convert('America/New_York')
-            end_date = pd.to_datetime(trade_df['timestamp'].max()).tz_convert('America/New_York')
-            plot_pnl_calendar(engine, start_date, end_date, initial_balance, symbol)
     except Exception as e:
         logger.error(f"Main execution error: {str(e)}", exc_info=True)
     finally:
