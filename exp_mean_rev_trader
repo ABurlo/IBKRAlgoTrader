@@ -682,40 +682,56 @@ def log_trade(trade, symbol):
 # DATA MANAGEMENT
 # =====================
 def calculate_mrc_with_gradient(df, length=100, gradient_levels=[0.5, 1.0, 1.5, 2.0]):
+    # Calculate True Range
     df['prev_close'] = df['close'].shift(1).ffill()
     df['tr1'] = df['high'] - df['low']
     df['tr2'] = abs(df['high'] - df['prev_close'])
     df['tr3'] = abs(df['low'] - df['prev_close'])
-    df['tr'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)
+    df['tr'] = df[['tr1', 'tr2', 'tr3']].max(axis=1).replace(0, np.nan).ffill().bfill()
+    logger.debug(f"TR sample: {df['tr'].tail()}")
     df.drop(['tr1', 'tr2', 'tr3', 'prev_close'], axis=1, inplace=True, errors='ignore')
 
-    df['meanline'] = supersmoother(df['hlc3'], length).bfill().ffill()
-    df['meanrange'] = df['tr'].rolling(20).mean().bfill().ffill()
-    
+    # Calculate HLC3 and Meanline
+    df['hlc3'] = (df['high'] + df['low'] + df['close']) / 3
+    logger.debug(f"HLC3 sample: {df['hlc3'].tail()}")
+    df['meanline'] = supersmoother(df['hlc3'], length).replace([np.inf, -np.inf], np.nan).interpolate().ffill().bfill()
+    logger.debug(f"Meanline sample: {df['meanline'].tail()}")
+
+    # Calculate Meanrange with robust handling of NaNs
+    tr_mean = df['tr'].rolling(20, min_periods=1).mean()  # Use min_periods=1 to avoid all NaNs early
+    logger.debug(f"TR rolling mean sample: {tr_mean.tail()}")
+    df['meanrange'] = supersmoother(tr_mean, length // 10).replace([np.inf, -np.inf, 0], np.nan).interpolate().ffill().bfill()
+    logger.debug(f"Meanrange sample: {df['meanrange'].tail()}")
+
+    # Calculate custom MRC bands
     for level in gradient_levels:
         df[f'upband_{level}'] = df['meanline'] + (df['meanrange'] * level)
         df[f'loband_{level}'] = df['meanline'] - (df['meanrange'] * level)
-        df[f'upband_{level}_shifted'] = df[f'upband_{level}'].shift(1).ffill()
-        df[f'loband_{level}_shifted'] = df[f'loband_{level}'].shift(1).ffill()
+        df[f'upband_{level}_shifted'] = df[f'upband_{level}'].shift(1).replace([np.inf, -np.inf, np.nan], np.nan).ffill().bfill()
+        df[f'loband_{level}_shifted'] = df[f'loband_{level}'].shift(1).replace([np.inf, -np.inf, np.nan], np.nan).ffill().bfill()
     
     df['meanrange_shifted'] = df['meanrange'].shift(1).ffill()
+    
+    mrc_cols = ['meanline'] + [f'upband_{lvl}' for lvl in gradient_levels] + [f'loband_{lvl}' for lvl in gradient_levels]
+    logger.info(f"MRC calculated:\n{df[mrc_cols].tail()}")  # Elevated to INFO for visibility
+    logger.info(f"MRC NaN counts: {df[mrc_cols].isna().sum()}")
     return df
 
 def supersmoother(src: pd.Series, length: int) -> pd.Series:
     if len(src) < 3:
         return src.ffill().bfill()
-    a1 = np.exp(-np.sqrt(2) * np.pi / length)
-    b1 = 2 * a1 * np.cos(np.sqrt(2) * np.pi / length)
+    a1 = np.exp(-np.sqrt(2) * np.pi / max(1, length))
+    b1 = 2 * a1 * np.cos(np.sqrt(2) * np.pi / max(1, length))
     c3 = -a1**2
     c2 = b1
     c1 = 1 - c2 - c3
     
-    ss = np.zeros_like(src)
+    ss = np.zeros_like(src, dtype=float)
     ss[0] = src.iloc[0]
     ss[1] = src.iloc[1]
     for i in range(2, len(src)):
         ss[i] = c1 * src.iloc[i] + c2 * ss[i-1] + c3 * ss[i-2]
-    return pd.Series(ss, index=src.index).bfill().ffill()
+    return pd.Series(ss, index=src.index).interpolate().bfill().ffill()  # Add interpolation for smoothness
 
 def williams_r(high, low, close, lookback=14):
     highest_high = high.rolling(window=lookback, min_periods=1).max()
@@ -738,7 +754,7 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
     if backtest:
         logger.info(f"Requesting historical data for {symbol}")
         bars = ib.reqHistoricalData(
-            contract, endDateTime='', durationStr='30 D', barSizeSetting='1 hour',
+            contract, endDateTime='', durationStr='7 D', barSizeSetting='1 hour',
             whatToShow='TRADES', useRTH=True, formatDate=2, keepUpToDate=False)  # UTC timestamps
         
         if not bars:
@@ -774,6 +790,7 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         # Calculate additional columns
         df['hlc3'] = (df['high'] + df['low'] + df['close']) / 3
         df = calculate_mrc_with_gradient(df)
+        logger.debug(f"Post-MRC columns: {list(df.columns)}")  # Check columns after MRC
         df = df.drop(columns=['average', 'barCount'], errors='ignore')
         
         df = calculate_adx(df)
@@ -821,41 +838,87 @@ def get_historical_data(ib, symbol, exchange='SMART', currency='USD', backtest=F
         
         logger.info(f"Processed historical data with {len(df)} rows")
         logger.debug(f"OHLCV sample: \n{df[required_cols].head()}")
+        logger.info(f"Processed historical data with {len(df)} rows")
+        logger.debug(f"OHLCV sample: \n{df[required_cols].head()}")
+        logger.debug(f"Final MRC sample: \n{df[['meanline', 'upband_0.5', 'loband_0.5']].tail()}")  # Sample MRC
         return df
 
+import matplotlib.pyplot as plt
+from matplotlib.dates import DateFormatter, HourLocator, DayLocator
+import mplfinance as mpf
+import numpy as np
+import pandas as pd
+from matplotlib.colors import Normalize
+import logging
+
+logger = logging.getLogger(__name__)
+gradient_levels = [0.5, 1.0, 1.5, 2.0]  # Example MRC levels
+#mrc_cmap = plt.get_cmap('rainbow')  # Rainbow colormap for seamless effect
+
 def plot_mrc_gradient(ax, df):
-    meanline = df['meanline'].replace([np.inf, -np.inf, np.nan, 0], np.nan).ffill().bfill()
+    meanline = df['meanline'].replace([np.inf, -np.inf, np.nan, 0], np.nan).interpolate().ffill().bfill()
     if meanline.empty or meanline.isna().all():
         logger.error("Meanline data is empty or contains only NaN values")
         return
     
-    ax.plot(df.index, meanline, color='purple', linestyle='-', width=1.8, zorder=3,
-            path_effects=[pe.Stroke(width=3, foreground='white'), pe.Normal()])
-    
+    ax.plot(df.index, meanline, color='purple', linestyle='-', linewidth=2.5, zorder=3, label='Mean Line')
     norm = Normalize(vmin=min(gradient_levels), vmax=max(gradient_levels))
-    for i, level in enumerate(gradient_levels):
-        color = mrc_cmap(norm(level))
-        upper_band = df[f'upband_{level}'].replace([np.inf, -np.inf, np.nan, 0], np.nan).ffill().bfill()
-        lower_band = df[f'loband_{level}'].replace([np.inf, -np.inf, np.nan, 0], np.nan).ffill().bfill()
-        if upper_band.empty or upper_band.isna().all() or lower_band.empty or lower_band.isna().all():
-            logger.error(f"Band data for level {level} is empty or contains only NaN values")
-            continue
-        ax.plot(df.index, upper_band, color=color, linestyle='-' if level != 0.5 else ':', width=1.5, zorder=2,
-                alpha=0.8 if level != 0.5 else 0.7)
-        ax.plot(df.index, lower_band, color=color, linestyle='-' if level != 0.5 else ':', width=1.5, zorder=2,
-                alpha=0.8 if level != 0.5 else 0.7)
     
-    ax.plot(df.index, df[f'upband_{gradient_levels[0]}'].replace([np.inf, -np.inf, np.nan, 0], np.nan).ffill().bfill(),
-            color='cyan', linestyle=':', width=1.5, zorder=2, alpha=0.7)
-    ax.plot(df.index, df[f'loband_{gradient_levels[0]}'].replace([np.inf, -np.inf, np.nan, 0], np.nan).ffill().bfill(),
-            color='cyan', linestyle=':', width=1.5, zorder=2, alpha=0.7)
+    band_labels = {
+        2.0: "Strong Overbought",
+        1.5: "Overbought",
+        1.0: "Weak Overbought",
+        0.5: "Neutral",
+        -0.5: "Weak Oversold",
+        -1.5: "Oversold",
+        -2.0: "Strong Oversold"
+    }
+    
+    # Upper bands
+    for i in range(len(gradient_levels)):
+        level = gradient_levels[i]
+        color = mrc_cmap(norm(level))  # Use global mrc_cmap
+        upper_band = df[f'upband_{level}'].replace([np.inf, -np.inf, np.nan, 0], np.nan).interpolate().ffill().bfill()
+        
+        if upper_band.empty or upper_band.isna().all():
+            logger.error(f"Upper band data for level {level} is empty or all NaN")
+            logger.debug(f"Upper band {level} sample: {upper_band.tail()}")
+            continue
+        
+        if i == 0:
+            ax.fill_between(df.index, meanline, upper_band, color=color, alpha=0.4, zorder=2, interpolate=True,
+                            label=band_labels[level])
+        else:
+            prev_level = gradient_levels[i-1]
+            prev_upper_band = df[f'upband_{prev_level}'].replace([np.inf, -np.inf, np.nan, 0], np.nan).interpolate().ffill().bfill()
+            ax.fill_between(df.index, prev_upper_band, upper_band, color=color, alpha=0.4, zorder=2, interpolate=True,
+                            label=band_labels[level])
+    
+    # Lower bands
+    for i in range(len(gradient_levels)):
+        level = gradient_levels[i]
+        color = mrc_cmap(norm(level))
+        lower_band = df[f'loband_{level}'].replace([np.inf, -np.inf, np.nan, 0], np.nan).interpolate().ffill().bfill()
+        
+        if lower_band.empty or lower_band.isna().all():
+            logger.error(f"Lower band data for level {level} is empty or all NaN")
+            logger.debug(f"Lower band {level} sample: {lower_band.tail()}")
+            continue
+        
+        if i == 0:
+            ax.fill_between(df.index, meanline, lower_band, color=color, alpha=0.4, zorder=2, interpolate=True,
+                            label=band_labels[-level])
+        else:
+            prev_level = gradient_levels[i-1]
+            prev_lower_band = df[f'loband_{prev_level}'].replace([np.inf, -np.inf, np.nan, 0], np.nan).interpolate().ffill().bfill()
+            ax.fill_between(df.index, prev_lower_band, lower_band, color=color, alpha=0.4, zorder=2, interpolate=True,
+                            label=band_labels[-level])
+    
+    ax.legend(loc='upper left', fontsize=8, bbox_to_anchor=(1.05, 1), borderaxespad=0.)
 
-    ax.set_xlim(df.index[0], df.index[-1])
-    ax.set_ylim(df['close'].min() * 0.95, df['close'].max() * 1.05)
-
-#
+# ==================
 # HELPER FUNCTIONS
-#
+# ==================
 def calculate_rsi(close, period=14):
     delta = close.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -927,7 +990,7 @@ def calculate_vwap(high, low, close, volume):
 # =====================
 # VISUALIZATION ENGINE
 # =====================
-def plot_candlestick(df, backtest=False, symbol=GlobalConfig.symbol):
+def plot_candlestick(df, backtest=False, symbol='ORCL'):
     if df.empty:
         logger.error("Cannot plot empty DataFrame")
         raise ValueError("Cannot plot empty DataFrame")
@@ -950,16 +1013,8 @@ def plot_candlestick(df, backtest=False, symbol=GlobalConfig.symbol):
         base_mpf_style="classic"
     )
 
-    # Prepare addplots for all MRC levels and indicators
+    # Prepare addplots for indicators
     addplots = []
-    if all(f'loband_{level}' in df.columns for level in gradient_levels):
-        norm = Normalize(vmin=min(gradient_levels), vmax=max(gradient_levels))
-        for level in gradient_levels:
-            color = mrc_cmap(norm(level))
-            addplots.append(mpf.make_addplot(df[f'upband_{level}'], panel=0, color=color, linestyle='-', alpha=0.8))
-            addplots.append(mpf.make_addplot(df[f'loband_{level}'], panel=0, color=color, linestyle='-', alpha=0.8))
-        addplots.append(mpf.make_addplot(df['meanline'], panel=0, color='purple', linestyle='-', width=1.8))
-
     if all(col in df.columns for col in ['MACD', 'Signal', 'Histogram']):
         addplots.extend([
             mpf.make_addplot(df['MACD'], panel=1, color='#1f77b4', width=1.2, ylabel='MACD'),
@@ -976,14 +1031,11 @@ def plot_candlestick(df, backtest=False, symbol=GlobalConfig.symbol):
             mpf.make_addplot(df['%D'], panel=4, color='#e377c2', width=1.2),
         ])
 
-    logger.debug(f"Addplots prepared: {len(addplots)} items")
-    for ap in addplots:
-        logger.debug(f"Addplot: {ap}")
-
     panel_count = 1 + sum(1 for _ in range(1, 5) if any(ap['panel'] == _ for ap in addplots))
     panel_ratios = tuple([10] + [5] * (panel_count - 1)) if panel_count > 1 else (10,)
     logger.debug(f"Panel count: {panel_count}, Panel ratios: {panel_ratios}")
 
+    # Increase figure width to stretch the plot
     try:
         fig, axlist = mpf.plot(
             df,
@@ -992,24 +1044,34 @@ def plot_candlestick(df, backtest=False, symbol=GlobalConfig.symbol):
             volume=True,
             addplot=addplots,
             panel_ratios=panel_ratios,
-            figsize=(16, 12 + 2 * (panel_count - 1)),
+            figsize=(24, 12 + 2 * (panel_count - 1)),  # Wider figure: 24 instead of 16
             title=f'{symbol} Candlestick Chart (Backtest: {backtest})',
-            returnfig=True
+            returnfig=True,
+            tight_layout=True,  # Ensure proper spacing
+            show_nontrading=False  # Remove gaps for non-trading hours if desired
         )
     except Exception as e:
         logger.error(f"mplfinance plotting failed: {str(e)}", exc_info=True)
         raise
 
+    # Add seamless MRC gradient
+    if all(f'loband_{level}' in df.columns for level in gradient_levels):
+        plot_mrc_gradient(axlist[0], df)
+
     logger.debug(f"Number of axes: {len(axlist)}")
     for ax in axlist:
-        ax.grid(True, color='gray', linestyle=':', width=0.5)
+        ax.grid(True, color='gray', linestyle=':', linewidth=0.5)
         ax.set_facecolor('white')
-        ax.tick_params(colors='black', labelsize=8)
-        ax.xaxis.set_major_locator(plt.MaxNLocator(10))
-        ax.xaxis.set_major_formatter(DateFormatter('%Y-%m-%d %H:%M'))
+        ax.tick_params(colors='black', labelsize=10)  # Larger labels for readability
+        # Use DayLocator for better spacing with hourly data over multiple days
+        ax.xaxis.set_major_locator(DayLocator())
+        ax.xaxis.set_minor_locator(HourLocator(byhour=range(0, 24, 6)))  # Minor ticks every 6 hours
+        ax.xaxis.set_major_formatter(DateFormatter('%Y-%m-%d'))  # Date only for major ticks
+        ax.tick_params(axis='x', rotation=45)  # Rotate x-axis labels for clarity
 
-    logger.info("Candlestick chart plotted successfully")
-    plt.tight_layout()
+    # Adjust layout to prevent squishing
+    fig.subplots_adjust(left=0.05, right=0.95, bottom=0.1, top=0.9, hspace=0.3)
+    logger.info("Candlestick chart with seamless MRC gradient plotted successfully")
     plt.show()
 
 # =====================
@@ -1067,6 +1129,7 @@ def run_backtest(df, mode):  # Add mode parameter
 # MAIN EXECUTION
 # =====================
 def main():
+    root_logger.setLevel(logging.INFO)  # Keep INFO level
     global engine
     selected_mode = select_trading_mode()
     engine = BacktestEngine(mode=selected_mode)
@@ -1080,6 +1143,11 @@ def main():
         if daily_data is None or daily_data.empty:
             raise ValueError("Failed to retrieve historical data")
         
+        # Debug MRC data
+        mrc_cols = ['meanline'] + [f'upband_{lvl}' for lvl in gradient_levels] + [f'loband_{lvl}' for lvl in gradient_levels]
+        logger.info(f"MRC Data Sample:\n{daily_data[mrc_cols].tail()}")
+        logger.info(f"NaN counts: {daily_data[mrc_cols].isna().sum()}")
+
         engine, daily_data = run_backtest(daily_data, selected_mode)
         logger.info(f"Backtest completed with {len(engine.trade_history)} trades")
         plot_candlestick(daily_data, backtest=True)
