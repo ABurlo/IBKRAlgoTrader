@@ -1,0 +1,1431 @@
+#broken tri multiframe API calls excessive IBKR
+# =====================
+# CORE IMPORTS
+# =====================
+from ib_insync import *
+import pandas as pd
+import numpy as np
+import mplfinance as mpf
+from datetime import datetime, timedelta, time
+import asyncio
+import nest_asyncio
+import logging
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+from time import sleep
+from matplotlib.colors import ListedColormap, Normalize, LinearSegmentedColormap
+from collections.abc import MutableMapping
+import pytz
+import re
+import matplotlib.patheffects as pe
+from matplotlib.cm import ScalarMappable
+import seaborn as sns
+from matplotlib.dates import DateFormatter
+from scipy.signal import savgol_filter
+
+# =====================
+# LOGGING SETUP
+# =====================
+class TradeFormatter(logging.Formatter):
+    GREEN = '\033[92m'
+    RED = '\033[91m'
+    WHITE = '\033[0m'
+    
+    def format(self, record):
+        message = super().format(record)
+        message = self.colorize_strategy(message)
+        message = self.colorize_actions(message)
+        message = self.colorize_values(message)
+        return message
+
+    def colorize_strategy(self, message):
+        for strat_id, color in GlobalConfig.STRATEGY_COLORS.items():
+            message = re.sub(rf'#\[{strat_id}\] (BUY|SELL)',
+                           rf'{color}#[{strat_id}] {self.GREEN if "BUY" in message else self.RED}\1{self.WHITE}',
+                           message)
+        return message
+
+    def colorize_actions(self, message):
+        return re.sub(r'#\[\d\] (BUY|SELL)(\s+\|)', 
+                     lambda m: f"{m.group(1)}{m.group(2)}",
+                     message, count=1)
+    
+    def colorize_values(self, message):
+        def color_repl(match):
+            value_str = match.group(1) or match.group(2)
+            try:
+                value = float(value_str)
+                color = self.GREEN if value > 0 else self.RED
+            except:
+                color = self.WHITE
+            return f"{color}{match.group(0)}{self.WHITE}"
+        
+        parts = message.split(' | ')
+        for i, part in enumerate(parts):
+            if part.startswith(('Price:', 'Size:')):
+                continue
+            parts[i] = re.sub(r'\$ *(-?\d+\.\d+)|(-?\d+\.\d+)%', color_repl, part)
+        return ' | '.join(parts)
+
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.DEBUG)
+for handler in root_logger.handlers[:]:
+    root_logger.removeHandler(handler)
+
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(TradeFormatter('%(asctime)s | %(message)s'))
+file_handler = logging.FileHandler('strategy_execution.log')
+file_handler.setFormatter(logging.Formatter('%(asctime)s | %(message)s'))
+root_logger.addHandler(console_handler)
+root_logger.addHandler(file_handler)
+logger = logging.getLogger(__name__)
+
+class GlobalConfig:
+    nest_asyncio.apply()
+    symbol = 'MSFT'
+    durationStr = '365 D'
+    barSizeSetting = '4 hours'  # Default, will be overridden in backtest loop
+    BAR_SIZES = [
+        '5 mins', '10 mins', '15 mins', '20 mins', '30 mins',
+        '1 hour', '2 hours', '3 hours', '4 hours', '8 hours',
+        '1 day', '1 week'
+    ]
+    currency = 'USD'
+    initial_balance = 10000  # Per strategy
+    MIN_REQUIRED_BANDS = 2
+    gradient_levels = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+    colors = ['#FF0000', '#FFA500', '#00FF00', '#0000FF']
+    outer_levels = ['weak', 'moderate', 'strong']
+    volatility_threshold = 0.05
+    STRATEGIES = {
+        '1': 'time_based',
+        '2': 'signal_score',
+        '3': 'volatility_breakout'
+    }
+    STRATEGY_COLORS = {
+        '1': '\033[95m',  # Magenta for strategy 1
+        '2': '\033[96m',  # Cyan for strategy 2
+        '3': '\033[93m'   # Yellow for strategy 3
+    }
+
+sns.set_style("whitegrid")
+sns.set_context("notebook")
+sns.set_palette("tab10")
+plt.rcParams.update({
+    'font.size': 10,
+    'axes.labelcolor': 'black',
+    'axes.titlepad': 12,
+    'grid.color': 'gray',
+    'figure.dpi': 300,
+    'axes.facecolor': 'white',
+    'figure.facecolor': 'white'
+})
+
+MRC_GRADIENT_STYLE = 'full_spectrum'
+full_spectrum_colors = ['#FF0000', '#FFA500', '#00FF00', '#0000FF']
+def create_colormap(colors_list):
+    return LinearSegmentedColormap.from_list('custom_mrc', colors_list, N=len(GlobalConfig.gradient_levels))
+full_spectrum_cmap = create_colormap(full_spectrum_colors)
+mrc_cmap = full_spectrum_cmap
+
+# =====================
+# LINKED LIST DICTIONARY IMPLEMENTATION
+# =====================
+class LLNode:
+    __slots__ = ('key', 'value', 'next')
+    def __init__(self, key, value, next=None):
+        self.key = key
+        self.value = value
+        self.next = next
+
+class LLDict(MutableMapping):
+    def __init__(self):
+        self.head = None
+        self._size = 0
+
+    def __setitem__(self, key, value):
+        current = self.head
+        while current is not None:
+            if current.key == key:
+                current.value = value
+                return
+            current = current.next
+        self.head = LLNode(key, value, self.head)
+        self._size += 1
+
+    def __getitem__(self, key):
+        current = self.head
+        while current is not None:
+            if current.key == key:
+                return current.value
+            current = current.next
+        raise KeyError(key)
+
+    def __delitem__(self, key):
+        prev = None
+        current = self.head
+        while current is not None:
+            if current.key == key:
+                if prev:
+                    prev.next = current.next
+                else:
+                    self.head = current.next
+                self._size -= 1
+                return
+            prev = current
+            current = current.next
+        raise KeyError(key)
+
+    def __iter__(self):
+        current = self.head
+        while current is not None:
+            yield current.key
+            current = current.next
+
+    def __len__(self):
+        return self._size
+
+# =====================
+# MARKET CLOSURE WARNING
+# =====================
+def enforce_ny_timezone(timestamp):
+    ny_tz = pytz.timezone('America/New_York')
+    if not isinstance(timestamp, pd.Timestamp):
+        timestamp = pd.to_datetime(timestamp)
+    if timestamp.tzinfo is None:
+        logger.debug(f"Localizing naive timestamp {timestamp} to NY timezone")
+        return ny_tz.localize(timestamp)
+    else:
+        logger.debug(f"Converting tz-aware timestamp {timestamp} to NY timezone")
+        return timestamp.tz_convert(ny_tz)
+
+def is_market_close(index):
+    ny_tz = pytz.timezone('America/New_York')
+    if index.tzinfo is None:
+        logger.debug(f"Localizing naive index {index} to NY timezone")
+        index = index.tz_localize(ny_tz)
+    else:
+        logger.debug(f"Converting tz-aware index {index} to NY timezone")
+        index = index.tz_convert(ny_tz)
+    
+    current_time = index.time
+    market_close_time = time(16, 0)
+    time_delta = timedelta(minutes=10)
+    
+    dummy_date = index.date()
+    market_close_dt = ny_tz.localize(datetime.combine(dummy_date, market_close_time))
+    
+    return (market_close_dt - time_delta) <= index <= market_close_dt
+
+# =====================
+# METRICS CALCULATION
+# =====================
+def calculate_day_metrics(trades, risk_free_rate=0.02):
+    if not trades:
+        return {
+            'overall': {
+                'win_rate': 0.0,
+                'win_loss_ratio': 0.0,
+                'num_trades': 0,
+                'total_pnl': 0.0,
+                'avg_pnl': 0.0,
+                'sharpe_ratio': 0.0,
+                'sortino_ratio': 0.0,
+                'max_drawdown': 0.0,
+                'avg_win': 0.0,
+                'avg_loss': 0.0,
+                'profit_factor': 0.0,
+                'avg_holding_hours': 0.0,
+                'trades_per_day': 0.0,
+                'risk_reward_ratio': 0.0,
+                'recovery_factor': 0.0
+            },
+            'by_exit_strategy': {},
+            'holding_periods': {
+                'winning': 0.0,
+                'losing': 0.0,
+                'by_exit_strategy': {}
+            },
+            'volatility': {
+                'avg_atr': 0.0,
+                'pnl_volatility_correlation': 0.0
+            }
+        }
+
+    num_trades = len(trades)
+    total_pnl = 0.0
+    wins = losses = 0
+    pnl_list = []
+    win_pnls = []
+    loss_pnls = []
+    holding_times = []
+    exit_strategy_counts = {}
+    exit_strategy_pnl = {}
+    exit_strategy_wins = {}
+    exit_strategy_losses = {}
+    exit_strategy_holding = {}
+    atr_list = []
+    risk_rewards = []
+    balance_history = [GlobalConfig.initial_balance]
+
+    for t in trades:
+        if not isinstance(t, dict) or 'timestamp' not in t or 'pnl' not in t:
+            logger.error("Invalid trade format in calculate_day_metrics")
+            continue
+        
+        trade_pnl = float(t.get('pnl', 0.0))
+        total_pnl += trade_pnl
+        pnl_list.append(trade_pnl)
+        balance_history.append(balance_history[-1] + trade_pnl)
+        
+        if trade_pnl > 0:
+            wins += 1
+            win_pnls.append(trade_pnl)
+        elif trade_pnl < 0:
+            losses += 1
+            loss_pnls.append(trade_pnl)
+
+        entry_time = pd.to_datetime(t.get('entry_time', t['timestamp']))
+        exit_time = pd.to_datetime(t['timestamp'])
+        holding_time = (exit_time - entry_time).total_seconds() / 3600
+        holding_times.append(holding_time)
+
+        exit_type = t.get('exit_type', 'Unknown')
+        exit_strategy_counts[exit_type] = exit_strategy_counts.get(exit_type, 0) + 1
+        exit_strategy_pnl[exit_type] = exit_strategy_pnl.get(exit_type, 0) + trade_pnl
+        if trade_pnl > 0:
+            exit_strategy_wins[exit_type] = exit_strategy_wins.get(exit_type, 0) + 1
+        elif trade_pnl < 0:
+            exit_strategy_losses[exit_type] = exit_strategy_losses.get(exit_type, 0) + 1
+        exit_strategy_holding[exit_type] = exit_strategy_holding.get(exit_type, []) + [holding_time]
+
+        if 'ATR' in t and 'entry_price' in t and 'price' in t:
+            atr_list.append(float(t['ATR']))
+            entry_price = float(t['entry_price'])
+            exit_price = float(t['price'])
+            potential_loss = entry_price - (entry_price - t['ATR'])
+            potential_gain = abs(exit_price - entry_price) if trade_pnl > 0 else 0
+            if potential_loss > 0 and potential_gain > 0:
+                risk_rewards.append(potential_gain / potential_loss)
+
+    win_rate = (wins / num_trades * 100) if num_trades > 0 else 0.0
+    win_loss_ratio = (wins / losses) if losses > 0 else float('inf') if wins > 0 else 0.0
+    avg_pnl = total_pnl / num_trades if num_trades > 0 else 0.0
+    avg_win = sum(win_pnls) / len(win_pnls) if win_pnls else 0.0
+    avg_loss = sum(loss_pnls) / len(loss_pnls) if loss_pnls else 0.0
+    profit_factor = sum(win_pnls) / abs(sum(loss_pnls)) if loss_pnls else float('inf') if win_pnls else 0.0
+
+    pnl_array = np.array(pnl_list)
+    daily_rfr = risk_free_rate / 252
+    excess_returns = pnl_array - daily_rfr
+    mean_excess_return = np.mean(excess_returns)
+    std_dev = np.std(pnl_array, ddof=1) if num_trades > 1 else 0.0
+    sharpe_ratio = (mean_excess_return / std_dev) * np.sqrt(252) if std_dev > 0 else 0.0
+
+    downside_returns = pnl_array[pnl_array < 0]
+    downside_dev = np.std(downside_returns, ddof=1) if len(downside_returns) > 1 else 0.0
+    sortino_ratio = (mean_excess_return / downside_dev) * np.sqrt(252) if downside_dev > 0 else 0.0
+
+    if pnl_array.size > 0:
+        balance_array = np.array(balance_history)
+        peak = np.maximum.accumulate(balance_array)
+        drawdowns = (peak - balance_array) / peak
+        max_drawdown = np.max(drawdowns) * 100 if np.max(drawdowns) > 0 else 0.0
+    else:
+        max_drawdown = 0.0
+
+    avg_holding_hours = sum(holding_times) / len(holding_times) if holding_times else 0.0
+    days_span = (max(pd.to_datetime([t['timestamp'] for t in trades])) - 
+                 min(pd.to_datetime([t['timestamp'] for t in trades]))).days + 1 if trades else 1
+    trades_per_day = num_trades / days_span if days_span > 0 else 0.0
+    risk_reward_ratio = sum(risk_rewards) / len(risk_rewards) if risk_rewards else 0.0
+    recovery_factor = total_pnl / (max_drawdown / 100 * GlobalConfig.initial_balance) if max_drawdown > 0 else float('inf')
+
+    by_exit_strategy = {}
+    holding_by_exit = {}
+    for exit_type in exit_strategy_counts:
+        num_trades_exit = exit_strategy_counts[exit_type]
+        wins_exit = exit_strategy_wins.get(exit_type, 0)
+        losses_exit = exit_strategy_losses.get(exit_type, 0)
+        total_pnl_exit = exit_strategy_pnl[exit_type]
+        
+        by_exit_strategy[exit_type] = {
+            'win_rate': (wins_exit / num_trades_exit * 100) if num_trades_exit > 0 else 0.0,
+            'num_trades': num_trades_exit,
+            'total_pnl': round(total_pnl_exit, 2),
+            'avg_pnl': total_pnl_exit / num_trades_exit if num_trades_exit > 0 else 0.0,
+            'win_loss_ratio': (wins_exit / losses_exit) if losses_exit > 0 else float('inf') if wins_exit > 0 else 0.0
+        }
+        holding_by_exit[exit_type] = sum(exit_strategy_holding[exit_type]) / len(exit_strategy_holding[exit_type]) if exit_strategy_holding[exit_type] else 0.0
+
+    winning_holding = [ht for ht, pnl in zip(holding_times, pnl_list) if pnl > 0]
+    losing_holding = [ht for ht, pnl in zip(holding_times, pnl_list) if pnl < 0]
+    avg_winning_holding = sum(winning_holding) / len(winning_holding) if winning_holding else 0.0
+    avg_losing_holding = sum(losing_holding) / len(losing_holding) if losing_holding else 0.0
+
+    avg_atr = sum(atr_list) / len(atr_list) if atr_list else 0.0
+    volatility_pnl_correlation = np.corrcoef(pnl_list, atr_list[:len(pnl_list)])[0, 1] if atr_list and len(pnl_list) <= len(atr_list) else 0.0
+
+    return {
+        'overall': {
+            'win_rate': round(win_rate, 2),
+            'win_loss_ratio': round(win_loss_ratio, 2) if win_loss_ratio != float('inf') else float('inf'),
+            'num_trades': num_trades,
+            'total_pnl': round(total_pnl, 2),
+            'avg_pnl': round(avg_pnl, 2),
+            'sharpe_ratio': round(sharpe_ratio, 2),
+            'sortino_ratio': round(sortino_ratio, 2),
+            'max_drawdown': round(max_drawdown, 2),
+            'avg_win': round(avg_win, 2),
+            'avg_loss': round(avg_loss, 2),
+            'profit_factor': round(profit_factor, 2) if profit_factor != float('inf') else float('inf'),
+            'avg_holding_hours': round(avg_holding_hours, 2),
+            'trades_per_day': round(trades_per_day, 2),
+            'risk_reward_ratio': round(risk_reward_ratio, 2),
+            'recovery_factor': round(recovery_factor, 2) if recovery_factor != float('inf') else float('inf')
+        },
+        'by_exit_strategy': by_exit_strategy,
+        'holding_periods': {
+            'winning': round(avg_winning_holding, 2),
+            'losing': round(avg_losing_holding, 2),
+            'by_exit_strategy': {k: round(v, 2) for k, v in holding_by_exit.items()}
+        },
+        'volatility': {
+            'avg_atr': round(avg_atr, 2),
+            'pnl_volatility_correlation': round(volatility_pnl_correlation, 2)
+        }
+    }
+
+# =====================
+# METRICS CALCULATION (Unchanged)
+# =====================
+class BacktestEngine:
+    def __init__(self, strategy_id, mode='time_based'):
+        self.strategy_id = strategy_id
+        self.mode = mode
+        self.mode_config = {
+            'time_based': {
+                'position_risk': 0.02,
+                'volatility_mult': 1.5,
+                'entry_conditions': {
+                    'mean_deviation': {'threshold': -1.0, 'operator': '<'},
+                    'rsi': {'threshold': 40, 'operator': '<'},
+                    'williams_r': {'threshold': -70, 'operator': '<'},
+                    'volatility_filter': {'threshold': 0.08, 'operator': '<'},
+                    'macd_histogram': {'threshold': 0, 'operator': '>'}
+                },
+                'exit_conditions': {
+                    'mean_reversion': {'threshold': 0.5, 'operator': '>'},
+                    'stop_loss': {'threshold': -2.5, 'operator': '<'},
+                    'time_limit': {'hours': 24}
+                },
+                'signal_weights': {
+                    'rsi': 0.3,
+                    'mean_deviation': 0.3,
+                    'williams': 0.2,
+                    'volatility': 0.1,
+                    'macd': 0.1
+                }
+            },
+            'signal_score': {
+                'position_risk': 0.02,
+                'volatility_mult': 1.5,
+                'entry_conditions': {
+                    'rsi': {'threshold': 35, 'operator': '<'},
+                    'williams_r': {'threshold': -80, 'operator': '<'},
+                    'macd_crossover': {'direction': 'up'},
+                    'vwap': {'threshold': 'close < VWAP_shifted', 'operator': 'custom'},
+                    'stoch': {'%K_threshold': 30, '%D_threshold': 30, 'operator': '<'}
+                },
+                'exit_conditions': {
+                    'signal_score': {'threshold': 0.65},
+                    'stop_loss': {'threshold': -2.0, 'operator': '<'}
+                },
+                'signal_weights': {
+                    'rsi': 0.25,
+                    'williams': 0.25,
+                    'macd': 0.2,
+                    'vwap': 0.15,
+                    'stoch': 0.15
+                }
+            },
+            'volatility_breakout': {
+                'position_risk': 0.02,
+                'volatility_mult': 2.0,
+                'entry_conditions': {
+                    'atr_breakout': {'multiplier': 1.5, 'operator': '>'},
+                    'adx': {'threshold': 20, 'operator': '>'},
+                    'di_spread': {'threshold': 5, 'operator': '>'},
+                    'volume': {'threshold': 'volume > volume_ma', 'operator': 'custom'}
+                },
+                'exit_conditions': {
+                    'trailing_stop': {'atr_multiplier': 2.0},
+                    'adx_drop': {'threshold': 15, 'operator': '<'},
+                    'mean_reversion': {'threshold': 0.3, 'operator': '<'}
+                },
+                'signal_weights': {
+                    'atr': 0.3,
+                    'adx': 0.3,
+                    'di': 0.2,
+                    'volume': 0.2
+                }
+            }
+        }
+        self.validate_mode_config()
+        self.balance = GlobalConfig.initial_balance
+        self.positions = LLDict()
+        self.trade_history = []
+        self.current_position = None
+        self.fee_per_share = 0.0035
+        self.slippage = 0.0002
+        self.volatility_filter = {'min_mrc': 0.02, 'max_mrc': 0.08}
+        self.daily_pnl = {}
+        self.backtest_data = []
+        logger.info(f"Strategy #{strategy_id} ({mode}) initialized with balance: ${self.balance}")
+
+    @property
+    def max_position_size(self):
+        return self.balance * 0.25
+
+    def validate_mode_config(self):
+        required_keys = ['position_risk', 'volatility_mult', 'entry_conditions', 'exit_conditions', 'signal_weights']
+        for mode, config in self.mode_config.items():
+            if not all(k in config for k in required_keys):
+                raise ValueError(f"Missing config keys in {mode}")
+
+    def calculate_position_size(self, row):
+        config = self.mode_config[self.mode]
+        risk_capital = self.balance * config['position_risk']
+        combined_vol = (max(0.01, row['meanrange']) * config['volatility_mult'] + row['ATR']) / 2
+        position_size = min(self.max_position_size, risk_capital / combined_vol) * 100
+        logger.debug(f"Strategy #{self.strategy_id} - Position size: ${position_size:.2f} (Risk=${risk_capital:.2f}, Vol={combined_vol:.2f})")
+        return position_size
+
+    def composite_signal_score(self, row):
+        config = self.mode_config[self.mode]
+        weights = config['signal_weights']
+        total_weight = sum(weights.values())
+        scores = {}
+        conditions_met = 0
+        total_conditions = len(weights) + 2
+
+        volatility_regime = 1 + min(2, (row['ATR'] / row['close']) * 2.5) if not pd.isna(row['ATR']) else 1.0
+        if 'rsi' in weights:
+            rsi_value = row['RSI_shifted']
+            scores['rsi'] = weights['rsi'] if rsi_value < 35 else 0
+            conditions_met += 1 if rsi_value < 35 else 0
+        if 'williams' in weights:
+            williams_value = row['Williams_%R_shifted']
+            scores['williams'] = weights['williams'] if williams_value < -80 else 0
+            conditions_met += 1 if williams_value < -80 else 0
+        if 'macd' in weights:
+            scores['macd'] = weights['macd'] if row['MACD_shifted'] > row['Signal_shifted'] else 0
+            conditions_met += 1 if row['MACD_shifted'] > row['Signal_shifted'] else 0
+        if 'vwap' in weights:
+            scores['vwap'] = weights['vwap'] if row['close_shifted'] < row['VWAP_shifted'] else 0
+            conditions_met += 1 if row['close_shifted'] < row['VWAP_shifted'] else 0
+        if 'stoch' in weights:
+            scores['stoch'] = weights['stoch'] if row['%K_shifted'] < 30 and row['%D_shifted'] < 30 else 0
+            conditions_met += 1 if row['%K_shifted'] < 30 and row['%D_shifted'] < 30 else 0
+        if 'atr' in weights:
+            atr_value = row['ATR'] / row['close']
+            scores['atr'] = weights['atr'] if atr_value > 0.05 else 0
+            conditions_met += 1 if atr_value > 0.05 else 0
+        if 'adx' in weights:
+            scores['adx'] = weights['adx'] if row['adx_shifted'] > 20 else 0
+            conditions_met += 1 if row['adx_shifted'] > 20 else 0
+        if 'di' in weights:
+            di_spread = row['+di_shifted'] - row['-di_shifted']
+            scores['di'] = weights['di'] if di_spread > 5 else 0
+            conditions_met += 1 if di_spread > 5 else 0
+        if 'volume' in weights:
+            scores['volume'] = weights['volume'] if row['volume'] > row['volume_ma'] else 0
+            conditions_met += 1 if row['volume'] > row['volume_ma'] else 0
+
+        conditions_met += 1 if row['+di_shifted'] > row['-di_shifted'] else 0
+        conditions_met += 1 if row['%K_shifted'] > row['%D_shifted'] else 0
+
+        weighted_score = sum(scores.values()) / total_weight if total_weight > 0 else 0
+        percentage_score = (conditions_met / total_conditions) * volatility_regime * weighted_score
+        return min(1.0, percentage_score)
+
+    def apply_slippage(self, price, is_buy):
+        slippage_factor = 1 + (self.slippage if is_buy else -self.slippage)
+        return price * slippage_factor
+    
+    def calculate_fees(self, shares):
+        return abs(shares * self.fee_per_share)
+
+    def execute_trade(self, price, shares, action, timestamp, exit_type=None, row=None):
+        try:
+            price_with_slippage = self.apply_slippage(price, action == 'BUY')
+            fees = self.calculate_fees(shares)
+            position_value = shares * price_with_slippage
+
+            trade = {
+                'strategy_id': self.strategy_id,
+                'timestamp': timestamp,
+                'action': action,
+                'price': price_with_slippage,
+                'shares': shares,
+                'position_value': position_value,
+                'balance_before': self.balance,
+                'exit_type': exit_type if action == 'SELL' else None
+            }
+
+            if action == 'BUY':
+                if position_value > self.balance:
+                    logger.warning(f"Strategy #{self.strategy_id}: Insufficient funds: ${position_value:.2f} > ${self.balance:.2f}")
+                    return None
+                self.current_position = {
+                    'symbol': GlobalConfig.symbol, 
+                    'entry_price': price_with_slippage, 
+                    'shares': shares, 
+                    'timestamp': timestamp, 
+                    'position_value': position_value, 
+                    'entry_time': timestamp,
+                    'highest_price': price_with_slippage
+                }
+                self.balance -= (position_value + fees)
+                trade['pnl'] = 0.0
+                trade['pnl_pct'] = 0.0
+                trade['entry_time'] = timestamp
+                logger.info(f"Strategy #{self.strategy_id} - Buy: Price=${price_with_slippage:.2f}, Shares={shares:.2f}, Value=${position_value:.2f}")
+            elif action == 'SELL' and self.current_position:
+                entry_price = self.current_position['entry_price']
+                entry_value = self.current_position['position_value']
+                entry_time = self.current_position['entry_time']
+                exit_value = position_value
+                pnl = exit_value - entry_value - fees
+                pnl_pct = (pnl / entry_value) * 100 if entry_value != 0 else 0
+
+                trade['pnl'] = pnl
+                trade['pnl_pct'] = pnl_pct
+                trade['entry_time'] = entry_time
+                self.balance += (exit_value - fees)
+                self.daily_pnl[timestamp.strftime('%Y-%m-%d')] = (
+                    self.daily_pnl.get(timestamp.strftime('%Y-%m-%d'), 0) + pnl
+                )
+                self.current_position = None
+                logger.info(f"Strategy #{self.strategy_id} - Sell: Price=${price_with_slippage:.2f}, Shares={shares:.2f}, PnL=${pnl:.2f}")
+
+            trade['balance_after'] = self.balance
+            if row is not None:
+                trade.update(row.to_dict())
+            self.trade_history.append(trade)
+            self.backtest_data.append(trade)
+            return trade
+        except Exception as e:
+            logger.error(f"Strategy #{self.strategy_id} trade execution failed: {str(e)}", exc_info=True)
+            return None
+
+# =====================
+# CONDITION CHECKS
+# =====================
+def check_entry_conditions(df, index, engine):
+    if str(index.tz) != 'America/New_York':
+        raise ValueError(f"Invalid timezone in entry check: {index.tz}")
+    
+    try:
+        df_up_to_index = df.loc[:index]
+        if df_up_to_index.empty:
+            return False
+        
+        row = df.loc[index]
+        prev_row = df_up_to_index.iloc[-1] if len(df_up_to_index) > 1 else row
+        config = engine.mode_config[engine.mode]
+        conditions = config['entry_conditions']
+        total_conditions = len(conditions) + 2
+        conditions_met = 0
+        log_details = [f"Strategy #{engine.strategy_id} Entry Check at {index}"]
+
+        for condition_name, params in conditions.items():
+            condition_met = False
+            if condition_name == 'mean_deviation':
+                meanline = row['meanline']
+                meanrange = row['meanrange_shifted']
+                deviation = (row['close'] - meanline) / meanrange if meanrange > 0 else 0
+                condition_met = deviation < params['threshold']
+                log_details.append(f"Mean Deviation: Value={deviation:.2f}, Threshold={params['threshold']}, Met={condition_met}")
+            elif condition_name == 'rsi':
+                value = row['RSI_shifted']
+                if pd.isna(value):
+                    logger.warning(f"Strategy #{engine.strategy_id} - RSI_shifted is NaN at {index}")
+                    condition_met = False
+                else:
+                    condition_met = value < params['threshold']
+                log_details.append(f"RSI: Value={value:.2f}, Threshold={params['threshold']}, Met={condition_met}")
+            elif condition_name == 'volatility_filter':
+                volatility = row['ATR'] / row['close'] if row['close'] > 0 else float('inf')
+                condition_met = volatility < params['threshold']
+                log_details.append(f"Volatility: Value={volatility:.2f}, Threshold={params['threshold']}, Met={condition_met}")
+            elif condition_name == 'williams_r':
+                value = row['Williams_%R_shifted']
+                condition_met = value < params['threshold']
+                log_details.append(f"Williams %R: Value={value:.2f}, Threshold={params['threshold']}, Met={condition_met}")
+            elif condition_name == 'macd_histogram':
+                value = row['Histogram_shifted']
+                condition_met = value > params['threshold']
+                log_details.append(f"MACD Histogram: Value={value:.2f}, Threshold={params['threshold']}, Met={condition_met}")
+            elif condition_name == 'macd_crossover':
+                condition_met = row['MACD_shifted'] > row['Signal_shifted'] and prev_row['MACD_shifted'] <= prev_row['Signal_shifted']
+                log_details.append(f"MACD Crossover: MACD={row['MACD_shifted']:.2f}, Signal={row['Signal_shifted']:.2f}, Prev MACD={prev_row['MACD_shifted']:.2f}, Met={condition_met}")
+            elif condition_name == 'vwap':
+                condition_met = row['close'] < row['VWAP_shifted']
+                log_details.append(f"VWAP: Close={row['close']:.2f}, VWAP={row['VWAP_shifted']:.2f}, Met={condition_met}")
+            elif condition_name == 'stoch':
+                k_value = row['%K_shifted']
+                d_value = row['%D_shifted']
+                condition_met = k_value < params['%K_threshold'] and d_value < params['%D_threshold']
+                log_details.append(f"Stochastic: %K={k_value:.2f}, %D={d_value:.2f}, Met={condition_met}")
+            elif condition_name == 'atr_breakout':
+                prev_high = df_up_to_index['high'].iloc[-2] if len(df_up_to_index) > 1 else row['high']
+                breakout_level = prev_high + (row['ATR'] * params['multiplier'])
+                condition_met = row['close'] > breakout_level
+                log_details.append(f"ATR Breakout: Close={row['close']:.2f}, Level={breakout_level:.2f}, Met={condition_met}")
+            elif condition_name == 'adx':
+                value = row['adx_shifted']
+                condition_met = value > params['threshold']
+                log_details.append(f"ADX: Value={value:.2f}, Threshold={params['threshold']}, Met={condition_met}")
+            elif condition_name == 'di_spread':
+                spread = row['+di_shifted'] - row['-di_shifted']
+                condition_met = spread > params['threshold']
+                log_details.append(f"DI Spread: Spread={spread:.2f}, Threshold={params['threshold']}, Met={condition_met}")
+            elif condition_name == 'volume':
+                condition_met = row['volume'] > row['volume_ma']
+                log_details.append(f"Volume: Vol={row['volume']:.0f}, MA={row['volume_ma']:.0f}, Met={condition_met}")
+            conditions_met += 1 if condition_met else 0
+
+        position_ok = engine.balance > 1000 and not engine.current_position
+        conditions_met += 1 if position_ok else 0
+        log_details.append(f"Position OK: Balance={engine.balance:.2f}, Has Position={bool(engine.current_position)}, Met={position_ok}")
+
+        time_ok = not is_market_close(index)
+        conditions_met += 1 if time_ok else 0
+        log_details.append(f"Time OK: Market Closed={not time_ok}, Met={time_ok}")
+
+        fraction_met = conditions_met / total_conditions
+        position_size = engine.calculate_position_size(row) if conditions_met > 0 else 0
+        log_details.append(f"Fraction Met: {conditions_met}/{total_conditions} ({fraction_met:.2%})")
+        log_details.append(f"Current Price: ${row['close']:.2f}, Position Size: ${position_size:.2f}")
+        logger.info(" | ".join(log_details))
+
+        entry_triggered = fraction_met >= 0.75
+        if entry_triggered:
+            logger.info(f"Strategy #{engine.strategy_id} - Entry conditions met at {index} with {fraction_met:.2%}")
+        return entry_triggered
+    
+    except KeyError as e:
+        logger.error(f"Strategy #{engine.strategy_id} - Missing data at {index}: '{e}'")
+        return False
+    except Exception as e:
+        logger.error(f"Strategy #{engine.strategy_id} - Error in entry check at {index}: {str(e)}", exc_info=True)
+        return False
+
+def check_exit_conditions(df, index, engine):
+    if str(index.tz) != 'America/New_York':
+        raise ValueError(f"Invalid timezone in exit check: {index.tz}")
+    
+    if not engine.current_position:
+        return None
+    
+    try:
+        row = df.loc[index]
+        config = engine.mode_config[engine.mode]
+        conditions = config['exit_conditions']
+        current_time = enforce_ny_timezone(index)
+        entry_time = engine.current_position['entry_time']
+        entry_price = engine.current_position['entry_price']
+        current_price = row['close']
+        meanrange = row['meanrange_shifted']
+
+        for condition_name, params in conditions.items():
+            if condition_name == 'mean_reversion':
+                deviation = (current_price - row['meanline']) / meanrange if meanrange > 0 else 0
+                if deviation > params['threshold']:
+                    logger.debug(f"Strategy #{engine.strategy_id} - Mean Reversion exit at {index}: Deviation={deviation:.2f}")
+                    return 'Mean Reversion'
+            elif condition_name == 'stop_loss':
+                deviation = (current_price - entry_price) / meanrange if meanrange > 0 else 0
+                if deviation < params['threshold']:
+                    logger.debug(f"Strategy #{engine.strategy_id} - Stop Loss exit at {index}: Deviation={deviation:.2f}")
+                    return 'Stop Loss'
+            elif condition_name == 'time_limit':
+                time_diff = (current_time - entry_time).total_seconds() / 3600
+                if time_diff >= params['hours']:
+                    logger.debug(f"Strategy #{engine.strategy_id} - Time Limit exit at {index}: Holding={time_diff:.2f}h")
+                    return f'Time Limit ({params["hours"]}h)'
+            elif condition_name == 'signal_score':
+                score = engine.composite_signal_score(row)
+                if score >= params['threshold']:
+                    logger.debug(f"Strategy #{engine.strategy_id} - Signal Score exit at {index}: Score={score:.2f}")
+                    return 'Signal Score'
+            elif condition_name == 'trailing_stop':
+                if 'highest_price' not in engine.current_position:
+                    engine.current_position['highest_price'] = entry_price
+                engine.current_position['highest_price'] = max(engine.current_position['highest_price'], current_price)
+                stop_level = engine.current_position['highest_price'] - (row['ATR'] * params['atr_multiplier'])
+                if current_price <= stop_level:
+                    logger.debug(f"Strategy #{engine.strategy_id} - Trailing Stop exit at {index}: Price={current_price:.2f}, Stop={stop_level:.2f}")
+                    return f'Trailing Stop ({params["atr_multiplier"]}x ATR)'
+            elif condition_name == 'adx_drop':
+                if row['adx_shifted'] < params['threshold']:
+                    logger.debug(f"Strategy #{engine.strategy_id} - ADX Drop exit at {index}: ADX={row['adx_shifted']:.2f}")
+                    return 'ADX Drop'
+        
+        return None
+    
+    except KeyError as e:
+        logger.error(f"Strategy #{engine.strategy_id} - Missing data at {index}: '{e}'")
+        return None
+    except Exception as e:
+        logger.error(f"Strategy #{engine.strategy_id} - Error in exit check at {index}: {str(e)}", exc_info=True)
+        return None
+
+def log_trade(trade):
+    strategy_id = trade['strategy_id']
+    timestamp = pd.to_datetime(trade['timestamp']).tz_convert('America/New_York')
+    log_parts = [
+        f"#[{strategy_id}] {trade['action'].ljust(6)} | {GlobalConfig.symbol.ljust(5)}",
+        f"Time:  {timestamp.strftime('%Y-%m-%d %H:%M:%S%z')}",
+        f"Price: ${trade['price']:7.2f}",
+        f"Size:  ${trade['position_value']:7.2f}",
+        f"Shares: {trade['shares']:>6.2f}"
+    ]
+    if trade['action'] == 'SELL':
+        log_parts.extend([
+            f"PnL:   ${trade['pnl']:7.2f}",
+            f"Return: {trade['pnl_pct']:6.2f}%",
+            f"Exit:  {trade['exit_type']}"
+        ])
+    logger.info(" | ".join(log_parts))
+
+def calculate_mrc_with_gradient(df, length=50, gradient_levels=GlobalConfig.gradient_levels, outer_levels=GlobalConfig.outer_levels):
+    if 'hlc3' not in df.columns:
+        df['hlc3'] = (df['high'] + df['low'] + df['close']) / 3
+
+    df['prev_close'] = df['close'].shift(1).ffill()
+    df['tr1'] = df['high'] - df['low']
+    df['tr2'] = abs(df['high'] - df['prev_close'])
+    df['tr3'] = abs(df['low'] - df['prev_close'])
+    df['tr'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)
+    df.drop(['tr1', 'tr2', 'tr3', 'prev_close'], axis=1, inplace=True, errors='ignore')
+    tr_mean = df['tr'].mean()
+    tr_std = df['tr'].std()
+    if tr_std > 0:
+        df['tr'] = df['tr'].clip(tr_mean - 3 * tr_std, tr_mean + 3 * tr_std)
+
+    df['meanline'] = supersmoother(df['hlc3'], length, apply_savgol=False).replace([np.inf, -np.inf, np.nan], np.nan).ffill().bfill()
+    logger.debug(f"Meanline sample: {df['meanline'].head().tolist()}, NaN count: {df['meanline'].isna().sum()}")
+
+    df['meanrange'] = df['tr'].rolling(10, min_periods=1).mean().replace([np.inf, -np.inf, np.nan], 0).ffill().bfill()
+    meanrange_mean = df['meanrange'].mean()
+    meanrange_std = df['meanrange'].std()
+    if meanrange_std > 0:
+        df['meanrange'] = df['meanrange'].clip(meanrange_mean - 3 * meanrange_std, meanrange_mean + 3 * meanrange_std)
+    logger.debug(f"Meanrange sample: {df['meanrange'].head().tolist()}, NaN count: {df['meanrange'].isna().sum()}")
+
+    for level in gradient_levels:
+        df[f'upband_{level}'] = df['meanline'] + (df['meanrange'] * level)
+        df[f'loband_{level}'] = df['meanline'] - (df['meanrange'] * level)
+        df[f'upband_{level}_shifted'] = df[f'upband_{level}'].shift(1).ffill().bfill()
+        df[f'loband_{level}_shifted'] = df[f'loband_{level}'].shift(1).ffill().bfill()
+        logger.debug(f"Upband_{level} sample: {df[f'upband_{level}'].head().tolist()}, NaN count: {df[f'upband_{level}'].isna().sum()}")
+
+    outer_multiples = {'weak': 3.0, 'moderate': 3.5, 'strong': 4.0}
+    for level_name in outer_levels:
+        multiple = outer_multiples[level_name]
+        df[f'upband_{level_name}'] = df['meanline'] + (df['meanrange'] * multiple)
+        df[f'loband_{level_name}'] = df['meanline'] - (df['meanrange'] * multiple)
+
+    df['meanrange_shifted'] = df['meanrange'].shift(1).ffill().bfill()
+    logger.debug(f"Meanline at 15:00: {df['meanline'].loc[df.index.time == time(15, 0)].tolist() if not df['meanline'].empty else 'Empty'}")
+    logger.debug(f"Meanrange at 15:00: {df['meanrange'].loc[df.index.time == time(15, 0)].tolist() if not df['meanrange'].empty else 'Empty'}")
+    logger.debug(f"Upband_0.5 at 15:00: {df['upband_0.5'].loc[df.index.time == time(15, 0)].tolist() if 'upband_0.5' in df and not df['upband_0.5'].empty else 'Empty'}")
+    return df
+
+def supersmoother(src: pd.Series, length: int = 50, apply_savgol: bool = False) -> pd.Series:
+    if len(src) < 3 or length < 1:
+        return src.ffill().bfill()
+    
+    src_clean = src.copy()
+    mean_val = src_clean.mean()
+    std_val = src_clean.std()
+    if std_val > 0:
+        src_clean = src_clean.clip(mean_val - 3 * std_val, mean_val + 3 * std_val)
+    logger.debug(f"Clipped outliers in source data - Mean: {mean_val}, Std: {std_val}")
+
+    a1 = np.exp(-np.sqrt(2) * np.pi / length)
+    b1 = 2 * a1 * np.cos(np.sqrt(2) * np.pi / length)
+    c3 = -a1**2
+    c2 = b1
+    c1 = 1 - c2 - c3
+    
+    ss = np.zeros_like(src_clean, dtype=float)
+    ss[0] = src_clean.iloc[0] if not pd.isna(src_clean.iloc[0]) else 0
+    ss[1] = src_clean.iloc[1] if not pd.isna(src_clean.iloc[1]) else ss[0]
+    for i in range(2, len(src_clean)):
+        ss[i] = c1 * (src_clean.iloc[i] if not pd.isna(src_clean.iloc[i]) else ss[i-1]) + c2 * ss[i-1] + c3 * ss[i-2]
+    
+    result = pd.Series(ss, index=src_clean.index).replace([np.inf, -np.inf, np.nan], np.nan).ffill().bfill()
+    
+    if apply_savgol and len(result) >= 5:
+        window_length = 5 if len(result) >= 5 else len(result)
+        if window_length % 2 == 0:
+            window_length += 1
+        polyorder = 1
+        try:
+            result = pd.Series(savgol_filter(result, window_length=window_length, polyorder=polyorder), index=result.index)
+        except ValueError as e:
+            logger.warning(f"Savitzky-Golay filter failed: {str(e)}. Using raw supersmoother result.")
+            result = result
+    
+    if result.isna().any():
+        result = result.interpolate(method='linear', limit=2).ffill().bfill()
+    
+    logger.debug(f"Supersmoother output sample: {result.head().tolist()}, NaN count: {result.isna().sum()}")
+    return result
+
+def williams_r(high, low, close, lookback=14):
+    highest_high = high.rolling(window=lookback, min_periods=1).max()
+    lowest_low = low.rolling(window=lookback, min_periods=1).min()
+    denominator = highest_high - lowest_low
+    denominator = denominator.replace(0, np.nan)
+    wr = -100 * ((highest_high - close) / denominator)
+    return wr.fillna(-50).replace([np.inf, -np.inf], -50)
+
+def stochastic_oscillator(df, k_period=14, d_period=3):
+    low_min = df['low'].rolling(k_period).min()
+    high_max = df['high'].rolling(k_period).max()
+    df['%K'] = 100 * ((df['close'] - low_min) / (high_max - low_min))
+    df['%K'] = df['%K'].fillna(50)
+    df['%D'] = df['%K'].rolling(d_period).mean()
+    return df
+
+def get_historical_data(ib, bar_size, exchange='SMART', currency='USD', backtest=False):
+    contract = Stock(GlobalConfig.symbol, exchange, currency)
+    ib.qualifyContracts(contract)
+    if backtest:
+        logger.info(f"Requesting historical data for {GlobalConfig.symbol} ({GlobalConfig.durationStr}, {bar_size})")
+        bars = ib.reqHistoricalData(
+            contract,
+            endDateTime='',
+            durationStr=GlobalConfig.durationStr,
+            barSizeSetting=bar_size,
+            whatToShow='TRADES',
+            useRTH=True,
+            formatDate=2,
+            keepUpToDate=False
+        )
+        
+        if not bars:
+            logger.error(f"No historical data received from IBKR for {bar_size}")
+            return None
+        
+        df = util.df(bars)
+        if df.empty:
+            logger.error(f"Empty DataFrame received from IBKR for {bar_size}")
+            return None
+
+        logger.debug(f"Raw data shape for {bar_size}: {df.shape}, Columns: {df.columns.tolist()}")
+
+        df['date'] = pd.to_datetime(df['date'], utc=True)
+        df.set_index('date', inplace=True)
+        df.index = df.index.tz_convert('America/New_York')
+
+        required_cols = ['open', 'high', 'low', 'close', 'volume']
+        for col in required_cols:
+            if col not in df.columns:
+                logger.error(f"Missing column {col} for {bar_size}")
+                return None
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            if df[col].isna().all():
+                logger.error(f"Column {col} contains only NaN values after conversion for {bar_size}")
+                return None
+            volatility = df['close'].std() / df['close'].mean() if not df['close'].empty else 0
+            clipping_std = 2 if volatility > GlobalConfig.volatility_threshold else 3
+            col_mean = df[col].mean()
+            col_std = df[col].std()
+            if col_std > 0:
+                df[col] = df[col].clip(col_mean - clipping_std * col_std, col_mean + clipping_std * col_std)
+            df[col] = df[col].interpolate(method='linear', limit=2).ffill().bfill()
+            logger.debug(f"{col} - NaN count for {bar_size}: {df[col].isna().sum()}, Sample: {df[col].head().tolist()}")
+
+        logger.debug(f"DataFrame shape for {bar_size}: {df.shape}, Index range: {df.index.min()} to {df.index.max()}")
+
+        df['hlc3'] = (df['high'] + df['low'] + df['close']) / 3
+        hlc3_mean = df['hlc3'].mean()
+        hlc3_std = df['hlc3'].std()
+        if hlc3_std > 0:
+            df['hlc3'] = df['hlc3'].clip(hlc3_mean - clipping_std * hlc3_std, hlc3_mean + clipping_std * hlc3_std)
+
+        df = calculate_mrc_with_gradient(df)
+        df = calculate_adx(df)
+        df = stochastic_oscillator(df)
+        df['VWAP'] = (df['hlc3'] * df['volume']).groupby(df.index.date).cumsum() / df['volume'].groupby(df.index.date).cumsum()
+        
+        exp12 = df['close'].ewm(span=12, adjust=False).mean()
+        exp26 = df['close'].ewm(span=26, adjust=False).mean()
+        df['MACD'] = exp12 - exp26
+        df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+        df['Histogram'] = df['MACD'] - df['Signal']
+        
+        df['RSI'] = calculate_rsi(df['close'])
+        df['Williams_%R'] = williams_r(df['high'], df['low'], df['close'])
+        df['ATR'] = df['tr'].rolling(14).mean().replace([np.inf, -np.inf, np.nan], 0).ffill().bfill()
+        df['volume_ma'] = df['volume'].rolling(20).mean().replace([np.inf, -np.inf, np.nan], 0).ffill().bfill()
+        df['SMA_20'] = df['close'].rolling(20).mean().replace([np.inf, -np.inf, np.nan], 0).ffill().bfill()
+
+        shifted_cols = ['close', 'RSI', 'Williams_%R', 'VWAP', 'MACD', 'Signal', 'adx', '+di', '-di', '%K', '%D', 'volume_ma', 'SMA_20', 'ATR']
+        for col in shifted_cols:
+            if col not in df.columns:
+                logger.error(f"Cannot shift missing column: {col} for {bar_size}")
+                return None
+            df[f'{col}_shifted'] = df[col].shift(1).ffill().bfill()
+            logger.debug(f"{col}_shifted - NaN count for {bar_size}: {df[f'{col}_shifted'].isna().sum()}, Sample: {df[f'{col}_shifted'].head().tolist()}")
+
+        logger.info(f"Processed historical data with {len(df)} rows for {bar_size}, Index range: {df.index.min()} to {df.index.max()}")
+        return df
+    return None
+
+def calculate_macd(close, fast=12, slow=26, signal=9):
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    macd = ema_fast - ema_slow
+    signal_line = macd.ewm(span=signal, adjust=False).mean()
+    histogram = macd - signal_line
+    return macd, signal_line, histogram
+
+def calculate_williams_r(high, low, close, period=14):
+    highest_high = high.rolling(window=period).max()
+    lowest_low = low.rolling(window=period).min()
+    return -100 * (highest_high - close) / (highest_high - lowest_low)
+
+def calculate_adx(df, window=14):
+    high = df['high']
+    low = df['low']
+    close = df['close']
+    tr = np.maximum(high - low, np.maximum(np.abs(high - close.shift().bfill()), np.abs(low - close.shift().bfill())))
+    up_move = high.diff()
+    down_move = -low.diff()
+    tr_smooth = tr.ewm(alpha=1/window, adjust=False).mean()
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+    plus_di = 100 * (plus_dm.ewm(alpha=1/window, adjust=False).mean() / tr_smooth)
+    minus_di = 100 * (minus_dm.ewm(alpha=1/window, adjust=False).mean() / tr_smooth)
+    di_diff = np.abs(plus_di - minus_di)
+    di_sum = (plus_di + minus_di).replace(0, 1e-8)
+    dx = 100 * (di_diff / di_sum)
+    adx = dx.ewm(alpha=1/window, adjust=False).mean().clip(0, 100)
+    df['adx'] = adx
+    df['+di'] = plus_di
+    df['-di'] = minus_di
+    df['adx_shifted'] = adx.shift(1).fillna(0)
+    return df
+
+def calculate_rsi(close, period=14):
+    delta = close.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def calculate_plus_di(high, low, close, period=14):
+    plus_dm = (high - high.shift()).where((high - high.shift()) > (low.shift() - low), 0)
+    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(window=period).mean()
+    return 100 * plus_dm.rolling(window=period).mean() / atr
+
+def calculate_minus_di(high, low, close, period=14):
+    minus_dm = (low.shift() - low).where((low.shift() - low) > (high - high.shift()), 0)
+    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(window=period).mean()
+    return 100 * minus_dm.rolling(window=period).mean() / atr
+
+def calculate_stoch(high, low, close, k_period=14, d_period=3):
+    lowest_low = low.rolling(window=k_period).min()
+    highest_high = high.rolling(window=k_period).max()
+    k = 100 * (close - lowest_low) / (highest_high - lowest_low)
+    d = k.rolling(window=d_period).mean()
+    return k, d
+
+def calculate_vwap(high, low, close, volume):
+    typical_price = (high + low + close) / 3
+    vwap = (typical_price * volume).cumsum() / volume.cumsum()
+    return vwap
+
+def plot_candlestick(df, bar_size, backtest=False):
+    if df is None or df.empty:
+        logger.error(f"Cannot plot: DataFrame is None or empty for {bar_size}")
+        return
+
+    required_cols = ['open', 'high', 'low', 'close', 'volume', 'meanline'] + \
+                    [f'upband_{level}' for level in GlobalConfig.gradient_levels] + \
+                    [f'loband_{level}' for level in GlobalConfig.gradient_levels]
+    indicator_cols = ['MACD', 'Signal', 'Histogram', 'RSI', 'Williams_%R', 'adx', '%K', '%D', 'volume']
+
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        logger.error(f"Missing required columns for {bar_size}: {missing_cols}")
+        return
+
+    for col in required_cols:
+        df[col] = pd.to_numeric(df[col], errors='coerce').replace([np.inf, -np.inf], np.nan).ffill().bfill()
+        if df[col].isna().all():
+            logger.error(f"Column {col} contains only NaN values after processing for {bar_size}")
+            return
+        logger.debug(f"{col} - NaN count for {bar_size}: {df[col].isna().sum()}, Sample: {df[col].head().tolist()}")
+
+    if df.index.tz != pytz.timezone('America/New_York'):
+        df.index = df.index.tz_convert('America/New_York')
+    df = df.sort_index()
+
+    if len(df) < 1:
+        logger.error(f"DataFrame has insufficient rows after sorting for {bar_size}")
+        return
+
+    style = mpf.make_mpf_style(
+        base_mpf_style='classic',
+        marketcolors=mpf.make_marketcolors(up='#00FF00', down='#FF0000', edge='black', wick='black', volume='gray'),
+        gridstyle=':', gridcolor='gray', facecolor='white'
+    )
+
+    addplots = []
+    panels_used = set()
+
+    if 'volume' in df.columns and not df['volume'].isna().all():
+        addplots.append(mpf.make_addplot(df['volume'], panel=1, type='bar', color='gray', ylabel='Volume'))
+        panels_used.add(1)
+
+    if all(col in df.columns for col in ['MACD', 'Signal', 'Histogram']) and not df[['MACD', 'Signal', 'Histogram']].isna().all().all():
+        addplots.extend([
+            mpf.make_addplot(df['MACD'], panel=2, color='#1f77b4', width=1.5, ylabel='MACD'),
+            mpf.make_addplot(df['Signal'], panel=2, color='#ff7f0e', width=1.5),
+            mpf.make_addplot(df['Histogram'], panel=2, type='bar', color=np.where(df['Histogram'] >= 0, '#5cb85c', '#d62728'), alpha=0.6)
+        ])
+        panels_used.add(2)
+
+    if 'RSI' in df.columns and not df['RSI'].isna().all():
+        addplots.append(mpf.make_addplot(df['RSI'], panel=3, color='#4B0082', width=1.5, ylim=(0, 100), ylabel='RSI'))
+        panels_used.add(3)
+
+    if 'Williams_%R' in df.columns and not df['Williams_%R'].isna().all():
+        addplots.append(mpf.make_addplot(df['Williams_%R'], panel=4, color='#9467bd', width=1.5, ylim=(-100, 0), ylabel='Williams %R'))
+        panels_used.add(4)
+
+    if 'adx' in df.columns and not df['adx'].isna().all():
+        addplots.append(mpf.make_addplot(df['adx'], panel=5, color='#2ca02c', width=1.5, ylim=(0, 100), ylabel='ADX'))
+        panels_used.add(5)
+
+    if all(col in df.columns for col in ['%K', '%D']) and not df[['%K', '%D']].isna().all().all():
+        addplots.extend([
+            mpf.make_addplot(df['%K'], panel=6, color='#8c564b', width=1.5, ylabel='Stochastic'),
+            mpf.make_addplot(df['%D'], panel=6, color='#e377c2', width=1.5)
+        ])
+        panels_used.add(6)
+
+    num_panels = 1 + len(panels_used)
+    panel_ratios = [10] + [3] * len(panels_used)
+
+    try:
+        fig, axlist = mpf.plot(
+            df[['open', 'high', 'low', 'close']],
+            type='candle',
+            style=style,
+            addplot=addplots,
+            volume=False,
+            panel_ratios=tuple(panel_ratios),
+            figsize=(20, 8 + 2 * len(panels_used)),
+            title=f'{GlobalConfig.symbol} Candlestick Chart - {bar_size} (Backtest: {backtest})',
+            returnfig=True,
+            datetime_format='%Y-%m-%d %H:%M'
+        )
+
+        plot_mrc_gradient(axlist[0], df, bar_size)
+
+        for i, ax in enumerate(axlist):
+            ax.set_facecolor('white')
+            ax.grid(True, color='gray', linestyle=':', linewidth=0.5, alpha=0.5)
+            ax.tick_params(colors='black', labelsize=8)
+            ax.xaxis.set_major_formatter(DateFormatter('%H:%M'))
+            ax.set_xlim(df.index[0], df.index[-1])
+
+        y_min = min(df['low'].min(), df[[f'loband_{level}' for level in GlobalConfig.gradient_levels]].min().min()) * 0.95
+        y_max = max(df['high'].max(), df[[f'upband_{level}' for level in GlobalConfig.gradient_levels]].max().max()) * 1.05
+        axlist[0].set_ylim(y_min, y_max)
+
+        fig.set_facecolor('white')
+        plt.tight_layout(pad=2.0)
+        logger.info(f"Chart plotted successfully for {bar_size}")
+        plt.show()
+    except Exception as e:
+        logger.error(f"Failed to plot candlestick chart for {bar_size}: {str(e)}", exc_info=True)
+
+def plot_mrc_gradient(ax, df, time_frame):
+    meanline = supersmoother(df['hlc3'], length=200, apply_savgol=True).replace([np.inf, -np.inf, np.nan, 0], np.nan).ffill().bfill()
+    if meanline.empty or meanline.isna().all():
+        logger.error(f"Meanline data is empty or contains only NaN values for {time_frame}")
+        return
+
+    ax.plot(df.index, meanline, color='purple', linestyle='-', linewidth=2.5, zorder=15, label='Meanline (Supersmoother)', 
+            path_effects=[pe.Stroke(linewidth=3.5, foreground='purple', alpha=0.3), pe.Normal()], 
+            antialiased=True)
+
+    norm = Normalize(vmin=min(GlobalConfig.gradient_levels), vmax=max(GlobalConfig.gradient_levels))
+    price_min = df['low'].quantile(0.05)
+    price_max = df['high'].quantile(0.95)
+
+    num_points = len(df.index)
+    for i in range(len(GlobalConfig.gradient_levels)):
+        level = GlobalConfig.gradient_levels[i]
+        upper_band = df[f'upband_{level}'].replace([np.inf, -np.inf, np.nan, 0], np.nan).ffill().bfill()
+        lower_band = df[f'loband_{level}'].replace([np.inf, -np.inf, np.nan, 0], np.nan).ffill().bfill()
+        color = mrc_cmap(norm(level))
+
+        logger.debug(f"Upband_{level} for plotting at 15:00 for {time_frame}: {upper_band.loc[upper_band.index.time == time(15, 0)].tolist() if not upper_band.empty else 'Empty'}")
+
+        upper_band = np.clip(upper_band, price_min, price_max)
+        lower_band = np.clip(lower_band, price_min, price_max)
+
+        upper_band_interpolated = np.interp(np.linspace(0, len(upper_band)-1, num_points), np.arange(len(upper_band)), upper_band)
+        lower_band_interpolated = np.interp(np.linspace(0, len(lower_band)-1, num_points), np.arange(len(lower_band)), lower_band)
+        meanline_interpolated = np.interp(np.linspace(0, len(meanline)-1, num_points), np.arange(len(meanline)), meanline)
+
+        if i == 0:
+            ax.fill_between(df.index, meanline_interpolated, upper_band_interpolated, color=color, alpha=0.5, zorder=2 + i, label=f'Level {level}', 
+                            interpolate=True)
+            ax.fill_between(df.index, meanline_interpolated, lower_band_interpolated, color=color, alpha=0.5, zorder=2 + i, 
+                            interpolate=True)
+        else:
+            prev_level = GlobalConfig.gradient_levels[i - 1]
+            prev_upper_band = df[f'upband_{prev_level}'].replace([np.inf, -np.inf, np.nan, 0], np.nan).ffill().bfill()
+            prev_lower_band = df[f'loband_{prev_level}'].replace([np.inf, -np.inf, np.nan, 0], np.nan).ffill().bfill()
+            prev_upper_band = np.clip(prev_upper_band, price_min, price_max)
+            prev_lower_band = np.clip(prev_lower_band, price_min, price_max)
+            prev_upper_band_interpolated = np.interp(np.linspace(0, len(prev_upper_band)-1, num_points), np.arange(len(prev_upper_band)), prev_upper_band)
+            prev_lower_band_interpolated = np.interp(np.linspace(0, len(prev_lower_band)-1, num_points), np.arange(len(prev_lower_band)), prev_lower_band)
+
+            ax.fill_between(df.index, prev_upper_band_interpolated, upper_band_interpolated, color=color, alpha=0.5, zorder=2 + i, label=f'Level {level}', 
+                            interpolate=True)
+            ax.fill_between(df.index, prev_lower_band_interpolated, lower_band_interpolated, color=color, alpha=0.5, zorder=2 + i, 
+                            interpolate=True)
+
+    ax.legend(loc='upper left', fontsize=8, bbox_to_anchor=(0, 1))
+    ax.set_ylim(price_min * 0.95, price_max * 1.05)
+    ax.set_xlim(df.index[0], df.index[-1])
+
+def print_backtest_report(metrics, bar_size, strategy_name):
+    print(f"\n=== {strategy_name} Performance Report - {bar_size} ===")
+    print("\nOverall Metrics:")
+    for key, value in metrics['overall'].items():
+        print(f"  {key.replace('_', ' ').title()}: {value if value != float('inf') else '∞'}")
+
+    print("\nPerformance by Exit Strategy:")
+    for strategy, stats in metrics['by_exit_strategy'].items():
+        print(f"  {strategy}:")
+        for key, value in stats.items():
+            print(f"    {key.replace('_', ' ').title()}: {value if value != float('inf') else '∞'}")
+
+    print("\nHolding Periods (hours):")
+    print(f"  Winning Trades: {metrics['holding_periods']['winning']}")
+    print(f"  Losing Trades: {metrics['holding_periods']['losing']}")
+    print("  By Exit Strategy:")
+    for strategy, hours in metrics['holding_periods']['by_exit_strategy'].items():
+        print(f"    {strategy}: {hours}")
+
+    print("\nVolatility Metrics:")
+    print(f"  Average ATR: {metrics['volatility']['avg_atr']}")
+    print(f"  PnL-Volatility Correlation: {metrics['volatility']['pnl_volatility_correlation']}")
+
+def execute_entry(strategy_id, engine, price, timestamp, position_size, row):
+    timestamp = enforce_ny_timezone(pd.to_datetime(timestamp))
+    shares = max(0.01, round(position_size / price, 2))
+    if not np.isfinite(shares):
+        logger.error(f"Strategy #{strategy_id}: Invalid share calculation")
+        return None
+    trade = engine.execute_trade(price=price, shares=shares, action='BUY', timestamp=timestamp, row=row)
+    if trade:
+        log_trade(trade)
+    return trade
+
+def execute_exit(strategy_id, engine, price, timestamp, exit_type, row):
+    if not engine.current_position:
+        logger.warning(f"Strategy #{strategy_id}: Exit attempted with no position")
+        return None
+    timestamp = enforce_ny_timezone(pd.to_datetime(timestamp))
+    position = engine.current_position
+    exit_shares = min(position['shares'], engine.max_position_size)
+    trade = engine.execute_trade(price=price, shares=exit_shares, action='SELL', timestamp=timestamp, exit_type=exit_type, row=row)
+    if trade:
+        log_trade(trade)
+    return trade
+
+def run_backtest(df, bar_size):
+    engines = {
+        '1': BacktestEngine('1', 'time_based'),
+        '2': BacktestEngine('2', 'signal_score'),
+        '3': BacktestEngine('3', 'volatility_breakout')
+    }
+    
+    for index, row in df.iterrows():
+        if not is_market_close(index):
+            for strat_id, engine in engines.items():
+                if check_entry_conditions(df, index, engine):
+                    execute_entry(strat_id, engine, row['close'], index, engine.calculate_position_size(row), row)
+                elif engine.current_position:
+                    exit_type = check_exit_conditions(df, index, engine)
+                    if exit_type or index == df.index[-1]:
+                        execute_exit(strat_id, engine, row['close'], index, exit_type or 'End of Data', row)
+                else:
+                    non_trade_data = {
+                        'strategy_id': strat_id,
+                        'timestamp': index,
+                        'action': 'NONE',
+                        'price': row['close'],
+                        'shares': 0,
+                        'position_value': 0,
+                        'pnl': 0.0,
+                        'pnl_pct': 0.0,
+                        'balance_before': engine.balance,
+                        'balance_after': engine.balance,
+                        'exit_type': None
+                    }
+                    non_trade_data.update(row.to_dict())
+                    engine.backtest_data.append(non_trade_data)
+
+    for strat_id, engine in engines.items():
+        logger.info(f"Strategy #{strat_id} ({GlobalConfig.STRATEGIES[strat_id]}) completed with {len(engine.trade_history)} trades for {bar_size}")
+    return engines, df
+
+def run_multi_timeframe_backtest(ib):
+    results = []
+    for bar_size in GlobalConfig.BAR_SIZES:
+        logger.info(f"\nStarting backtest for bar size: {bar_size}")
+        daily_data = get_historical_data(ib, bar_size, backtest=True)
+        if daily_data is None or daily_data.empty:
+            logger.error(f"Skipping backtest for {bar_size} due to data retrieval failure")
+            continue
+        
+        required_cols = ['open', 'high', 'low', 'close', 'volume', 'meanline'] + \
+                       [f'upband_{level}' for level in GlobalConfig.gradient_levels] + \
+                       [f'loband_{level}' for level in GlobalConfig.gradient_levels] + \
+                       ['MACD', 'Signal', 'Histogram', 'RSI', 'Williams_%R', 'adx', '%K', '%D', 'VWAP', 'ATR']
+        missing = [col for col in required_cols if col not in daily_data.columns]
+        if missing:
+            logger.error(f"Skipping backtest for {bar_size} due to missing columns: {missing}")
+            continue
+        
+        engines, daily_data = run_backtest(daily_data, bar_size)
+        if daily_data is None or daily_data.empty:
+            logger.error(f"Data became invalid after backtest for {bar_size}")
+            continue
+        
+        logger.debug(f"Data shape for {bar_size}: {daily_data.shape}")
+        logger.debug(f"Columns available for {bar_size}: {daily_data.columns.tolist()}")
+        
+        # Optionally plot candlestick chart for each bar size (comment out if not needed due to volume of plots)
+        # plot_candlestick(daily_data, bar_size, backtest=True)
+
+        trade_histories = {strat_id: engine.trade_history for strat_id, engine in engines.items()}
+        metrics = {}
+        for strat_id, trades in trade_histories.items():
+            strat_name = f"Strategy #{strat_id} ({GlobalConfig.STRATEGIES[strat_id]})"
+            metrics[strat_name] = calculate_day_metrics(trades)
+            print_backtest_report(metrics[strat_name], bar_size, strat_name)
+
+            # Store results for aggregation
+            results.append({
+                'bar_size': bar_size,
+                'strategy': strat_name,
+                'total_pnl': metrics[strat_name]['overall']['total_pnl'],
+                'sharpe_ratio': metrics[strat_name]['overall']['sharpe_ratio'],
+                'profit_factor': metrics[strat_name]['overall']['profit_factor'],
+                'num_trades': metrics[strat_name]['overall']['num_trades'],
+                'win_rate': metrics[strat_name]['overall']['win_rate'],
+                'max_drawdown': metrics[strat_name]['overall']['max_drawdown'],
+                'avg_holding_hours': metrics[strat_name]['overall']['avg_holding_hours']
+            })
+
+            # Export backtest data to CSV
+            backtest_df = pd.DataFrame(engines[strat_id].backtest_data)
+            backtest_df['timestamp'] = pd.to_datetime(backtest_df['timestamp']).dt.tz_convert('America/New_York')
+            filename = f'backtest_raw_data_strategy_{strat_id}_{bar_size.replace(" ", "_")}.csv'
+            backtest_df.to_csv(filename, index=False)
+            logger.info(f"Strategy #{strat_id} data exported to '{filename}' for {bar_size}")
+
+    # Aggregate and highlight best combinations
+    if results:
+        print("\n=== Multi-Timeframe Backtest Summary ===")
+        results_df = pd.DataFrame(results)
+        
+        # Best by Total PnL
+        best_pnl = results_df.loc[results_df['total_pnl'].idxmax()]
+        print(f"\nBest Total PnL: {best_pnl['strategy']} on {best_pnl['bar_size']}")
+        print(f"  Total PnL: ${best_pnl['total_pnl']:.2f}")
+        print(f"  Sharpe Ratio: {best_pnl['sharpe_ratio']:.2f}")
+        print(f"  Profit Factor: {best_pnl['profit_factor']:.2f}")
+        print(f"  Number of Trades: {best_pnl['num_trades']}")
+        print(f"  Win Rate: {best_pnl['win_rate']:.2f}%")
+        print(f"  Max Drawdown: {best_pnl['max_drawdown']:.2f}%")
+        print(f"  Avg Holding Hours: {best_pnl['avg_holding_hours']:.2f}")
+
+        # Best by Sharpe Ratio
+        best_sharpe = results_df.loc[results_df['sharpe_ratio'].idxmax()]
+        print(f"\nBest Sharpe Ratio: {best_sharpe['strategy']} on {best_sharpe['bar_size']}")
+        print(f"  Total PnL: ${best_sharpe['total_pnl']:.2f}")
+        print(f"  Sharpe Ratio: {best_sharpe['sharpe_ratio']:.2f}")
+        print(f"  Profit Factor: {best_sharpe['profit_factor']:.2f}")
+        print(f"  Number of Trades: {best_sharpe['num_trades']}")
+        print(f"  Win Rate: {best_sharpe['win_rate']:.2f}%")
+        print(f"  Max Drawdown: {best_sharpe['max_drawdown']:.2f}%")
+        print(f"  Avg Holding Hours: {best_sharpe['avg_holding_hours']:.2f}")
+
+        # Best by Profit Factor
+        best_profit_factor = results_df.loc[results_df['profit_factor'].idxmax()]
+        print(f"\nBest Profit Factor: {best_profit_factor['strategy']} on {best_profit_factor['bar_size']}")
+        print(f"  Total PnL: ${best_profit_factor['total_pnl']:.2f}")
+        print(f"  Sharpe Ratio: {best_profit_factor['sharpe_ratio']:.2f}")
+        print(f"  Profit Factor: {best_profit_factor['profit_factor']:.2f}")
+        print(f"  Number of Trades: {best_profit_factor['num_trades']}")
+        print(f"  Win Rate: {best_profit_factor['win_rate']:.2f}%")
+        print(f"  Max Drawdown: {best_profit_factor['max_drawdown']:.2f}%")
+        print(f"  Avg Holding Hours: {best_profit_factor['avg_holding_hours']:.2f}")
+
+        # Additional Insights
+        print("\nAdditional Insights:")
+        print("Top 5 Performers by Total PnL:")
+        top_pnl = results_df.nlargest(5, 'total_pnl')[['strategy', 'bar_size', 'total_pnl', 'sharpe_ratio', 'profit_factor']]
+        print(top_pnl.to_string(index=False))
+
+        print("\nTop 5 Performers by Sharpe Ratio:")
+        top_sharpe = results_df.nlargest(5, 'sharpe_ratio')[['strategy', 'bar_size', 'total_pnl', 'sharpe_ratio', 'profit_factor']]
+        print(top_sharpe.to_string(index=False))
+
+    return results
+
+# =====================
+# MAIN EXECUTION
+# =====================
+def main():
+    ib = IB()
+    
+    try:
+        ib.connect('127.0.0.1', 7497, clientId=1)
+        logger.info("Connected to IBKR")
+        
+        # Run multi-timeframe backtest
+        results = run_multi_timeframe_backtest(ib)
+        
+        if not results:
+            logger.error("No successful backtests completed across any timeframe")
+            return
+        
+    except Exception as e:
+        logger.error(f"Main execution error: {str(e)}", exc_info=True)
+    finally:
+        if ib.isConnected():
+            ib.disconnect()
+            logger.info("Disconnected from IBKR")
+
+if __name__ == '__main__':
+    main()
