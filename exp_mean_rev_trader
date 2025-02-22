@@ -23,6 +23,9 @@ from matplotlib.dates import DateFormatter
 from scipy.signal import savgol_filter
 import optuna
 from optuna import Trial
+import sys  # Added import for sys
+from concurrent.futures import ThreadPoolExecutor
+
 
 # =====================
 # LOGGING SETUP
@@ -34,42 +37,16 @@ class TradeFormatter(logging.Formatter):
     
     def format(self, record):
         message = super().format(record)
-        message = self.colorize_strategy(message)
-        message = self.colorize_actions(message)
-        message = self.colorize_values(message)
+        if sys.stdout.isatty():
+            if 'BUY' in message:
+                message = f"{self.GREEN}{message}{self.WHITE}"
+            elif 'SELL' in message:
+                message = f"{self.RED}{message}{self.WHITE}"
         return message
 
-    def colorize_strategy(self, message):
-        for strat_id, color in GlobalConfig.STRATEGY_COLORS.items():
-            message = re.sub(rf'#\[{strat_id}\] (BUY|SELL)',
-                           rf'{color}#[{strat_id}] {self.GREEN if "BUY" in message else self.RED}\1{self.WHITE}',
-                           message)
-        return message
-
-    def colorize_actions(self, message):
-        return re.sub(r'#\[\d\] (BUY|SELL)(\s+\|)', 
-                     lambda m: f"{m.group(1)}{m.group(2)}",
-                     message, count=1)
-    
-    def colorize_values(self, message):
-        def color_repl(match):
-            value_str = match.group(1) or match.group(2)
-            try:
-                value = float(value_str)
-                color = self.GREEN if value > 0 else self.RED
-            except:
-                color = self.WHITE
-            return f"{color}{match.group(0)}{self.WHITE}"
-        
-        parts = message.split(' | ')
-        for i, part in enumerate(parts):
-            if part.startswith(('Price:', 'Size:')):
-                continue
-            parts[i] = re.sub(r'\$ *(-?\d+\.\d+)|(-?\d+\.\d+)%', color_repl, part)
-        return ' | '.join(parts)
-
+# Update logging setup in the global section
 root_logger = logging.getLogger()
-root_logger.setLevel(logging.DEBUG)
+root_logger.setLevel(logging.INFO)  # Change from DEBUG to INFO
 for handler in root_logger.handlers[:]:
     root_logger.removeHandler(handler)
 
@@ -84,8 +61,8 @@ logger = logging.getLogger(__name__)
 class GlobalConfig:
     nest_asyncio.apply()
     symbol = 'MSFT'
-    durationStr = '30 D'
-    timeframes = ['1 hour']  # Corrected to timeframes
+    durationStr = '1 D'
+    timeframes = ['5 mins']  # Corrected to timeframes
     currency = 'USD'
     initial_balance = 10000  # Per strategy
     MIN_REQUIRED_BANDS = 2
@@ -186,14 +163,18 @@ class LLDict(MutableMapping):
 # =====================
 def enforce_ny_timezone(timestamp):
     ny_tz = pytz.timezone('America/New_York')
-    if not isinstance(timestamp, pd.Timestamp):
-        timestamp = pd.to_datetime(timestamp)
-    if timestamp.tzinfo is None:
-        logger.debug(f"Localizing naive timestamp {timestamp} to NY timezone")
-        return ny_tz.localize(timestamp)
-    else:
-        logger.debug(f"Converting tz-aware timestamp {timestamp} to NY timezone")
-        return timestamp.tz_convert(ny_tz)
+    try:
+        if not isinstance(timestamp, pd.Timestamp):
+            timestamp = pd.to_datetime(timestamp)
+        if timestamp.tzinfo is None:
+            logger.debug(f"Localizing naive timestamp {timestamp} to NY timezone")
+            return ny_tz.localize(timestamp)
+        else:
+            logger.debug(f"Converting tz-aware timestamp {timestamp} to NY timezone")
+            return timestamp.tz_convert(ny_tz)
+    except Exception as e:
+        logger.error(f"Timezone enforcement failed for {timestamp}: {str(e)}")
+        raise ValueError(f"Invalid timestamp: {timestamp}")
 
 def is_market_close(index):
     ny_tz = pytz.timezone('America/New_York')
@@ -470,7 +451,7 @@ class BacktestEngine:
         }
         self.validate_mode_config()
         self.balance = GlobalConfig.initial_balance  # Each strategy starts with $10,000
-        self.positions = LLDict()  # Independent position tracking
+        self.positions = dict()  # Replace LLDict with dict
         self.trade_history = []  # Independent trade history per strategy
         self.current_position = None
         self.fee_per_share = 0.0035
@@ -492,9 +473,13 @@ class BacktestEngine:
 
     def calculate_position_size(self, row):
         config = self.mode_config[self.mode]
-        risk_capital = self.balance * config['position_risk']
-        combined_vol = (max(0.01, row['meanrange']) * config['volatility_mult'] + row['ATR']) / 2
-        position_size = min(self.max_position_size, risk_capital / combined_vol) * 100
+        risk_capital = self.balance * config['position_risk']  # e.g., 10000 * 0.02 = 200
+        combined_vol = max(0.01, (max(0.01, row['meanrange']) * config['volatility_mult'] + row['ATR']) / 2)
+        # Cap position size to 50% of balance and remove excessive multiplier
+        position_size = min(self.max_position_size, risk_capital / combined_vol, self.balance * 0.5)
+        if not np.isfinite(position_size) or position_size <= 0:
+            logger.warning(f"Strategy #{self.strategy_id}: Invalid position size calculated: {position_size}")
+            return 0
         logger.debug(f"Strategy #{self.strategy_id} - Position size: ${position_size:.2f} (Risk=${risk_capital:.2f}, Vol={combined_vol:.2f})")
         return position_size
 
@@ -588,7 +573,10 @@ class BacktestEngine:
                 trade['pnl_pct'] = 0.0
                 trade['entry_time'] = timestamp
                 logger.info(f"Strategy #{self.strategy_id} - Buy: Price=${price_with_slippage:.2f}, Shares={shares:.2f}, Value=${position_value:.2f}")
-            elif action == 'SELL' and self.current_position:
+            elif action == 'SELL':
+                if not self.current_position:
+                    logger.warning(f"Strategy #{self.strategy_id}: Sell attempted with no position")
+                    return None
                 entry_price = self.current_position['entry_price']
                 entry_value = self.current_position['position_value']
                 entry_time = self.current_position['entry_time']
@@ -691,10 +679,14 @@ class ParameterOptimizer:
                     if exit_type:
                         execute_exit(strategy_id, engine, row['close'], index, exit_type, row)
 
-        metrics = calculate_day_metrics(engine.trade_history)
-        sharpe = metrics['overall']['sharpe_ratio']
-        drawdown = metrics['overall']['max_drawdown']
-        return sharpe - (drawdown * 0.01)
+        try:
+            metrics = calculate_day_metrics(engine.trade_history)
+            sharpe = metrics['overall']['sharpe_ratio']
+            drawdown = metrics['overall']['max_drawdown']
+            return sharpe - (drawdown * 0.01)
+        except Exception as e:
+            logger.error(f"Optimization objective failed for Strategy #{strategy_id}: {str(e)}")
+            return -float('inf')  # Penalize failed trials
 
     def optimize(self):
         """
@@ -778,7 +770,7 @@ class ParameterOptimizer:
 # =====================
 def check_entry_conditions(df, index, engine, row):
     """
-    Check entry conditions using point-in-time data.
+    Check entry conditions using precomputed point-in-time data.
     """
     if str(index.tz) != 'America/New_York':
         raise ValueError(f"Invalid timezone in entry check: {index.tz}")
@@ -797,38 +789,32 @@ def check_entry_conditions(df, index, engine, row):
                 meanrange = row['meanrange_shifted']
                 deviation = (row['close'] - meanline) / meanrange if meanrange > 0 else 0
                 condition_met = deviation < params['threshold']
-                log_details.append(f"Mean Deviation: Value={deviation:.2f}, Threshold={params['threshold']}, "
-                                 f"Met={condition_met}")
+                log_details.append(f"Mean Deviation: Value={deviation:.2f}, Threshold={params['threshold']}, Met={condition_met}")
             elif condition_name == 'rsi':
                 value = row['RSI_shifted']
                 condition_met = value < params['threshold'] if not pd.isna(value) else False
                 log_details.append(f"RSI: Value={value:.2f}, Threshold={params['threshold']}, Met={condition_met}")
             elif condition_name == 'volatility_filter':
-                volatility = row['ATR'] / row['close'] if row['close'] > 0 else float('inf')
+                volatility = row['ATR_shifted'] / row['close'] if row['close'] > 0 else float('inf')
                 condition_met = volatility < params['threshold']
-                log_details.append(f"Volatility: Value={volatility:.2f}, Threshold={params['threshold']}, "
-                                 f"Met={condition_met}")
+                log_details.append(f"Volatility: Value={volatility:.2f}, Threshold={params['threshold']}, Met={condition_met}")
             elif condition_name == 'williams_r':
                 value = row['Williams_%R_shifted']
                 condition_met = value < params['threshold'] if not pd.isna(value) else False
-                log_details.append(f"Williams %R: Value={value:.2f}, Threshold={params['threshold']}, "
-                                 f"Met={condition_met}")
+                log_details.append(f"Williams %R: Value={value:.2f}, Threshold={params['threshold']}, Met={condition_met}")
             elif condition_name == 'macd_histogram':
                 value = row['Histogram_shifted']
                 condition_met = value > params['threshold'] if not pd.isna(value) else False
-                log_details.append(f"MACD Histogram: Value={value:.2f}, Threshold={params['threshold']}, "
-                                 f"Met={condition_met}")
+                log_details.append(f"MACD Histogram: Value={value:.2f}, Threshold={params['threshold']}, Met={condition_met}")
             elif condition_name == 'macd_crossover':
                 condition_met = (row['MACD_shifted'] > row['Signal_shifted'] and 
                                (len(df.loc[:index]) > 1 and 
-                                calculate_point_in_time_indicators(df, df.index[df.index.get_loc(index) - 1])['MACD'] <= 
-                                calculate_point_in_time_indicators(df, df.index[df.index.get_loc(index) - 1])['Signal']))
-                log_details.append(f"MACD Crossover: MACD={row['MACD_shifted']:.2f}, Signal={row['Signal_shifted']:.2f}, "
-                                 f"Met={condition_met}")
+                                df.loc[df.index[df.index.get_loc(index) - 1], 'MACD_shifted'] <= 
+                                df.loc[df.index[df.index.get_loc(index) - 1], 'Signal_shifted']))
+                log_details.append(f"MACD Crossover: MACD={row['MACD_shifted']:.2f}, Signal={row['Signal_shifted']:.2f}, Met={condition_met}")
             elif condition_name == 'vwap':
                 condition_met = row['close'] < row['VWAP_shifted'] if not pd.isna(row['VWAP_shifted']) else False
-                log_details.append(f"VWAP: Close={row['close']:.2f}, VWAP={row['VWAP_shifted']:.2f}, "
-                                 f"Met={condition_met}")
+                log_details.append(f"VWAP: Close={row['close']:.2f}, VWAP={row['VWAP_shifted']:.2f}, Met={condition_met}")
             elif condition_name == 'stoch':
                 k_value = row['%K_shifted']
                 d_value = row['%D_shifted']
@@ -837,10 +823,9 @@ def check_entry_conditions(df, index, engine, row):
                 log_details.append(f"Stochastic: %K={k_value:.2f}, %D={d_value:.2f}, Met={condition_met}")
             elif condition_name == 'atr_breakout':
                 prev_high = df.loc[:index, 'high'].iloc[-2] if len(df.loc[:index]) > 1 else row['high']
-                breakout_level = prev_high + (row['ATR'] * params['multiplier'])
+                breakout_level = prev_high + (row['ATR_shifted'] * params['multiplier'])
                 condition_met = row['close'] > breakout_level
-                log_details.append(f"ATR Breakout: Close={row['close']:.2f}, Level={breakout_level:.2f}, "
-                                 f"Met={condition_met}")
+                log_details.append(f"ATR Breakout: Close={row['close']:.2f}, Level={breakout_level:.2f}, Met={condition_met}")
             elif condition_name == 'adx':
                 value = row['adx_shifted']
                 condition_met = value > params['threshold'] if not pd.isna(value) else False
@@ -848,18 +833,15 @@ def check_entry_conditions(df, index, engine, row):
             elif condition_name == 'di_spread':
                 spread = row['+di_shifted'] - row['-di_shifted']
                 condition_met = spread > params['threshold'] if not pd.isna(spread) else False
-                log_details.append(f"DI Spread: Spread={spread:.2f}, Threshold={params['threshold']}, "
-                                 f"Met={condition_met}")
+                log_details.append(f"DI Spread: Spread={spread:.2f}, Threshold={params['threshold']}, Met={condition_met}")
             elif condition_name == 'volume':
-                condition_met = row['volume'] > row['volume_ma'] if not pd.isna(row['volume_ma']) else False
-                log_details.append(f"Volume: Vol={row['volume']:.0f}, MA={row['volume_ma']:.0f}, "
-                                 f"Met={condition_met}")
+                condition_met = row['volume'] > row['volume_ma_shifted'] if not pd.isna(row['volume_ma_shifted']) else False
+                log_details.append(f"Volume: Vol={row['volume']:.0f}, MA={row['volume_ma_shifted']:.0f}, Met={condition_met}")
             conditions_met += 1 if condition_met else 0
 
         position_ok = engine.balance > 1000 and not engine.current_position
         conditions_met += 1 if position_ok else 0
-        log_details.append(f"Position OK: Balance={engine.balance:.2f}, Has Position={bool(engine.current_position)}, "
-                         f"Met={position_ok}")
+        log_details.append(f"Position OK: Balance={engine.balance:.2f}, Has Position={bool(engine.current_position)}, Met={position_ok}")
 
         time_ok = not is_market_close(index)
         conditions_met += 1 if time_ok else 0
@@ -882,7 +864,7 @@ def check_entry_conditions(df, index, engine, row):
 
 def check_exit_conditions(df, index, engine, row):
     """
-    Check exit conditions using point-in-time data.
+    Check exit conditions using precomputed point-in-time data.
     """
     if str(index.tz) != 'America/New_York':
         raise ValueError(f"Invalid timezone in exit check: {index.tz}")
@@ -903,20 +885,17 @@ def check_exit_conditions(df, index, engine, row):
             if condition_name == 'mean_reversion':
                 deviation = (current_price - row['meanline']) / meanrange if meanrange > 0 else 0
                 if deviation > params['threshold']:
-                    logger.debug(f"Strategy #{engine.strategy_id} - Mean Reversion exit at {index}: "
-                               f"Deviation={deviation:.2f}")
+                    logger.debug(f"Strategy #{engine.strategy_id} - Mean Reversion exit at {index}: Deviation={deviation:.2f}")
                     return 'Mean Reversion'
             elif condition_name == 'stop_loss':
                 deviation = (current_price - entry_price) / meanrange if meanrange > 0 else 0
                 if deviation < params['threshold']:
-                    logger.debug(f"Strategy #{engine.strategy_id} - Stop Loss exit at {index}: "
-                               f"Deviation={deviation:.2f}")
+                    logger.debug(f"Strategy #{engine.strategy_id} - Stop Loss exit at {index}: Deviation={deviation:.2f}")
                     return 'Stop Loss'
             elif condition_name == 'time_limit':
                 time_diff = (current_time - entry_time).total_seconds() / 3600
                 if time_diff >= params['hours']:
-                    logger.debug(f"Strategy #{engine.strategy_id} - Time Limit exit at {index}: "
-                               f"Holding={time_diff:.2f}h")
+                    logger.debug(f"Strategy #{engine.strategy_id} - Time Limit exit at {index}: Holding={time_diff:.2f}h")
                     return f'Time Limit ({params["hours"]}h)'
             elif condition_name == 'signal_score':
                 score = engine.composite_signal_score(row)
@@ -927,15 +906,13 @@ def check_exit_conditions(df, index, engine, row):
                 if 'highest_price' not in engine.current_position:
                     engine.current_position['highest_price'] = entry_price
                 engine.current_position['highest_price'] = max(engine.current_position['highest_price'], current_price)
-                stop_level = engine.current_position['highest_price'] - (row['ATR'] * params['atr_multiplier'])
+                stop_level = engine.current_position['highest_price'] - (row['ATR_shifted'] * params['atr_multiplier'])
                 if current_price <= stop_level:
-                    logger.debug(f"Strategy #{engine.strategy_id} - Trailing Stop exit at {index}: "
-                               f"Price={current_price:.2f}, Stop={stop_level:.2f}")
+                    logger.debug(f"Strategy #{engine.strategy_id} - Trailing Stop exit at {index}: Price={current_price:.2f}, Stop={stop_level:.2f}")
                     return f'Trailing Stop ({params["atr_multiplier"]}x ATR)'
             elif condition_name == 'adx_drop':
                 if row['adx_shifted'] < params['threshold']:
-                    logger.debug(f"Strategy #{engine.strategy_id} - ADX Drop exit at {index}: "
-                               f"ADX={row['adx_shifted']:.2f}")
+                    logger.debug(f"Strategy #{engine.strategy_id} - ADX Drop exit at {index}: ADX={row['adx_shifted']:.2f}")
                     return 'ADX Drop'
         
         return None
@@ -1066,139 +1043,52 @@ def stochastic_oscillator(df, k_period=14, d_period=3):
 
 def calculate_point_in_time_indicators(df, index):
     """
-    Calculate indicators using only data up to the given index.
-    Returns a Series with current values including shifted (previous) values.
+    Return the current row with precomputed indicators from the DataFrame.
     """
-    df_past = df.loc[:index].copy()
-    if df_past.empty:
-        logger.warning(f"No past data available at {index}")
+    try:
+        row = df.loc[index].copy()
+        # Ensure basic columns are numeric
+        for col in ['open', 'high', 'low', 'close', 'volume', 'hlc3', 'tr']:
+            if col in row:
+                row[col] = pd.to_numeric(row[col], errors='coerce')
+        return row
+    except KeyError:
+        logger.warning(f"No data available at index {index}")
         return pd.Series()
-
-    # Current row
-    row = df_past.iloc[-1].copy()
-    
-    # Ensure basic columns are numeric
-    for col in ['open', 'high', 'low', 'close', 'volume', 'hlc3', 'tr']:
-        if col in row:
-            row[col] = pd.to_numeric(row[col], errors='coerce')
-
-    # Previous row for shifted values (if available)
-    prev_row = df_past.iloc[-2] if len(df_past) > 1 else row.copy()
-
-    # ATR
-    row['ATR'] = df_past['tr'].rolling(14, min_periods=1).mean().iloc[-1]
-    row['ATR_shifted'] = prev_row['tr'] if len(df_past) > 1 else row['ATR']
-
-    # Meanrange and Meanline
-    row['meanrange'] = df_past['tr'].rolling(10, min_periods=1).mean().iloc[-1]
-    row['meanrange_shifted'] = prev_row['tr'] if len(df_past) > 1 else row['meanrange']
-    row['meanline'] = supersmoother(df_past['hlc3'], length=50, apply_savgol=False).iloc[-1]
-
-    # RSI
-    row['RSI'] = calculate_rsi(df_past['close']).iloc[-1]
-    row['RSI_shifted'] = calculate_rsi(df_past['close'].iloc[:-1]).iloc[-1] if len(df_past) > 1 else row['RSI']
-
-    # Williams %R
-    row['Williams_%R'] = williams_r(df_past['high'], df_past['low'], df_past['close']).iloc[-1]
-    row['Williams_%R_shifted'] = williams_r(df_past['high'].iloc[:-1], df_past['low'].iloc[:-1], 
-                                            df_past['close'].iloc[:-1]).iloc[-1] if len(df_past) > 1 else row['Williams_%R']
-
-    # MACD
-    macd, signal, hist = calculate_macd(df_past['close'])
-    row['MACD'] = macd.iloc[-1]
-    row['Signal'] = signal.iloc[-1]
-    row['Histogram'] = hist.iloc[-1]
-    if len(df_past) > 1:
-        macd_prev, signal_prev, hist_prev = calculate_macd(df_past['close'].iloc[:-1])
-        row['MACD_shifted'] = macd_prev.iloc[-1]
-        row['Signal_shifted'] = signal_prev.iloc[-1]
-        row['Histogram_shifted'] = hist_prev.iloc[-1]
-    else:
-        row['MACD_shifted'] = row['MACD']
-        row['Signal_shifted'] = row['Signal']
-        row['Histogram_shifted'] = row['Histogram']
-
-    # Stochastic Oscillator
-    df_past = stochastic_oscillator(df_past)
-    row['%K'] = df_past['%K'].iloc[-1]
-    row['%D'] = df_past['%D'].iloc[-1]
-    if len(df_past) > 1:
-        df_prev = stochastic_oscillator(df_past.iloc[:-1])
-        row['%K_shifted'] = df_prev['%K'].iloc[-1]
-        row['%D_shifted'] = df_prev['%D'].iloc[-1]
-    else:
-        row['%K_shifted'] = row['%K']
-        row['%D_shifted'] = row['%D']
-
-    # ADX
-    df_past = calculate_adx(df_past)
-    row['adx'] = df_past['adx'].iloc[-1]
-    row['+di'] = df_past['+di'].iloc[-1]
-    row['-di'] = df_past['-di'].iloc[-1]
-    if len(df_past) > 1:
-        df_prev = calculate_adx(df_past.iloc[:-1])
-        row['adx_shifted'] = df_prev['adx'].iloc[-1]
-        row['+di_shifted'] = df_prev['+di'].iloc[-1]
-        row['-di_shifted'] = df_prev['-di'].iloc[-1]
-    else:
-        row['adx_shifted'] = row['adx']
-        row['+di_shifted'] = row['+di']
-        row['-di_shifted'] = row['-di']
-
-    # VWAP (daily reset)
-    daily_data = df_past.loc[df_past.index.date == index.date()]
-    if not daily_data.empty:
-        daily_typical = (daily_data['hlc3'] * daily_data['volume']).sum()
-        daily_volume = daily_data['volume'].sum()
-        row['VWAP'] = daily_typical / daily_volume if daily_volume > 0 else row['close']
-        if len(df_past) > 1:
-            prev_daily = df_past.loc[df_past.index.date < index.date()]
-            if not prev_daily.empty:
-                prev_typical = (prev_daily['hlc3'] * prev_daily['volume']).sum()
-                prev_volume = prev_daily['volume'].sum()
-                row['VWAP_shifted'] = prev_typical / prev_volume if prev_volume > 0 else prev_row['close']
-            else:
-                row['VWAP_shifted'] = row['VWAP']
-        else:
-            row['VWAP_shifted'] = row['VWAP']
-    else:
-        row['VWAP'] = row['close']
-        row['VWAP_shifted'] = row['close']
-
-    # Volume MA
-    row['volume_ma'] = df_past['volume'].rolling(20, min_periods=1).mean().iloc[-1]
-    row['volume_ma_shifted'] = df_past['volume'].rolling(20, min_periods=1).mean().iloc[-2] if len(df_past) > 1 else row['volume_ma']
-
-    # Shifted close
-    row['close_shifted'] = prev_row['close'] if len(df_past) > 1 else row['close']
-
-    return row
 
 # Updated get_historical_data (remove precomputed indicators)
 def get_historical_data(ib, timeframe, exchange='SMART', currency='USD', backtest=False):
     """
     Retrieve raw historical data for a specific timeframe without precomputed indicators.
     """
+    max_retries = 3
     try:
         contract = Stock(GlobalConfig.symbol, exchange, currency)
         ib.qualifyContracts(contract)
         if backtest:
             logger.info(f"Requesting historical data for {GlobalConfig.symbol} at {timeframe}")
-            bars = ib.reqHistoricalData(
-                contract,
-                endDateTime='',
-                durationStr=GlobalConfig.durationStr,
-                barSizeSetting=timeframe,
-                whatToShow='TRADES',
-                useRTH=True,
-                formatDate=2,
-                keepUpToDate=False
-            )
-            
-            if not bars:
-                logger.error(f"No historical data received from IBKR for {timeframe}")
-                return None
-                
+            for attempt in range(max_retries):
+                try:
+                    bars = ib.reqHistoricalData(
+                        contract,
+                        endDateTime='',
+                        durationStr=GlobalConfig.durationStr,
+                        barSizeSetting=timeframe,
+                        whatToShow='TRADES',
+                        useRTH=True,
+                        formatDate=2,
+                        keepUpToDate=False
+                    )
+                    if not bars:
+                        raise ValueError("No data received from IBKR")
+                    break
+                except Exception as e:
+                    logger.error(f"Attempt {attempt + 1} failed for {timeframe}: {str(e)}")
+                    if attempt == max_retries - 1:
+                        logger.error(f"Failed to fetch data for {timeframe} after {max_retries} attempts")
+                        return None
+                    sleep(2)
+
             df = util.df(bars)
             if df.empty:
                 logger.error(f"Empty DataFrame received from IBKR for {timeframe}")
@@ -1513,194 +1403,103 @@ def execute_exit(strategy_id, engine, price, timestamp, exit_type, row):
         log_trade(trade)
     return trade
 
-def run_backtest(df, timeframe):
+def process_strategy(strat_id, engine, df, index, row):
+    """Helper function to process a single strategy."""
+    try:
+        if check_entry_conditions(df, index, engine, row):
+            position_size = engine.calculate_position_size(row)
+            if position_size > 0:
+                execute_entry(strat_id, engine, row['close'], index, position_size, row)
+        elif engine.current_position:
+            exit_type = check_exit_conditions(df, index, engine, row)
+            if exit_type:
+                execute_exit(strat_id, engine, row['close'], index, exit_type, row)
+    except Exception as e:
+        logger.error(f"Error processing strategy {strat_id} at {index}: {str(e)}")
+
+def run_backtest(df, timeframe, collect_non_trades=False):
     """
-    Run backtest for a specific timeframe with independent strategies using point-in-time data.
+    Run backtest with precomputed indicators for all strategies.
     """
     try:
         if df is None or df.empty:
             logger.error(f"Invalid input data for backtest at {timeframe}")
             return None, None
 
-        logger.debug(f"Starting backtest for {timeframe} with data shape: {df.shape}")
-        logger.debug(f"Data columns for {timeframe}: {df.columns.tolist()}")
+        logger.info(f"Starting backtest for {timeframe} with data shape: {df.shape}")
 
-        # Initialize engines for each strategy
+        # Precompute all required indicators once
+        df = calculate_mrc_with_gradient(df)
+        df['ATR'] = df['tr'].rolling(14, min_periods=1).mean().fillna(0)
+        df = calculate_adx(df)
+        df = stochastic_oscillator(df)
+        df['VWAP'] = (df['hlc3'] * df['volume']).groupby(df.index.date).cumsum() / df['volume'].groupby(df.index.date).cumsum().fillna(df['close'])
+        exp12 = df['close'].ewm(span=12, adjust=False).mean()
+        exp26 = df['close'].ewm(span=26, adjust=False).mean()
+        df['MACD'] = exp12 - exp26
+        df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+        df['Histogram'] = df['MACD'] - df['Signal']
+        df['RSI'] = calculate_rsi(df['close']).fillna(50)
+        df['Williams_%R'] = williams_r(df['high'], df['low'], df['close']).fillna(-50)
+        df['volume_ma'] = df['volume'].rolling(20, min_periods=1).mean().fillna(df['volume'].mean())
+        
+        # Shift all required columns
+        shifted_cols = ['close', 'RSI', 'Williams_%R', 'VWAP', 'MACD', 'Signal', 'Histogram', 'adx', '+di', '-di', '%K', '%D', 'volume_ma', 'ATR', 'meanrange']
+        for col in shifted_cols:
+            if col in df.columns:
+                df[f'{col}_shifted'] = df[col].shift(1).fillna(df[col].mean())
+
         engines = {
             '1': BacktestEngine('1', 'time_based', timeframe),
             '2': BacktestEngine('2', 'signal_score', timeframe),
             '3': BacktestEngine('3', 'volatility_breakout', timeframe)
         }
 
-        required_cols = ['open', 'high', 'low', 'close', 'volume', 'hlc3', 'tr']
+        required_cols = ['open', 'high', 'low', 'close', 'volume', 'hlc3', 'tr', 'meanline', 'meanrange_shifted'] + [f'{col}_shifted' for col in shifted_cols]
         missing_cols = [col for col in required_cols if col not in df.columns]
         if missing_cols:
             logger.error(f"Missing required columns for {timeframe}: {missing_cols}")
             return None, None
 
-        for index, _ in df.iterrows():
-            if pd.isna(index):
-                logger.warning(f"Encountered NaN index at {timeframe}, skipping")
-                continue
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            for index, _ in df.iterrows():
+                if pd.isna(index):
+                    continue
                 
-            logger.debug(f"Processing timestamp for {timeframe}: {index}")
-            if not is_market_close(index):
-                row = calculate_point_in_time_indicators(df, index)
-                for strat_id, engine in engines.items():
-                    try:
-                        if check_entry_conditions(df, index, engine, row):
-                            position_size = engine.calculate_position_size(row)
-                            if position_size > 0:
-                                execute_entry(strat_id, engine, row['close'], index, position_size, row)
-                        elif engine.current_position:
-                            exit_type = check_exit_conditions(df, index, engine, row)
-                            if exit_type:
-                                execute_exit(strat_id, engine, row['close'], index, exit_type, row)
-                        else:
-                            non_trade_data = {
-                                'strategy_id': strat_id,
-                                'timestamp': index,
-                                'action': 'NONE',
-                                'price': row['close'],
-                                'shares': 0,
-                                'position_value': 0,
-                                'pnl': 0.0,
-                                'pnl_pct': 0.0,
-                                'balance_before': engine.balance,
-                                'balance_after': engine.balance,
-                                'exit_type': None
-                            }
-                            non_trade_data.update(row.to_dict())
-                            engine.backtest_data.append(non_trade_data)
-                    except Exception as e:
-                        logger.error(f"Error processing strategy {strat_id} at {timeframe} {index}: {str(e)}",
-                                   exc_info=True)
+                if not is_market_close(index):
+                    row = calculate_point_in_time_indicators(df, index)
+                    futures = {
+                        strat_id: executor.submit(process_strategy, strat_id, engine, df, index, row)
+                        for strat_id, engine in engines.items()
+                    }
+                    for strat_id, future in futures.items():
+                        future.result()
+                    if collect_non_trades:
+                        for strat_id, engine in engines.items():
+                            if not engine.current_position and not any(t['timestamp'] == index and t['action'] != 'NONE' for t in engine.trade_history):
+                                non_trade_data = {
+                                    'strategy_id': strat_id,
+                                    'timestamp': index,
+                                    'action': 'NONE',
+                                    'price': row['close'],
+                                    'shares': 0,
+                                    'position_value': 0,
+                                    'pnl': 0.0,
+                                    'pnl_pct': 0.0,
+                                    'balance_before': engine.balance,
+                                    'balance_after': engine.balance,
+                                    'exit_type': None
+                                }
+                                non_trade_data.update(row.to_dict())
+                                engine.backtest_data.append(non_trade_data)
 
         for strat_id, engine in engines.items():
-            logger.info(f"Strategy #{strat_id} completed for {timeframe} - Trades: {len(engine.trade_history)}, "
-                       f"Balance: ${engine.balance:.2f}")
+            logger.info(f"Strategy #{strat_id} completed for {timeframe} - Trades: {len(engine.trade_history)}, Balance: ${engine.balance:.2f}")
             
         return engines, df
     except Exception as e:
-        logger.error(f"Error in run_backtest for {timeframe}: {str(e)}", exc_info=True)
+        logger.error(f"Error in run_backtest for {timeframe}: {str(e)}")
         return None, None
-
-def run_multi_timeframe_backtest(ib):
-    results = []
-    logger.info(f"Fetching base historical data for {GlobalConfig.symbol} at 1 day")
-    base_data = get_historical_data(ib, '1 day', backtest=True)
-    if base_data is None or base_data.empty:
-        logger.error(f"Failed to retrieve base historical data for 1 day")
-        return results
-
-    for bar_size in GlobalConfig.timeframes:
-        logger.info(f"\nProcessing backtest for bar size: {bar_size}")
-        if bar_size == '1 day':
-            daily_data = base_data
-        else:
-            timeframe_map = {
-                '5 mins': '5T', '15 mins': '15T', '30 mins': '30T', 
-                '1 hour': '1H', '4 hours': '4H', '8 hours': '8H'
-            }
-            resample_rule = timeframe_map.get(bar_size)
-            daily_data = base_data.resample(resample_rule).agg({
-                'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
-            }).dropna()
-            daily_data = get_historical_data(ib, bar_size, backtest=False)
-            if daily_data is None or daily_data.empty:
-                logger.error(f"Skipping backtest for {bar_size} due to resampling failure")
-                continue
-            daily_data = calculate_mrc_with_gradient(daily_data)
-            daily_data = calculate_adx(daily_data)
-            daily_data = stochastic_oscillator(daily_data)
-            daily_data['VWAP'] = (daily_data['hlc3'] * daily_data['volume']).groupby(daily_data.index.date).cumsum() / daily_data['volume'].groupby(daily_data.index.date).cumsum()
-            exp12 = daily_data['close'].ewm(span=12, adjust=False).mean()
-            exp26 = daily_data['close'].ewm(span=26, adjust=False).mean()
-            daily_data['MACD'] = exp12 - exp26
-            daily_data['Signal'] = daily_data['MACD'].ewm(span=9, adjust=False).mean()
-            daily_data['Histogram'] = daily_data['MACD'] - daily_data['Signal']
-            daily_data[['MACD', 'Signal', 'Histogram']] = daily_data[['MACD', 'Signal', 'Histogram']].fillna(0)
-            daily_data['RSI'] = calculate_rsi(daily_data['close']).fillna(50)
-            daily_data['Williams_%R'] = williams_r(daily_data['high'], daily_data['low'], daily_data['close']).fillna(-50)
-            daily_data['ATR'] = daily_data['tr'].rolling(14).mean().replace([np.inf, -np.inf], 0).fillna(0)
-            daily_data['volume_ma'] = daily_data['volume'].rolling(20).mean().fillna(daily_data['volume'].mean())
-            shifted_cols = ['close', 'RSI', 'Williams_%R', 'VWAP', 'MACD', 'Signal', 'Histogram', 'adx', '+di', '-di', '%K', '%D', 'volume_ma', 'ATR']
-            for col in shifted_cols:
-                if col in daily_data.columns:
-                    default_value = 0 if col in ['MACD', 'Signal', 'Histogram'] else daily_data[col].mean()
-                    daily_data[f'{col}_shifted'] = daily_data[col].shift(1).fillna(default_value)
-
-        engines, daily_data = run_backtest(daily_data, bar_size)
-        if engines is None or daily_data is None:
-            logger.error(f"Backtest failed for {bar_size}")
-            continue
-
-        trade_histories = {strat_id: engine.trade_history for strat_id, engine in engines.items()}
-        metrics = {}
-        for strat_id, trades in trade_histories.items():
-            strat_name = f"Strategy #{strat_id} ({GlobalConfig.STRATEGIES[strat_id]})"
-            metrics[strat_name] = calculate_day_metrics(trades)
-            print_backtest_report(metrics[strat_name], bar_size, strat_name)
-            results.append({
-                'bar_size': bar_size,
-                'strategy': strat_name,
-                'total_pnl': metrics[strat_name]['overall']['total_pnl'],
-                'sharpe_ratio': metrics[strat_name]['overall']['sharpe_ratio'],
-                'profit_factor': metrics[strat_name]['overall']['profit_factor'],
-                'num_trades': metrics[strat_name]['overall']['num_trades'],
-                'win_rate': metrics[strat_name]['overall']['win_rate'],
-                'max_drawdown': metrics[strat_name]['overall']['max_drawdown'],
-                'avg_holding_hours': metrics[strat_name]['overall']['avg_holding_hours']
-            })
-            filename = f'backtest_raw_data_strategy_{strat_id}_{bar_size.replace(" ", "_")}.csv'
-            pd.DataFrame(engines[strat_id].backtest_data).to_csv(filename, index=False)
-            logger.info(f"Exported data for {strat_name} at {bar_size} to {filename}")
-
-        sleep(10)
-
-    if results:
-        print("\n=== Multi-Timeframe Backtest Summary ===")
-        results_df = pd.DataFrame(results)
-        best_pnl = results_df.loc[results_df['total_pnl'].idxmax()]
-        print(f"\nBest Total PnL: {best_pnl['strategy']} on {best_pnl['bar_size']}")
-        print(f"  Total PnL: ${best_pnl['total_pnl']:.2f}")
-        print(f"  Sharpe Ratio: {best_pnl['sharpe_ratio']:.2f}")
-        print(f"  Profit Factor: {best_pnl['profit_factor']:.2f}")
-        print(f"  Number of Trades: {best_pnl['num_trades']}")
-        print(f"  Win Rate: {best_pnl['win_rate']:.2f}%")
-        print(f"  Max Drawdown: {best_pnl['max_drawdown']:.2f}%")
-        print(f"  Avg Holding Hours: {best_pnl['avg_holding_hours']:.2f}")
-
-        best_sharpe = results_df.loc[results_df['sharpe_ratio'].idxmax()]
-        print(f"\nBest Sharpe Ratio: {best_sharpe['strategy']} on {best_sharpe['bar_size']}")
-        print(f"  Total PnL: ${best_sharpe['total_pnl']:.2f}")
-        print(f"  Sharpe Ratio: {best_sharpe['sharpe_ratio']:.2f}")
-        print(f"  Profit Factor: {best_sharpe['profit_factor']:.2f}")
-        print(f"  Number of Trades: {best_sharpe['num_trades']}")
-        print(f"  Win Rate: {best_sharpe['win_rate']:.2f}%")
-        print(f"  Max Drawdown: {best_sharpe['max_drawdown']:.2f}%")
-        print(f"  Avg Holding Hours: {best_sharpe['avg_holding_hours']:.2f}")
-
-        best_profit_factor = results_df.loc[results_df['profit_factor'].idxmax()]
-        print(f"\nBest Profit Factor: {best_profit_factor['strategy']} on {best_profit_factor['bar_size']}")
-        print(f"  Total PnL: ${best_profit_factor['total_pnl']:.2f}")
-        print(f"  Sharpe Ratio: {best_profit_factor['sharpe_ratio']:.2f}")
-        print(f"  Profit Factor: {best_profit_factor['profit_factor']:.2f}")
-        print(f"  Number of Trades: {best_profit_factor['num_trades']}")
-        print(f"  Win Rate: {best_profit_factor['win_rate']:.2f}%")
-        print(f"  Max Drawdown: {best_profit_factor['max_drawdown']:.2f}%")
-        print(f"  Avg Holding Hours: {best_profit_factor['avg_holding_hours']:.2f}")
-
-        print("\nAdditional Insights:")
-        print("Top 5 Performers by Total PnL:")
-        top_pnl = results_df.nlargest(5, 'total_pnl')[['strategy', 'bar_size', 'total_pnl', 'sharpe_ratio', 'profit_factor']]
-        print(top_pnl.to_string(index=False))
-
-        print("\nTop 5 Performers by Sharpe Ratio:")
-        top_sharpe = results_df.nlargest(5, 'sharpe_ratio')[['strategy', 'bar_size', 'total_pnl', 'sharpe_ratio', 'profit_factor']]
-        print(top_sharpe.to_string(index=False))
-
-    return results
 
 # =====================
 # MAIN EXECUTION
@@ -1709,8 +1508,18 @@ def main():
     ib = IB()
     try:
         logger.info("Starting main execution")
-        ib.connect('127.0.0.1', 7497, clientId=1)
-        logger.info("Connected to IBKR")
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                ib.connect('127.0.0.1', 7497, clientId=1)
+                logger.info("Connected to IBKR")
+                break
+            except Exception as e:
+                logger.error(f"Connection attempt {attempt + 1} failed: {str(e)}")
+                if attempt == max_retries - 1:
+                    logger.error(f"Failed to connect to IBKR after {max_retries} attempts")
+                    return
+                sleep(2)
 
         all_results = {}
         for timeframe in GlobalConfig.timeframes:
@@ -1719,21 +1528,13 @@ def main():
             if daily_data is None or daily_data.empty:
                 logger.error(f"Failed to retrieve valid historical data for {timeframe}")
                 continue
-
-            logger.info(f"Starting parameter optimization for {timeframe}")
-            optimizer = ParameterOptimizer(daily_data, n_trials=50)
-            best_params = optimizer.optimize()
+            logger.debug(f"Sample data for {timeframe}:\n{daily_data.head().to_string()}")  # Log sample data
 
             logger.debug(f"Pre-backtest data shape for {timeframe}: {daily_data.shape}")
-            engines, daily_data = run_backtest(daily_data, timeframe)
+            engines, daily_data = run_backtest(daily_data, timeframe, collect_non_trades=False)
             if engines is None or daily_data is None:
                 logger.error(f"Backtest execution failed for {timeframe}")
                 continue
-
-            optimizer.apply_best_params(engines)
-
-            logger.info(f"Running final backtest with optimized parameters for {timeframe}")
-            engines, daily_data = run_backtest(daily_data, timeframe)
 
             logger.debug(f"Post-backtest data shape for {timeframe}: {daily_data.shape}")
             plot_candlestick(daily_data, bar_size=timeframe, backtest=True)
@@ -1741,11 +1542,13 @@ def main():
             trade_histories = {strat_id: engine.trade_history for strat_id, engine in engines.items()}
             metrics = {}
             for strat_id, trades in trade_histories.items():
-                metrics[f"Strategy #{strat_id} ({GlobalConfig.STRATEGIES[strat_id]})"] = calculate_day_metrics(trades)
-                print(f"\n=== {strat_id} Final Stats for {timeframe} ===")
+                strat_name = f"Strategy #{strat_id} ({GlobalConfig.STRATEGIES[strat_id]})"
+                metrics[strat_name] = calculate_day_metrics(trades)
+                print(f"\n=== {strat_id} Stats for {timeframe} ===")
                 print(f"Trades: {len(trades)}")
                 print(f"Final Balance: ${engines[strat_id].balance:.2f}")
-                print(f"Optimized Parameters: {best_params[strat_id]}")
+                if not trades:
+                    logger.info(f"No trades executed for Strategy #{strat_id} in {timeframe}. Check entry conditions and data.")
 
             for strat_name, strat_metrics in metrics.items():
                 print(f"\n=== {strat_name} Performance Report for {timeframe} ===")
@@ -1754,13 +1557,65 @@ def main():
             all_results[timeframe] = {'engines': engines, 'metrics': metrics, 'data': daily_data}
 
             for strat_id, engine in engines.items():
-                backtest_df = pd.DataFrame(engine.backtest_data)
-                backtest_df['timestamp'] = pd.to_datetime(backtest_df['timestamp']).dt.tz_convert('America/New_York')
-                filename = f'backtest_raw_data_strategy_{strat_id}_{timeframe.replace(" ", "_")}_optimized.csv'
-                backtest_df.to_csv(filename, index=False)
-                logger.info(f"Exported optimized strategy #{strat_id} data for {timeframe} to {filename}")
+                backtest_df = pd.DataFrame(engine.trade_history)
+                if not backtest_df.empty:
+                    backtest_df['timestamp'] = pd.to_datetime(backtest_df['timestamp']).dt.tz_convert('America/New_York')
+                    filename = f'backtest_raw_data_strategy_{strat_id}_{timeframe.replace(" ", "_")}.csv'
+                    backtest_df.to_csv(filename, index=False)
+                    logger.info(f"Exported strategy #{strat_id} data for {timeframe} to {filename}")
+                else:
+                    logger.info(f"No data to export for Strategy #{strat_id} in {timeframe} (empty trade history)")
 
             sleep(10)  # Add delay to prevent exceeding IBKR pacing limits
+
+        # Summary of all results
+        if all_results:
+            print("\n=== Multi-Timeframe Backtest Summary ===")
+            results_list = []
+            for timeframe, result in all_results.items():
+                for strat_name, strat_metrics in result['metrics'].items():
+                    results_list.append({
+                        'bar_size': timeframe,
+                        'strategy': strat_name,
+                        'total_pnl': strat_metrics['overall']['total_pnl'],
+                        'sharpe_ratio': strat_metrics['overall']['sharpe_ratio'],
+                        'profit_factor': strat_metrics['overall']['profit_factor'],
+                        'num_trades': strat_metrics['overall']['num_trades'],
+                        'win_rate': strat_metrics['overall']['win_rate'],
+                        'max_drawdown': strat_metrics['overall']['max_drawdown'],
+                        'avg_holding_hours': strat_metrics['overall']['avg_holding_hours']
+                    })
+            results_df = pd.DataFrame(results_list)
+            
+            best_pnl = results_df.loc[results_df['total_pnl'].idxmax()]
+            print(f"\nBest Total PnL: {best_pnl['strategy']} on {best_pnl['bar_size']}")
+            print(f"  Total PnL: ${best_pnl['total_pnl']:.2f}")
+            print(f"  Sharpe Ratio: {best_pnl['sharpe_ratio']:.2f}")
+            print(f"  Profit Factor: {best_pnl['profit_factor']:.2f}")
+            print(f"  Number of Trades: {best_pnl['num_trades']}")
+            print(f"  Win Rate: {best_pnl['win_rate']:.2f}%")
+            print(f"  Max Drawdown: {best_pnl['max_drawdown']:.2f}%")
+            print(f"  Avg Holding Hours: {best_pnl['avg_holding_hours']:.2f}")
+
+            best_sharpe = results_df.loc[results_df['sharpe_ratio'].idxmax()]
+            print(f"\nBest Sharpe Ratio: {best_sharpe['strategy']} on {best_sharpe['bar_size']}")
+            print(f"  Total PnL: ${best_sharpe['total_pnl']:.2f}")
+            print(f"  Sharpe Ratio: {best_sharpe['sharpe_ratio']:.2f}")
+            print(f"  Profit Factor: {best_sharpe['profit_factor']:.2f}")
+            print(f"  Number of Trades: {best_sharpe['num_trades']}")
+            print(f"  Win Rate: {best_sharpe['win_rate']:.2f}%")
+            print(f"  Max Drawdown: {best_sharpe['max_drawdown']:.2f}%")
+            print(f"  Avg Holding Hours: {best_sharpe['avg_holding_hours']:.2f}")
+
+            best_profit_factor = results_df.loc[results_df['profit_factor'].idxmax()]
+            print(f"\nBest Profit Factor: {best_profit_factor['strategy']} on {best_profit_factor['bar_size']}")
+            print(f"  Total PnL: ${best_profit_factor['total_pnl']:.2f}")
+            print(f"  Sharpe Ratio: {best_profit_factor['sharpe_ratio']:.2f}")
+            print(f"  Profit Factor: {best_profit_factor['profit_factor']:.2f}")
+            print(f"  Number of Trades: {best_profit_factor['num_trades']}")
+            print(f"  Win Rate: {best_profit_factor['win_rate']:.2f}%")
+            print(f"  Max Drawdown: {best_profit_factor['max_drawdown']:.2f}%")
+            print(f"  Avg Holding Hours: {best_profit_factor['avg_holding_hours']:.2f}")
 
     except Exception as e:
         logger.error(f"Main execution error: {str(e)}", exc_info=True)
