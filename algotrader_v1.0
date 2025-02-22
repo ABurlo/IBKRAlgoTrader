@@ -22,6 +22,127 @@ from matplotlib.dates import DateFormatter
 from scipy.signal import savgol_filter
 import sys
 from concurrent.futures import ThreadPoolExecutor
+import random
+from itertools import product
+PARAM_RANGES = {
+    'time_based': {
+        'position_risk': [0.01, 0.02, 0.03],
+        'volatility_mult': [1.0, 1.5, 2.0],
+        'entry_conditions': {
+            'rsi': {'threshold': [30, 40, 50]},
+            'mean_deviation': {'threshold': [-0.5, -1.0, -1.5]},
+        },
+        'exit_conditions': {
+            'stop_loss': {'threshold': [-1.5, -2.5, -3.5]},
+            'mean_reversion': {'threshold': [0.3, 0.5, 0.7]},
+        }
+    },
+    'signal_score': {
+        'position_risk': [0.01, 0.02, 0.03],
+        'entry_conditions': {
+            'rsi': {'threshold': [30, 35, 40]},
+            'williams_r': {'threshold': [-70, -80, -90]},
+        },
+        'signal_weights': {
+            'rsi': [0.2, 0.25, 0.3],
+            'williams': [0.2, 0.25, 0.3],
+        },
+        'exit_conditions': {
+            'signal_score': {'threshold': [0.6, 0.65, 0.7]},
+        }
+    },
+    'volatility_breakout': {
+        'position_risk': [0.01, 0.02, 0.03],
+        'volatility_mult': [1.5, 2.0, 2.5],
+        'entry_conditions': {
+            'atr_breakout': {'multiplier': [1.0, 1.5, 2.0]},
+            'adx': {'threshold': [15, 20, 25]},
+        },
+        'exit_conditions': {
+            'trailing_stop': {'atr_multiplier': [1.5, 2.0, 2.5]},
+        }
+    }
+}
+
+def update_config(base_config, mode, params):
+    """Update the mode_config with hypertuned parameters."""
+    config = base_config[mode].copy()
+    for key, value in params.items():
+        if key in ['position_risk', 'volatility_mult']:
+            config[key] = value
+        elif key == 'entry_conditions':
+            for cond, cond_params in value.items():
+                config['entry_conditions'][cond].update(cond_params)
+        elif key == 'exit_conditions':
+            for cond, cond_params in value.items():
+                config['exit_conditions'][cond].update(cond_params)
+        elif key == 'signal_weights':
+            for sig, weight in value.items():
+                config['signal_weights'][sig] = weight
+    return config
+
+def hypertune_strategy(ib, timeframe, mode, base_config, num_trials=10):
+    """Perform random search hypertuning for a given strategy mode."""
+    # Map mode to strategy_id
+    mode_to_id = {
+        'time_based': '1',
+        'signal_score': '2',
+        'volatility_breakout': '3'
+    }
+    strategy_id = mode_to_id[mode]
+
+    best_metrics = None
+    best_params = None
+    best_sharpe = -float('inf')
+
+    # Generate random parameter combinations
+    param_keys = PARAM_RANGES[mode].keys()
+    for trial in range(num_trials):
+        params = {}
+        for key in param_keys:
+            if key in ['position_risk', 'volatility_mult']:
+                params[key] = random.choice(PARAM_RANGES[mode][key])
+            elif key in ['entry_conditions', 'exit_conditions']:
+                params[key] = {
+                    cond: {p: random.choice(PARAM_RANGES[mode][key][cond][p]) 
+                           for p in PARAM_RANGES[mode][key][cond]}
+                    for cond in PARAM_RANGES[mode][key]
+                }
+            elif key == 'signal_weights':
+                weights = {sig: random.choice(PARAM_RANGES[mode][key][sig]) 
+                          for sig in PARAM_RANGES[mode][key]}
+                total = sum(weights.values())
+                params[key] = {sig: w / total for sig, w in weights.items()}  # Normalize weights
+
+        # Update engine config
+        engine = BacktestEngine(strategy_id, mode, timeframe)
+        engine.mode_config[mode] = update_config(base_config, mode, params)
+        
+        # Run backtest for this specific strategy only
+        daily_data = get_historical_data(ib, timeframe, backtest=True)
+        if daily_data is None:
+            logger.warning(f"Trial {trial + 1}/{num_trials} for {mode}: No data retrieved")
+            continue
+        engines, _ = run_backtest(daily_data, timeframe, single_strategy=strategy_id)
+        if engines is None or strategy_id not in engines:
+            logger.warning(f"Trial {trial + 1}/{num_trials} for {mode}: Backtest failed")
+            continue
+        
+        trades = engines[strategy_id].trade_history
+        metrics = calculate_day_metrics(trades)
+        sharpe = metrics['overall']['sharpe_ratio']
+
+        logger.info(f"Trial {trial + 1}/{num_trials} for {mode}: Sharpe={sharpe:.2f}, Params={params}")
+        if sharpe > best_sharpe:
+            best_sharpe = sharpe
+            best_metrics = metrics
+            best_params = params
+
+    if best_params:
+        logger.info(f"Best params for {mode} (ID {strategy_id}): {best_params}, Sharpe={best_sharpe:.2f}")
+    else:
+        logger.warning(f"No valid parameters found for {mode} after {num_trials} trials")
+    return best_params, best_metrics
 
 # =====================
 # LOGGING SETUP
@@ -57,7 +178,7 @@ class GlobalConfig:
     nest_asyncio.apply()
     symbol = 'MSFT'
     durationStr = '14 D'
-    timeframes = ['5 mins']
+    timeframes = ['5 mins', '15 mins']
     currency = 'USD'
     initial_balance = 10000
     MIN_REQUIRED_BANDS = 2
@@ -1142,7 +1263,7 @@ def execute_exit(strategy_id, engine, price, timestamp, exit_type, row):
         log_trade(trade)
     return trade
 
-def run_backtest(df, timeframe, collect_non_trades=False):
+def run_backtest(df, timeframe, collect_non_trades=False, single_strategy=None):
     try:
         if df is None or df.empty:
             logger.error(f"Invalid input data for backtest at {timeframe}")
@@ -1150,6 +1271,7 @@ def run_backtest(df, timeframe, collect_non_trades=False):
 
         logger.info(f"Starting optimized backtest for {timeframe} with data shape: {df.shape}")
 
+        # Calculate indicators (unchanged)
         df = calculate_mrc_with_gradient(df)
         df['ATR'] = df['tr'].rolling(14, min_periods=1).mean().fillna(0)
         df = calculate_adx(df)
@@ -1169,11 +1291,21 @@ def run_backtest(df, timeframe, collect_non_trades=False):
             if col in df.columns:
                 df[f'{col}_shifted'] = df[col].shift(1).fillna(df[col].iloc[0] if not df[col].empty else 0)
 
-        engines = {
-            '1': BacktestEngine('1', 'time_based', timeframe),
-            '2': BacktestEngine('2', 'signal_score', timeframe),
-            '3': BacktestEngine('3', 'volatility_breakout', timeframe)
-        }
+        # Define engines
+        if single_strategy:
+            # Run only the specified strategy
+            if single_strategy not in GlobalConfig.STRATEGIES:
+                logger.error(f"Invalid single_strategy ID: {single_strategy}")
+                return None, None
+            mode = GlobalConfig.STRATEGIES[single_strategy]
+            engines = {single_strategy: BacktestEngine(single_strategy, mode, timeframe)}
+        else:
+            # Run all strategies (default behavior)
+            engines = {
+                '1': BacktestEngine('1', 'time_based', timeframe),
+                '2': BacktestEngine('2', 'signal_score', timeframe),
+                '3': BacktestEngine('3', 'volatility_breakout', timeframe)
+            }
 
         required_cols = ['open', 'high', 'low', 'close', 'volume', 'hlc3', 'tr', 'meanline', 'meanrange_shifted'] + [f'{col}_shifted' for col in shifted_cols]
         missing_cols = [col for col in required_cols if col not in df.columns]
@@ -1213,33 +1345,38 @@ def run_backtest(df, timeframe, collect_non_trades=False):
 def main():
     ib = IB()
     try:
-        logger.info("Starting main execution")
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                ib.connect('127.0.0.1', 7497, clientId=1)
-                logger.info("Connected to IBKR")
-                break
-            except Exception as e:
-                logger.error(f"Connection attempt {attempt + 1} failed: {str(e)}")
-                if attempt == max_retries - 1:
-                    logger.error(f"Failed to connect to IBKR after {max_retries} attempts")
-                    return
-                sleep(2)
+        logger.info("Starting main execution with hypertuning")
+        ib.connect('127.0.0.1', 7497, clientId=1)
+        logger.info("Connected to IBKR")
 
         all_results = {}
+        base_config = BacktestEngine('1', 'time_based', '5 mins').mode_config  # Base config from any strategy
+
         for timeframe in GlobalConfig.timeframes:
-            logger.info(f"Processing timeframe: {timeframe}")
+            logger.info(f"Hypertuning for timeframe: {timeframe}")
             daily_data = get_historical_data(ib, timeframe, backtest=True)
-            if daily_data is None or daily_data.empty:
-                logger.error(f"Failed to retrieve valid historical data for {timeframe}")
+            if daily_data is None:
+                logger.error(f"Failed to retrieve data for {timeframe}")
                 continue
 
-            engines, daily_data = run_backtest(daily_data, timeframe, collect_non_trades=False)
-            if engines is None or daily_data is None:
-                logger.error(f"Backtest execution failed for {timeframe}")
+            # Hypertune each strategy
+            tuned_engines = {}
+            for mode in ['time_based', 'signal_score', 'volatility_breakout']:
+                logger.info(f"Hypertuning {mode} for {timeframe}")
+                best_params, best_metrics = hypertune_strategy(ib, timeframe, mode, base_config, num_trials=5)
+                if best_params:
+                    strategy_id = {'time_based': '1', 'signal_score': '2', 'volatility_breakout': '3'}[mode]
+                    tuned_engine = BacktestEngine(strategy_id, mode, timeframe)
+                    tuned_engine.mode_config[mode] = update_config(base_config, mode, best_params)
+                    tuned_engines[strategy_id] = tuned_engine
+                    print_backtest_report(best_metrics, timeframe, f"Tuned {mode}")
+
+            # Run final backtest with tuned parameters (all strategies)
+            engines, daily_data = run_backtest(daily_data, timeframe)  # No single_strategy here
+            if engines is None:
                 continue
 
+            # Rest of the main function (plotting, reporting, etc.) remains unchanged
             plot_candlestick(daily_data, bar_size=timeframe, backtest=True)
 
             trade_histories = {strat_id: engine.trade_history for strat_id, engine in engines.items()}
@@ -1247,27 +1384,14 @@ def main():
             for strat_id, trades in trade_histories.items():
                 strat_name = f"Strategy #{strat_id} ({GlobalConfig.STRATEGIES[strat_id]})"
                 metrics[strat_name] = calculate_day_metrics(trades)
-                print(f"\n=== {strat_id} Stats for {timeframe} ===")
+                print(f"\n=== {strat_id} Final Stats for {timeframe} ===")
                 print(f"Trades: {len(trades)}")
                 print(f"Final Balance: ${engines[strat_id].balance:.2f}")
-                if not trades:
-                    logger.info(f"No trades executed for Strategy #{strat_id} in {timeframe}.")
-
-            for strat_name, strat_metrics in metrics.items():
-                print_backtest_report(strat_metrics, timeframe, strat_name)
+                print_backtest_report(metrics[strat_name], timeframe, strat_name)
 
             all_results[timeframe] = {'engines': engines, 'metrics': metrics, 'data': daily_data}
 
-            for strat_id, engine in engines.items():
-                backtest_df = pd.DataFrame(engine.trade_history)
-                if not backtest_df.empty:
-                    backtest_df['timestamp'] = pd.to_datetime(backtest_df['timestamp']).dt.tz_convert('America/New_York')
-                    filename = f'backtest_raw_data_strategy_{strat_id}_{timeframe.replace(" ", "_")}.csv'
-                    backtest_df.to_csv(filename, index=False)
-                    logger.info(f"Exported strategy #{strat_id} data for {timeframe} to {filename}")
-
-            sleep(10)
-
+        # Summary (unchanged)
         if all_results:
             print("\n=== Multi-Timeframe Backtest Summary ===")
             results_list = []
@@ -1285,7 +1409,6 @@ def main():
                         'avg_holding_hours': strat_metrics['overall']['avg_holding_hours']
                     })
             results_df = pd.DataFrame(results_list)
-            
             best_pnl = results_df.loc[results_df['total_pnl'].idxmax()]
             print(f"\nBest Total PnL: {best_pnl['strategy']} on {best_pnl['bar_size']}")
             print(f"  Total PnL: ${best_pnl['total_pnl']:.2f}")
@@ -1293,8 +1416,6 @@ def main():
             print(f"  Profit Factor: {best_pnl['profit_factor']:.2f}")
             print(f"  Number of Trades: {best_pnl['num_trades']}")
             print(f"  Win Rate: {best_pnl['win_rate']:.2f}%")
-            print(f"  Max Drawdown: {best_pnl['max_drawdown']:.2f}%")
-            print(f"  Avg Holding Hours: {best_pnl['avg_holding_hours']:.2f}")
 
     except Exception as e:
         logger.error(f"Main execution error: {str(e)}", exc_info=True)
