@@ -61,7 +61,7 @@ logger = logging.getLogger(__name__)
 class GlobalConfig:
     nest_asyncio.apply()
     symbol = 'MSFT'
-    durationStr = '1 D'
+    durationStr = '7 D'
     timeframes = ['5 mins']  # Corrected to timeframes
     currency = 'USD'
     initial_balance = 10000  # Per strategy
@@ -1528,7 +1528,7 @@ def main():
             if daily_data is None or daily_data.empty:
                 logger.error(f"Failed to retrieve valid historical data for {timeframe}")
                 continue
-            logger.debug(f"Sample data for {timeframe}:\n{daily_data.head().to_string()}")  # Log sample data
+            logger.debug(f"Sample data for {timeframe}:\n{daily_data.head().to_string()}")
 
             logger.debug(f"Pre-backtest data shape for {timeframe}: {daily_data.shape}")
             engines, daily_data = run_backtest(daily_data, timeframe, collect_non_trades=False)
@@ -1568,7 +1568,7 @@ def main():
 
             sleep(10)  # Add delay to prevent exceeding IBKR pacing limits
 
-        # Summary of all results
+        # Enhanced Multi-Timeframe Summary
         if all_results:
             print("\n=== Multi-Timeframe Backtest Summary ===")
             results_list = []
@@ -1587,6 +1587,7 @@ def main():
                     })
             results_df = pd.DataFrame(results_list)
             
+            # Best Total PnL
             best_pnl = results_df.loc[results_df['total_pnl'].idxmax()]
             print(f"\nBest Total PnL: {best_pnl['strategy']} on {best_pnl['bar_size']}")
             print(f"  Total PnL: ${best_pnl['total_pnl']:.2f}")
@@ -1597,6 +1598,7 @@ def main():
             print(f"  Max Drawdown: {best_pnl['max_drawdown']:.2f}%")
             print(f"  Avg Holding Hours: {best_pnl['avg_holding_hours']:.2f}")
 
+            # Best Sharpe Ratio
             best_sharpe = results_df.loc[results_df['sharpe_ratio'].idxmax()]
             print(f"\nBest Sharpe Ratio: {best_sharpe['strategy']} on {best_sharpe['bar_size']}")
             print(f"  Total PnL: ${best_sharpe['total_pnl']:.2f}")
@@ -1607,6 +1609,7 @@ def main():
             print(f"  Max Drawdown: {best_sharpe['max_drawdown']:.2f}%")
             print(f"  Avg Holding Hours: {best_sharpe['avg_holding_hours']:.2f}")
 
+            # Best Profit Factor
             best_profit_factor = results_df.loc[results_df['profit_factor'].idxmax()]
             print(f"\nBest Profit Factor: {best_profit_factor['strategy']} on {best_profit_factor['bar_size']}")
             print(f"  Total PnL: ${best_profit_factor['total_pnl']:.2f}")
@@ -1616,6 +1619,16 @@ def main():
             print(f"  Win Rate: {best_profit_factor['win_rate']:.2f}%")
             print(f"  Max Drawdown: {best_profit_factor['max_drawdown']:.2f}%")
             print(f"  Avg Holding Hours: {best_profit_factor['avg_holding_hours']:.2f}")
+
+            # Additional Insights
+            print("\nAdditional Insights:")
+            print("Top 5 Performers by Total PnL:")
+            top_pnl = results_df.nlargest(5, 'total_pnl')[['strategy', 'bar_size', 'total_pnl', 'sharpe_ratio', 'profit_factor']]
+            print(top_pnl.to_string(index=False))
+
+            print("\nTop 5 Performers by Sharpe Ratio:")
+            top_sharpe = results_df.nlargest(5, 'sharpe_ratio')[['strategy', 'bar_size', 'total_pnl', 'sharpe_ratio', 'profit_factor']]
+            print(top_sharpe.to_string(index=False))
 
     except Exception as e:
         logger.error(f"Main execution error: {str(e)}", exc_info=True)
