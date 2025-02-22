@@ -27,15 +27,15 @@ from matplotlib.dates import DateFormatter
 class GlobalConfig:
     nest_asyncio.apply()
     symbol = 'TSLA'
-    durationStr='7 D'
-    barSizeSetting='1 hour'
+    durationStr = '30 D'
+    barSizeSetting = '1 hour'
     currency = 'USD'
     initial_balance = 10000
     MIN_REQUIRED_BANDS = 2
     gradient_levels = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
     colors = ['#FF0000', '#FFA500', '#00FF00', '#0000FF']
     outer_levels = ['weak', 'moderate', 'strong']
-    
+
 sns.set_style("whitegrid")
 sns.set_context("notebook")
 sns.set_palette("tab10")
@@ -115,6 +115,9 @@ class LLDict(MutableMapping):
     def __len__(self):
         return self._size
 
+# =====================
+# MARKET CLOSURE WARNING
+# =====================
 def enforce_ny_timezone(timestamp):
     ny_tz = pytz.timezone('America/New_York')
     if not isinstance(timestamp, pd.Timestamp):
@@ -126,9 +129,6 @@ def enforce_ny_timezone(timestamp):
         logger.debug(f"Converting tz-aware timestamp {timestamp} to NY timezone")
         return timestamp.tz_convert(ny_tz)
 
-# =====================
-# MARKET CLOSURE WARNING
-# =====================
 def is_market_close(index):
     ny_tz = pytz.timezone('America/New_York')
     if index.tzinfo is None:
@@ -148,77 +148,8 @@ def is_market_close(index):
     return (market_close_dt - time_delta) <= index <= market_close_dt
 
 # =====================
-# PNL CALENDAR
+# METRICS CALCULATION
 # =====================
-def plot_pnl_calendar(engine, start_date, end_date, initial_balance):
-    ny_tz = pytz.timezone('America/New_York')
-    trade_df = pd.DataFrame(engine.trade_history)
-    
-    if not trade_df.empty and 'timestamp' in trade_df.columns:
-        trade_df['timestamp'] = pd.to_datetime(trade_df['timestamp']).dt.tz_convert(ny_tz)
-        start_date = trade_df['timestamp'].min().normalize()
-        end_date = trade_df['timestamp'].max().normalize()
-    else:
-        logger.warning("No trades available for calendar")
-        return
-
-    current_date = start_date.normalize()
-    while current_date <= end_date:
-        next_month = current_date.replace(day=1) + pd.DateOffset(months=1)
-        month_end = min(next_month - pd.Timedelta(days=1), end_date)
-        all_dates = pd.date_range(start=current_date, end=month_end, freq='D', tz=ny_tz)
-
-        daily_pnl = pd.DataFrame.from_dict(engine.daily_pnl, orient='index', columns=['pnl'])
-        daily_pnl.index = pd.to_datetime(daily_pnl.index).tz_convert(ny_tz)
-        daily_pnl = daily_pnl.reindex(all_dates, fill_value=0).reset_index()
-        daily_pnl.rename(columns={'index': 'date'}, inplace=True)
-
-        fig, ax = plt.subplots(figsize=(16, 28))
-        ax.set_facecolor('white')
-        
-        first_day_of_month = current_date.replace(day=1)
-        first_day_offset = first_day_of_month.weekday()
-        days_in_month = (current_date + pd.offsets.MonthEnd(1)).day
-        num_weeks = ((days_in_month + first_day_offset - 1) // 7) + 1
-
-        for i, row in daily_pnl.iterrows():
-            date = row['date']
-            col = date.weekday()
-            day_of_month = date.day
-            week_num = (day_of_month + first_day_offset - 1) // 7
-            row_pos = -week_num
-
-            if col in [5, 6]:
-                color = '#000000'
-                ax.add_patch(plt.Rectangle((col, row_pos), 1, 1, facecolor=color, edgecolor='gray', lw=0.5))
-            else:
-                day_trades = trade_df[trade_df['timestamp'].dt.date == date.date()].to_dict('records')
-                metrics = calculate_day_metrics(day_trades)
-                
-                if metrics['num_trades'] == 0:
-                    color = '#d3d3d3'
-                else:
-                    max_abs_pnl = abs(daily_pnl['pnl']).max()
-                    color_intensity = min(1, abs(row['pnl']) / max_abs_pnl) if max_abs_pnl > 0 else 0
-                    color = f"#{int((0.8 - color_intensity) * 255):02x}ff{int((0.8 - color_intensity) * 255):02x}"
-
-                ax.add_patch(plt.Rectangle((col, row_pos), 1, 1, facecolor=color, edgecolor='gray', lw=0.5))
-                ax.text(col + 0.05, row_pos + 0.85, str(day_of_month), ha='left', va='top', fontsize=8, color='black')
-                ax.text(col + 0.5, row_pos + 0.5,
-                        f"${row['pnl']:.2f}\nW%: {metrics['win_rate']:.2f}%\nTrades: {metrics['num_trades']}",
-                        ha='center', va='center', fontsize=6, color='black')
-
-        ax.set_xlim(-0.5, 6.5)
-        ax.set_ylim(-num_weeks - 0.5, 0.5)
-        ax.set_xticks(range(7))
-        ax.set_xticklabels(['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'], color='black')
-        ax.set_yticks([])
-        plt.suptitle(f"{GlobalConfig.symbol} Trading Performance {current_date.strftime('%B %Y')} "
-                     f"(Initial Balance: ${initial_balance:.2f})", fontsize=16, color='black')
-        plt.tight_layout()
-        plt.show()
-        current_date = next_month
-
 def calculate_day_metrics(trades, risk_free_rate=0.02):
     """
     Calculate comprehensive daily trading metrics from a list of trade dictionaries.
@@ -266,7 +197,6 @@ def calculate_day_metrics(trades, risk_free_rate=0.02):
             losses += 1
             loss_pnls.append(trade_pnl)
 
-    # Basic Metrics
     win_rate = (wins / num_trades * 100) if num_trades > 0 else 0.0
     win_loss_ratio = (wins / losses) if losses > 0 else float('inf') if wins > 0 else 0.0
     avg_pnl = total_pnl / num_trades if num_trades > 0 else 0.0
@@ -274,28 +204,22 @@ def calculate_day_metrics(trades, risk_free_rate=0.02):
     avg_loss = sum(loss_pnls) / len(loss_pnls) if loss_pnls else 0.0
     profit_factor = sum(win_pnls) / abs(sum(loss_pnls)) if loss_pnls else float('inf') if win_pnls else 0.0
 
-    # Convert pnl_list to numpy array for efficient calculations
     pnl_array = np.array(pnl_list)
-
-    # Sharpe Ratio: (Mean return - Risk-free rate) / Std dev of returns
-    # Assuming daily timeframe, adjust risk-free rate to daily (approx 252 trading days/year)
     daily_rfr = risk_free_rate / 252
     excess_returns = pnl_array - daily_rfr
     mean_excess_return = np.mean(excess_returns)
-    std_dev = np.std(pnl_array, ddof=1) if num_trades > 1 else 0.0  # ddof=1 for sample std dev
-    sharpe_ratio = (mean_excess_return / std_dev) * np.sqrt(252) if std_dev > 0 else 0.0  # Annualized
+    std_dev = np.std(pnl_array, ddof=1) if num_trades > 1 else 0.0
+    sharpe_ratio = (mean_excess_return / std_dev) * np.sqrt(252) if std_dev > 0 else 0.0
 
-    # Sortino Ratio: (Mean return - Risk-free rate) / Downside deviation
     downside_returns = pnl_array[pnl_array < 0]
     downside_dev = np.std(downside_returns, ddof=1) if len(downside_returns) > 1 else 0.0
-    sortino_ratio = (mean_excess_return / downside_dev) * np.sqrt(252) if downside_dev > 0 else 0.0  # Annualized
+    sortino_ratio = (mean_excess_return / downside_dev) * np.sqrt(252) if downside_dev > 0 else 0.0
 
-    # Maximum Drawdown
     if pnl_array.size > 0:
         cumulative_pnl = np.cumsum(pnl_array)
         peak = np.maximum.accumulate(cumulative_pnl)
-        drawdowns = (peak - cumulative_pnl) / (peak + 1e-8)  # Avoid division by zero
-        max_drawdown = np.max(drawdowns) * 100  # As percentage
+        drawdowns = (peak - cumulative_pnl) / (peak + 1e-8)
+        max_drawdown = np.max(drawdowns) * 100
     else:
         max_drawdown = 0.0
 
@@ -339,7 +263,7 @@ class BacktestEngine:
         self.validate_mode_config()
         self.balance = GlobalConfig.initial_balance
         self.positions = LLDict()
-        self.trade_history = []
+        self.trade_history = []  # Store all trades with additional details
         self.current_position = None
         self.fee_per_share = 0.0035
         self.slippage = 0.0002
@@ -352,13 +276,19 @@ class BacktestEngine:
             'mean_reversion_threshold': 25, 'low_volatility_threshold': 15, 'trend_strength_exit': 40,
             'rapid_trend_threshold': 15
         }
+        self.time_exit_hours = 4
+        self.signal_exit_threshold = 0.6
+        self.profit_target = 0.02
+        self.stop_loss = 0.01
+        self.backtest_data = []  # Store all data for CSV export
+
     @property
     def max_position_size(self):
         return self.balance * 0.25
 
     def validate_mode_config(self):
         required_keys = ['rsi_entry', 'williams_entry', 'position_risk', 'volatility_mult', 'profit_target', 
-                        'stop_loss', 'adx_threshold', 'di_ratio', 'macd_crossover']
+                         'stop_loss', 'adx_threshold', 'di_ratio', 'macd_crossover']
         for mode, config in self.mode_config.items():
             if not all(k in config for k in required_keys):
                 raise ValueError(f"Missing config keys in {mode}")
@@ -370,100 +300,67 @@ class BacktestEngine:
         return min(self.max_position_size, risk_capital / combined_vol)
 
     def composite_signal_score(self, row):
-        """
-        Calculate a composite signal score as a percentage (0 to 1) based on how many conditions are met,
-        using all indicators with mode-specific thresholds. Trigger a buy if the score exceeds 0.6 (60%).
-        """
         volatility_regime = 1 + min(2, (row['ATR'] / row['close']) * 2.5)
-        total_weight = sum(self.indicator_weights.values())  # Normalize weights to sum to 1
-
+        total_weight = sum(self.indicator_weights.values())
         scores = {}
         conditions_met = 0
-        total_conditions = len(self.indicator_weights) + 2  # Add Stochastic (%K, %D) and DI ratio
+        total_conditions = len(self.indicator_weights) + 2
 
-        # Mode-specific thresholds
         mode_config = self.mode_config[self.mode]
-        rsi_threshold = mode_config['rsi_entry']  # e.g., 28, 32, 35
-        williams_threshold = mode_config['williams_entry']  # e.g., -85, -80, -75
-        adx_threshold = mode_config['adx_threshold']  # e.g., 22, 25, 28
-        macd_crossover = mode_config['macd_crossover']  # e.g., 1.15, 1.05, 1.0
-        di_ratio = mode_config['di_ratio']  # e.g., 1.25, 1.35, 1.5
+        rsi_threshold = mode_config['rsi_entry']
+        williams_threshold = mode_config['williams_entry']
+        adx_threshold = mode_config['adx_threshold']
+        macd_crossover = mode_config['macd_crossover']
+        di_ratio = mode_config['di_ratio']
 
-        # RSI (oversold condition)
-        if row['RSI_shifted'] < rsi_threshold:
+        if row['RSI_shifted'] > (100 - rsi_threshold):
             scores['rsi'] = self.indicator_weights['rsi']
             conditions_met += 1
         else:
             scores['rsi'] = 0
 
-        # Williams %R (oversold condition)
-        if row['Williams_%R_shifted'] < williams_threshold:
+        if row['Williams_%R_shifted'] > (-100 - williams_threshold):
             scores['williams'] = self.indicator_weights['williams']
             conditions_met += 1
         else:
             scores['williams'] = 0
 
-        # MACD (bearish crossover for mean-reversion)
-        if row['MACD_shifted'] < row['Signal_shifted']:
+        if row['MACD_shifted'] > row['Signal_shifted'] * macd_crossover:
             scores['macd'] = self.indicator_weights['macd']
             conditions_met += 1
         else:
             scores['macd'] = 0
 
-        # VWAP (price below VWAP for mean-reversion)
-        if row['VWAP_shifted'] > row['close_shifted']:
+        if row['VWAP_shifted'] < row['close_shifted']:
             scores['vwap'] = self.indicator_weights['vwap']
             conditions_met += 1
         else:
             scores['vwap'] = 0
 
-        # ADX (low trend strength for mean-reversion)
-        if row['adx_shifted'] < adx_threshold:
+        if row['adx_shifted'] > adx_threshold:
             scores['adx'] = self.indicator_weights['adx']
             conditions_met += 1
         else:
             scores['adx'] = 0
 
-        # Volume (higher than moving average for confirmation)
         if row['volume'] > row['volume_ma']:
             scores['volume'] = self.indicator_weights['volume']
             conditions_met += 1
         else:
             scores['volume'] = 0
 
-        # Directional Indicators (+DI < -DI * di_ratio for downward pressure)
-        if row['+di_shifted'] < row['-di_shifted'] * di_ratio:
-            conditions_met += 1  # No weight, counted as an additional condition
-        else:
-            pass  # No penalty, just not counted
+        if row['+di_shifted'] > row['-di_shifted'] * di_ratio:
+            conditions_met += 1
 
-        # Stochastic (%K < %D and %D < 20 for oversold)
-        if row['%K_shifted'] < row['%D_shifted'] and row['%D_shifted'] < 20:
-            conditions_met += 1  # No weight, counted as an additional condition
-        else:
-            pass  # No penalty, just not counted
+        if row['%K_shifted'] > row['%D_shifted'] and row['%D_shifted'] > 80:
+            conditions_met += 1
 
-        # Calculate percentage of conditions met, weighted by importance
         weighted_score = sum(scores[k] for k in self.indicator_weights) / total_weight
         percentage_score = (conditions_met / total_conditions) * volatility_regime * weighted_score
 
-        logger.debug(f"Composite signal score at {row.name}: {percentage_score:.2%} "
+        logger.debug(f"Signal score at {row.name}: {percentage_score:.2%} "
                      f"(Conditions met: {conditions_met}/{total_conditions})")
-
-        return min(1.0, percentage_score)  # Cap at 100% (1.0)
-
-
-    def _normalize_macd(self, macd, signal):
-        denominator = abs(macd) + abs(signal)
-        if denominator < 1e-8:
-            return 0
-        return (macd - signal) / denominator
-
-    def _dynamic_adx_weight(self, adx, plus_di, minus_di):
-        di_diff = abs(plus_di - minus_di)
-        trend_strength = max(0, (25 - min(adx, 25)) / 25)
-        direction_confidence = 1 - (di_diff / 100)
-        return trend_strength * direction_confidence
+        return min(1.0, percentage_score)
 
     def apply_slippage(self, price, is_buy):
         slippage_factor = 1 + (self.slippage if is_buy else -self.slippage)
@@ -472,11 +369,21 @@ class BacktestEngine:
     def calculate_fees(self, shares):
         return abs(shares * self.fee_per_share)
 
-    def execute_trade(self, price, shares, action, timestamp):
+    def execute_trade(self, price, shares, action, timestamp, exit_type=None, row=None):
         try:
             price_with_slippage = self.apply_slippage(price, action == 'BUY')
             fees = self.calculate_fees(shares)
             position_value = shares * price_with_slippage
+
+            trade = {
+                'timestamp': timestamp,
+                'action': action,
+                'price': price_with_slippage,
+                'shares': shares,
+                'position_value': position_value,
+                'balance_before': self.balance,
+                'exit_type': exit_type if action == 'SELL' else None
+            }
 
             if action == 'BUY':
                 if position_value > self.balance:
@@ -484,9 +391,11 @@ class BacktestEngine:
                     return None
                 self.current_position = {
                     'symbol': GlobalConfig.symbol, 'entry_price': price_with_slippage, 'shares': shares, 
-                    'timestamp': timestamp, 'position_value': position_value
+                    'timestamp': timestamp, 'position_value': position_value, 'entry_time': timestamp
                 }
                 self.balance -= (position_value + fees)
+                trade['pnl'] = 0.0
+                trade['pnl_pct'] = 0.0
             elif action == 'SELL' and self.current_position:
                 entry_price = self.current_position['entry_price']
                 entry_value = self.current_position['position_value']
@@ -494,23 +403,19 @@ class BacktestEngine:
                 pnl = exit_value - entry_value - fees
                 pnl_pct = (pnl / entry_value) * 100 if entry_value != 0 else 0
 
-                trade = {
-                    'symbol': GlobalConfig.symbol, 'action': action, 'price': price_with_slippage, 'shares': shares,
-                    'timestamp': timestamp, 'pnl': pnl, 'pnl_pct': pnl_pct, 'position_value': position_value
-                }
+                trade['pnl'] = pnl
+                trade['pnl_pct'] = pnl_pct
                 self.balance += (exit_value - fees)
-                self.trade_history.append(trade)
                 self.daily_pnl[timestamp.strftime('%Y-%m-%d')] = (
                     self.daily_pnl.get(timestamp.strftime('%Y-%m-%d'), 0) + pnl
                 )
                 self.current_position = None
-                return trade
 
-            trade = {
-                'symbol': GlobalConfig.symbol, 'action': action, 'price': price_with_slippage, 'shares': shares,
-                'timestamp': timestamp, 'pnl': 0.0, 'pnl_pct': 0.0, 'position_value': position_value
-            }
+            trade['balance_after'] = self.balance
+            if row is not None:
+                trade.update(row.to_dict())  # Add all DataFrame row data (OHLCV, indicators)
             self.trade_history.append(trade)
+            self.backtest_data.append(trade)
             return trade
         except Exception as e:
             logger.error(f"Trade execution failed: {str(e)}")
@@ -519,28 +424,28 @@ class BacktestEngine:
 # =====================
 # TRADE EXECUTION CORE
 # =====================
-def execute_entry(price, timestamp, position_size):
+def execute_entry(price, timestamp, position_size, row):
     timestamp = enforce_ny_timezone(pd.to_datetime(timestamp))
     shares = max(0.01, position_size / price)
     if not np.isfinite(shares):
         logger.error(f"Invalid share calculation: {position_size}/{price}")
         return None
-    trade = engine.execute_trade(price=price, shares=shares, action='BUY', timestamp=timestamp)
+    trade = engine.execute_trade(price=price, shares=shares, action='BUY', timestamp=timestamp, row=row)
     if trade:
-        log_trade(trade, GlobalConfig.symbol)
+        log_trade(trade)
         return trade
     return None
 
-def execute_exit(price, timestamp):
+def execute_exit(price, timestamp, exit_type, row):
     if not engine.current_position:
         logger.warning("Exit attempted with no open position")
         return None
     timestamp = enforce_ny_timezone(pd.to_datetime(timestamp))
     position = engine.current_position
     exit_shares = min(position['shares'], engine.max_position_size)
-    trade = engine.execute_trade(price=price, shares=exit_shares, action='SELL', timestamp=timestamp)
+    trade = engine.execute_trade(price=price, shares=exit_shares, action='SELL', timestamp=timestamp, exit_type=exit_type, row=row)
     if trade:
-        log_trade(trade, GlobalConfig.symbol)
+        log_trade(trade)
         return trade
     return None
 
@@ -551,60 +456,26 @@ engine = BacktestEngine()
 # CONDITION CHECKS
 # =====================
 def check_entry_conditions(df, index):
-    """
-    Check conditions for entering a long-only mean-reversion trade (buy signal).
-    Uses composite signal score and mode-specific thresholds from engine.mode_config.
-    Strategy: Buy when price is below the lowest MRC band and indicators signal oversold conditions.
-    """
     if str(index.tz) != 'America/New_York':
         raise ValueError(f"Invalid timezone in entry check: {index.tz}")
     
     try:
         row = df.loc[index]
-        config = engine.mode_config[engine.mode]  # Get mode-specific config
-        
-        # Core mean-reversion condition: Price below lowest MRC band
-        price_below_band = row['close_shifted'] < row[f'loband_{GlobalConfig.gradient_levels[0]}_shifted']
-        
-        # Composite signal score (already uses mode-specific thresholds)
-        composite_score = engine.composite_signal_score(row)
-        
-        # Additional mode-specific indicator checks
-        rsi_oversold = row['RSI_shifted'] < config['rsi_entry']
-        williams_oversold = row['Williams_%R_shifted'] < config['williams_entry']
-        macd_bearish = row['MACD_shifted'] < row['Signal_shifted'] * config['macd_crossover']
-        vwap_below = row['close_shifted'] < row['VWAP_shifted'] * config['vwap_margin']
-        adx_low = row['adx_shifted'] < config['adx_threshold']
-        stochastic_oversold = row['%K_shifted'] < config['stochastic_k_entry']
-        volatility_ok = (engine.volatility_filter['min_mrc'] < row['meanrange'] < engine.volatility_filter['max_mrc'])
+        short_sma = df['close'].rolling(window=10).mean().shift(1)[index]
+        long_sma = df['close'].rolling(window=50).mean().shift(1)[index]
+        prev_short_sma = df['close'].rolling(window=10).mean().shift(2)[index]
+        prev_long_sma = df['close'].rolling(window=50).mean().shift(2)[index]
+
+        crossover_up = (prev_short_sma <= prev_long_sma) and (short_sma > long_sma)
         position_ok = engine.balance > 1000 and not engine.current_position
         time_ok = not is_market_close(index)
 
-        # Entry signal: Composite score >= 60% and key mean-reversion conditions
-        entry_signal = (
-            composite_score >= 0.6 and
-            price_below_band and
-            rsi_oversold and
-            williams_oversold and
-            vwap_below and
-            adx_low and
-            stochastic_oversold
-        )
-
         logger.debug(f"Entry check at {index}: "
-                     f"Close={row['close_shifted']:.2f}, "
-                     f"Loband={row[f'loband_{GlobalConfig.gradient_levels[0]}_shifted']:.2f}, "
-                     f"Composite Score={composite_score:.2%}, "
-                     f"RSI={row['RSI_shifted']:.2f} < {config['rsi_entry']}, "
-                     f"Williams %R={row['Williams_%R_shifted']:.2f} < {config['williams_entry']}, "
-                     f"VWAP={row['VWAP_shifted']:.2f}, "
-                     f"ADX={row['adx_shifted']:.2f} < {config['adx_threshold']}, "
-                     f"%K={row['%K_shifted']:.2f} < {config['stochastic_k_entry']}, "
-                     f"VolatilityOK={volatility_ok}, "
-                     f"PositionOK={position_ok}, "
-                     f"TimeOK={time_ok}")
+                     f"Short SMA={short_sma:.2f}, Long SMA={long_sma:.2f}, "
+                     f"Prev Short SMA={prev_short_sma:.2f}, Prev Long SMA={prev_long_sma:.2f}, "
+                     f"Crossover Up={crossover_up}, PositionOK={position_ok}, TimeOK={time_ok}")
 
-        return entry_signal and volatility_ok and position_ok and time_ok
+        return crossover_up and position_ok and time_ok
     
     except KeyError as e:
         logger.error(f"Missing data at {index}: '{e}'")
@@ -614,62 +485,49 @@ def check_entry_conditions(df, index):
         return False
 
 def check_exit_conditions(df, index):
-    """
-    Check conditions for exiting a long-only mean-reversion trade (sell signal).
-    Uses mode-specific thresholds from engine.mode_config for profit targets and stop losses.
-    Strategy: Exit on reversion to mean (price above VWAP or meanline) or extremes.
-    """
     if str(index.tz) != 'America/New_York':
         raise ValueError(f"Invalid timezone in exit check: {index.tz}")
     
     if not engine.current_position:
-        return False
+        return None
     
     try:
         row = df.loc[index]
-        config = engine.mode_config[engine.mode]  # Get mode-specific config
+        current_time = enforce_ny_timezone(index)
+        entry_time = engine.current_position['entry_time']
         entry_price = engine.current_position['entry_price']
-        
-        # Profit-taking conditions: Price reverts to mean or exceeds target
-        profit_conditions = (
-            (row['close_shifted'] > row['VWAP_shifted']) or  # Reversion to VWAP
-            (row['close_shifted'] > row['meanline']) or     # Reversion to MRC meanline
-            (row['RSI_shifted'] > 70) or                    # RSI overbought
-            (row['Williams_%R_shifted'] > -20) or           # Williams %R overbought
-            (row['MACD_shifted'] > row['Signal_shifted'] * config['macd_crossover']) or  # MACD bullish
-            (row['%D_shifted'] > 80) or                     # Stochastic overbought
-            (row['adx_shifted'] > engine.adx_params['trend_strength_exit']) or  # Strong trend
-            (row['+di_shifted'] > row['-di_shifted'] * config['di_ratio']) or  # Trend shift
-            (row['close_shifted'] >= entry_price * config['profit_target'])    # Profit target
-        )
-        
-        # Stop-loss conditions: Limit losses or exit on high volatility
-        stop_loss_conditions = (
-            (row['close_shifted'] < entry_price * config['stop_loss']) or  # Stop loss
-            (row['meanrange'] > engine.volatility_filter['max_mrc'] * 1.5) or  # High volatility
-            (np.abs(row['adx_shifted'] - df['adx_shifted'].shift(3)[index]) > engine.adx_params['rapid_trend_threshold']) or  # Rapid ADX change
-            (row['volume'] > row['volume_ma'] * 2)  # Volume spike
-        )
-        
-        logger.debug(f"Exit check at {index}: "
-                     f"Close={row['close_shifted']:.2f}, "
-                     f"EntryPrice={entry_price:.2f}, "
-                     f"ProfitTarget={entry_price * config['profit_target']:.2f}, "
-                     f"StopLoss={entry_price * config['stop_loss']:.2f}, "
-                     f"VWAP={row['VWAP_shifted']:.2f}, "
-                     f"Meanline={row['meanline']:.2f}, "
-                     f"RSI={row['RSI_shifted']:.2f}, "
-                     f"Williams %R={row['Williams_%R_shifted']:.2f}, "
-                     f"ADX={row['adx_shifted']:.2f}")
+        current_price = row['close']
 
-        return profit_conditions or stop_loss_conditions
+        # 1. Time-Based Exit: Check if 4 hours have passed
+        time_diff = (current_time - entry_time).total_seconds() / 3600  # Convert to hours
+        time_exit = time_diff >= engine.time_exit_hours
+
+        # 2. Signal Score Exit: High score indicating reversal
+        signal_score = engine.composite_signal_score(row)
+        signal_exit = signal_score >= engine.signal_exit_threshold
+
+        # 3. Profit Target/Stop Loss Exit
+        price_change = (current_price - entry_price) / entry_price
+        profit_target_exit = price_change >= engine.profit_target
+        stop_loss_exit = price_change <= -engine.stop_loss
+        pt_sl_exit = profit_target_exit or stop_loss_exit
+
+        # Determine which exit condition is met first
+        if time_exit:
+            return 'Time-Based'
+        elif signal_exit:
+            return 'Signal Score'
+        elif pt_sl_exit:
+            return 'Profit Target/Stop Loss'
+        
+        return None
     
     except KeyError as e:
         logger.error(f"Missing data at {index}: {str(e)}")
-        return False
+        return None
     except Exception as e:
         logger.error(f"Error in exit condition check at {index}: {str(e)}")
-        return False
+        return None
 
 # =====================
 # LOGGING SETUP
@@ -687,8 +545,8 @@ class TradeFormatter(logging.Formatter):
 
     def colorize_actions(self, message):
         return re.sub(r'^(BUY|SELL)(\s+\|)', 
-                     lambda m: f"{self.GREEN if m.group(1) == 'BUY' else self.RED}{m.group(1)}{self.WHITE}{m.group(2)}",
-                     message, count=1)
+                      lambda m: f"{self.GREEN if m.group(1) == 'BUY' else self.RED}{m.group(1)}{self.WHITE}{m.group(2)}",
+                      message, count=1)
         
     def colorize_values(self, message):
         def color_repl(match):
@@ -742,7 +600,8 @@ def log_trade(trade):
             pnl_color = TradeFormatter.GREEN if trade['pnl'] > 0 else TradeFormatter.RED
             log_parts.extend([
                 f"PnL:   {pnl_color}${trade['pnl']:7.2f}{TradeFormatter.WHITE}",
-                f"Return: {pnl_color}{trade['pnl_pct']:6.2f}%{TradeFormatter.WHITE}"
+                f"Return: {pnl_color}{trade['pnl_pct']:6.2f}%{TradeFormatter.WHITE}",
+                f"Exit:  {trade['exit_type']}"
             ])
         logger.info(" | ".join(log_parts))
     except Exception as e:
@@ -800,9 +659,9 @@ def williams_r(high, low, close, lookback=14):
     highest_high = high.rolling(window=lookback, min_periods=1).max()
     lowest_low = low.rolling(window=lookback, min_periods=1).min()
     denominator = highest_high - lowest_low
-    denominator = denominator.replace(0, np.nan)  # Prevent division by zero
+    denominator = denominator.replace(0, np.nan)
     wr = -100 * ((highest_high - close) / denominator)
-    return wr.fillna(-50).replace([np.inf, -np.inf], -50)  # Neutral default value
+    return wr.fillna(-50).replace([np.inf, -np.inf], -50)
 
 def stochastic_oscillator(df, k_period=14, d_period=3):
     low_min = df['low'].rolling(k_period).min()
@@ -831,12 +690,10 @@ def get_historical_data(ib, exchange='SMART', currency='USD', backtest=False):
             logger.error("Empty DataFrame received from IB")
             raise ValueError("Empty DataFrame received from IB")
 
-        # Set index and timezone
         df['date'] = pd.to_datetime(df['date'], utc=True)
         df.set_index('date', inplace=True)
         df.index = df.index.tz_convert('America/New_York')
 
-        # Validate and clean OHLCV data
         required_cols = ['open', 'high', 'low', 'close', 'volume']
         for col in required_cols:
             if col not in df.columns:
@@ -847,37 +704,31 @@ def get_historical_data(ib, exchange='SMART', currency='USD', backtest=False):
                 logger.error(f"Invalid data in {col}")
                 raise ValueError(f"Invalid data in {col}")
 
-        # Calculate MRC and indicators
         df['hlc3'] = (df['high'] + df['low'] + df['close']) / 3
         df = calculate_mrc_with_gradient(df)
         df = calculate_adx(df)
         df = stochastic_oscillator(df)
 
-        # VWAP calculation
         df['vwap_numerator'] = df['volume'] * df['hlc3']
         df['vwap_denominator'] = df['volume'].cumsum()
         df['VWAP'] = df['vwap_numerator'].cumsum() / df['vwap_denominator']
 
-        # MACD calculation
         exp12 = df['close'].ewm(span=12, adjust=False).mean()
         exp26 = df['close'].ewm(span=26, adjust=False).mean()
         df['MACD'] = exp12 - exp26
         df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
         df['Histogram'] = df['MACD'] - df['Signal']
 
-        # RSI, Williams %R, ATR, Volume MA, and SMA_20
         df['RSI'] = calculate_rsi(df['close'])
-        df['Williams_%R'] = williams_r(df['high'], df['low'], df['close'])  # Single consistent calculation
+        df['Williams_%R'] = williams_r(df['high'], df['low'], df['close'])
         df['ATR'] = df['tr'].rolling(14).mean().replace([np.inf, -np.inf, np.nan], 0).ffill().bfill()
         df['volume_ma'] = df['volume'].rolling(20).mean().replace([np.inf, -np.inf, np.nan], 0).ffill().bfill()
         df['SMA_20'] = df['close'].rolling(20).mean().replace([np.inf, -np.inf, np.nan], 0).ffill().bfill()
 
-        # Shift indicators for backtesting, ensuring all values are valid
         shifted_cols = ['close', 'RSI', 'Williams_%R', 'VWAP', 'MACD', 'Signal', 'adx', '+di', '-di', '%K', '%D', 'volume_ma', 'SMA_20']
         for col in shifted_cols:
-            df[f'{col}_shifted'] = df[col].shift(1).ffill().bfill()  # Propagate valid values
+            df[f'{col}_shifted'] = df[col].shift(1).ffill().bfill()
 
-        # Drop temporary columns
         df = df.drop(['vwap_numerator', 'vwap_denominator'], axis=1, errors='ignore')
         
         logger.info(f"Processed historical data with {len(df)} rows")
@@ -894,7 +745,6 @@ def calculate_macd(close, fast=12, slow=26, signal=9):
     histogram = macd - signal_line
     return macd, signal_line, histogram
 
-# Add other indicator functions (Williams %R, ADX, etc.) as needed
 def calculate_williams_r(high, low, close, period=14):
     highest_high = high.rolling(window=period).max()
     lowest_low = low.rolling(window=period).min()
@@ -920,7 +770,7 @@ def calculate_adx(df, window=14):
     df['+di'] = plus_di
     df['-di'] = minus_di
     df['adx_shifted'] = adx.shift(1).fillna(0)
-    return df  # Explicitly return the modified DataFrame
+    return df
 
 def calculate_rsi(close, period=14):
     delta = close.diff()
@@ -928,7 +778,6 @@ def calculate_rsi(close, period=14):
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
     rs = gain / loss
     return 100 - (100 / (1 + rs))
-
 
 def calculate_plus_di(high, low, close, period=14):
     plus_dm = (high - high.shift()).where((high - high.shift()) > (low.shift() - low), 0)
@@ -962,7 +811,6 @@ def plot_candlestick(df, backtest=False, time_frame=GlobalConfig.barSizeSetting)
         logger.error("Cannot plot empty DataFrame")
         raise ValueError("Cannot plot empty DataFrame")
 
-    # Validate OHLCV and MRC data
     required_cols = ['open', 'high', 'low', 'close', 'volume', 'meanline'] + \
                     [f'upband_{level}' for level in GlobalConfig.gradient_levels] + \
                     [f'loband_{level}' for level in GlobalConfig.gradient_levels]
@@ -977,34 +825,28 @@ def plot_candlestick(df, backtest=False, time_frame=GlobalConfig.barSizeSetting)
             raise ValueError(f"Column {col} contains only NaN values")
         logger.debug(f"{col} sample: {df[col].head().tolist()}, NaN count: {df[col].isna().sum()}")
 
-    # Ensure timezone and sort
     if df.index.tz != pytz.timezone('America/New_York'):
         df.index = df.index.tz_convert('America/New_York')
     df = df.sort_index()
 
-    # Debug index and indicators
     logger.debug(f"Index range: {df.index.min()} to {df.index.max()}")
     for col in indicator_cols:
         if col in df.columns:
             logger.debug(f"{col} NaN count: {df[col].isna().sum()}")
 
-    # Style
     style = mpf.make_mpf_style(
         base_mpf_style='classic',
         marketcolors=mpf.make_marketcolors(up='#00FF00', down='#FF0000', edge='black', wick='black', volume='gray'),
         gridstyle=':', gridcolor='gray', facecolor='white'
     )
 
-    # Prepare addplots for indicators
     addplots = []
     panels_used = set()
 
-    # Volume on panel 1
     if 'volume' in df.columns:
         addplots.append(mpf.make_addplot(df['volume'], panel=1, type='bar', color='gray', ylabel='Volume'))
         panels_used.add(1)
 
-    # MACD on panel 2
     if all(col in df.columns for col in ['MACD', 'Signal', 'Histogram']):
         addplots.extend([
             mpf.make_addplot(df['MACD'], panel=2, color='#1f77b4', width=1.5, ylabel='MACD'),
@@ -1013,22 +855,18 @@ def plot_candlestick(df, backtest=False, time_frame=GlobalConfig.barSizeSetting)
         ])
         panels_used.add(2)
 
-    # RSI on panel 3
     if 'RSI' in df.columns:
         addplots.append(mpf.make_addplot(df['RSI'], panel=3, color='#4B0082', width=1.5, ylim=(0, 100), ylabel='RSI'))
         panels_used.add(3)
 
-    # Williams %R on panel 4
     if 'Williams_%R' in df.columns:
         addplots.append(mpf.make_addplot(df['Williams_%R'], panel=4, color='#9467bd', width=1.5, ylim=(-100, 0), ylabel='Williams %R'))
         panels_used.add(4)
 
-    # ADX on panel 5
     if 'adx' in df.columns:
         addplots.append(mpf.make_addplot(df['adx'], panel=5, color='#2ca02c', width=1.5, ylim=(0, 100), ylabel='ADX'))
         panels_used.add(5)
 
-    # Stochastic on panel 6
     if all(col in df.columns for col in ['%K', '%D']):
         addplots.extend([
             mpf.make_addplot(df['%K'], panel=6, color='#8c564b', width=1.5, ylabel='Stochastic'),
@@ -1036,17 +874,15 @@ def plot_candlestick(df, backtest=False, time_frame=GlobalConfig.barSizeSetting)
         ])
         panels_used.add(6)
 
-    # Define panel layout
     num_panels = 1 + len(panels_used)
-    panel_ratios = [10] + [3] * len(panels_used)  # Main panel for candlesticks + MRC
+    panel_ratios = [10] + [3] * len(panels_used)
 
-    # Plot candlesticks on panel 0
     fig, axlist = mpf.plot(
-        df[['open', 'high', 'low', 'close']],  # Only OHLC for candlesticks
+        df[['open', 'high', 'low', 'close']],
         type='candle',
         style=style,
         addplot=addplots,
-        volume=False,  # Volume handled in addplot
+        volume=False,
         panel_ratios=tuple(panel_ratios),
         figsize=(20, 8 + 2 * len(panels_used)),
         title=f'{GlobalConfig.symbol} Candlestick Chart - {GlobalConfig.barSizeSetting} (Backtest: {backtest})',
@@ -1054,10 +890,8 @@ def plot_candlestick(df, backtest=False, time_frame=GlobalConfig.barSizeSetting)
         datetime_format='%Y-%m-%d %H:%M'
     )
 
-    # Plot MRC gradient on the main panel (axlist[0])
     plot_mrc_gradient(axlist[0], df)
 
-    # Customize axes
     for i, ax in enumerate(axlist):
         ax.set_facecolor('white')
         ax.grid(True, color='gray', linestyle=':', linewidth=0.5, alpha=0.5)
@@ -1065,7 +899,6 @@ def plot_candlestick(df, backtest=False, time_frame=GlobalConfig.barSizeSetting)
         ax.xaxis.set_major_formatter(DateFormatter('%H:%M'))
         ax.set_xlim(df.index[0], df.index[-1])
 
-    # Set y-limits for main panel to include MRC and candlesticks
     y_min = min(df['low'].min(), df[[f'loband_{level}' for level in GlobalConfig.gradient_levels]].min().min()) * 0.95
     y_max = max(df['high'].max(), df[[f'upband_{level}' for level in GlobalConfig.gradient_levels]].max().max()) * 1.05
     axlist[0].set_ylim(y_min, y_max)
@@ -1081,13 +914,9 @@ def plot_mrc_gradient(ax, df, time_frame=GlobalConfig.barSizeSetting):
         logger.error("Meanline data is empty or contains only NaN values")
         return
 
-    # Plot meanline with high z-order
     ax.plot(df.index, meanline, color='purple', linestyle='-', linewidth=2.5, zorder=10, label='Meanline')
-
-    # Normalize for gradient colors
     norm = Normalize(vmin=min(GlobalConfig.gradient_levels), vmax=max(GlobalConfig.gradient_levels))
 
-    # Plot gradient fills
     for i in range(len(GlobalConfig.gradient_levels)):
         level = GlobalConfig.gradient_levels[i]
         upper_band = df[f'upband_{level}'].replace([np.inf, -np.inf, np.nan, 0], np.nan).ffill().bfill()
@@ -1104,10 +933,7 @@ def plot_mrc_gradient(ax, df, time_frame=GlobalConfig.barSizeSetting):
             ax.fill_between(df.index, prev_upper_band, upper_band, color=color, alpha=0.5, zorder=2 + i, label=f'Level {level}')
             ax.fill_between(df.index, prev_lower_band, lower_band, color=color, alpha=0.5, zorder=2 + i)
 
-    # Add legend
     ax.legend(loc='upper left', fontsize=8)
-
-    # Set limits
     y_min = min(df['low'].min(), lower_band.min()) * 0.95
     y_max = max(df['high'].max(), upper_band.max()) * 1.05
     ax.set_ylim(y_min, y_max)
@@ -1131,21 +957,30 @@ def run_backtest(df, mode):
     global engine
     engine = BacktestEngine(mode=mode)
     
-    # No need to recalculate indicators; use those from get_historical_data
-    # Verify required columns are present
-    required_cols = ['close', 'RSI', 'Williams_%R', 'VWAP', 'MACD', 'Signal', 'adx', '+di', '-di', '%K', '%D', 'volume_ma']
-    missing_cols = [col for col in required_cols if col not in df.columns]
-    if missing_cols:
-        logger.error(f"Missing required columns in DataFrame: {missing_cols}")
-        raise ValueError(f"Missing required columns: {missing_cols}")
-
-    # Run backtest logic
     for index, row in df.iterrows():
         if not is_market_close(index):
             if check_entry_conditions(df, index):
-                execute_entry(row['close'], index, engine.calculate_position_size(row))
-            elif engine.current_position and check_exit_conditions(df, index):
-                execute_exit(row['close'], index)
+                execute_entry(row['close'], index, engine.calculate_position_size(row), row)
+            elif engine.current_position:
+                exit_type = check_exit_conditions(df, index)
+                if exit_type:
+                    execute_exit(row['close'], index, exit_type, row)
+            # Log non-trade data points with current balance
+            else:
+                non_trade_data = {
+                    'timestamp': index,
+                    'action': 'NONE',
+                    'price': row['close'],
+                    'shares': 0,
+                    'position_value': 0,
+                    'pnl': 0.0,
+                    'pnl_pct': 0.0,
+                    'balance_before': engine.balance,
+                    'balance_after': engine.balance,
+                    'exit_type': None
+                }
+                non_trade_data.update(row.to_dict())
+                engine.backtest_data.append(non_trade_data)
 
     logger.info(f"Backtest completed with {len(engine.trade_history)} trades")
     return engine, df
@@ -1182,9 +1017,12 @@ def main():
         logger.debug(f"Columns available: {daily_data.columns.tolist()}")
         
         plot_candlestick(daily_data, backtest=True)
-        
-        if engine.trade_history:
-            plot_pnl_calendar(engine, daily_data.index.min(), daily_data.index.max(), GlobalConfig.initial_balance)
+
+        # Export backtest data to CSV
+        backtest_df = pd.DataFrame(engine.backtest_data)
+        backtest_df['timestamp'] = pd.to_datetime(backtest_df['timestamp']).dt.tz_convert('America/New_York')
+        backtest_df.to_csv('backtest_raw_data.csv', index=False)
+        logger.info("Backtest data exported to 'backtest_raw_data.csv'")
             
     except Exception as e:
         logger.error(f"Main execution error: {str(e)}", exc_info=True)
