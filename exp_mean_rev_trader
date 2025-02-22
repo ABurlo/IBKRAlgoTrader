@@ -1,4 +1,3 @@
-#broken tri multiframe API calls excessive IBKR
 # =====================
 # CORE IMPORTS
 # =====================
@@ -85,9 +84,8 @@ logger = logging.getLogger(__name__)
 class GlobalConfig:
     nest_asyncio.apply()
     symbol = 'MSFT'
-    durationStr = '1 D'
-    timeframes = ['5 mins', '15 mins', '30 mins', '1 hour']  # Corrected to timeframes
-    #timeframes = ['5 mins', '15 mins', '30 mins', '1 hour', '4 hours', '8 hours', '1 day']  # Corrected to timeframes
+    durationStr = '30 D'
+    timeframes = ['1 hour']  # Corrected to timeframes
     currency = 'USD'
     initial_balance = 10000  # Per strategy
     MIN_REQUIRED_BANDS = 2
@@ -617,13 +615,28 @@ class BacktestEngine:
         except Exception as e:
             logger.error(f"Strategy #{self.strategy_id} trade execution failed: {str(e)}", exc_info=True)
             return None
+
 class ParameterOptimizer:
-    def __init__(self, df, n_trials=50):
+    def __init__(self, df, n_trials=50, train_ratio=0.7):
         self.df = df
         self.n_trials = n_trials
+        self.train_ratio = train_ratio
         self.best_params = {}
         
-    def objective(self, trial: Trial, strategy_id: str) -> float:
+    def split_data(self):
+        """
+        Split data into training and testing sets.
+        """
+        split_idx = int(len(self.df) * self.train_ratio)
+        train_df = self.df.iloc[:split_idx]
+        test_df = self.df.iloc[split_idx:]
+        logger.info(f"Data split: Training {len(train_df)} rows, Testing {len(test_df)} rows")
+        return train_df, test_df
+
+    def objective(self, trial: Trial, strategy_id: str, df_train) -> float:
+        """
+        Objective function for optimization using training data.
+        """
         params = {
             'position_risk': trial.suggest_float('position_risk', 0.01, 0.05, step=0.01),
             'volatility_mult': trial.suggest_float('volatility_mult', 1.0, 3.0, step=0.5),
@@ -666,14 +679,15 @@ class ParameterOptimizer:
                 'adx': {'threshold': params['adx_threshold'], 'operator': '>'},
             })
 
-        for index, row in self.df.iterrows():
+        for index, _ in df_train.iterrows():
             if not is_market_close(index):
-                if check_entry_conditions(self.df, index, engine):
+                row = calculate_point_in_time_indicators(df_train, index)
+                if check_entry_conditions(df_train, index, engine, row):
                     position_size = engine.calculate_position_size(row)
                     if position_size > 0:
                         execute_entry(strategy_id, engine, row['close'], index, position_size, row)
                 elif engine.current_position:
-                    exit_type = check_exit_conditions(self.df, index, engine)
+                    exit_type = check_exit_conditions(df_train, index, engine, row)
                     if exit_type:
                         execute_exit(strategy_id, engine, row['close'], index, exit_type, row)
 
@@ -683,15 +697,61 @@ class ParameterOptimizer:
         return sharpe - (drawdown * 0.01)
 
     def optimize(self):
+        """
+        Optimize parameters on training data and test on out-of-sample data.
+        """
+        train_df, test_df = self.split_data()
         for strat_id in GlobalConfig.STRATEGIES.keys():
             logger.info(f"Optimizing parameters for Strategy #{strat_id} ({GlobalConfig.STRATEGIES[strat_id]})")
             study = optuna.create_study(direction='maximize')
-            study.optimize(lambda trial: self.objective(trial, strat_id), n_trials=self.n_trials, n_jobs=1)
+            study.optimize(lambda trial: self.objective(trial, strat_id, train_df), n_trials=self.n_trials, n_jobs=1)
             self.best_params[strat_id] = study.best_params
             logger.info(f"Best parameters for Strategy #{strat_id}: {study.best_params}")
-        return self.best_params
+
+        # Test on out-of-sample data
+        test_results = {}
+        for strat_id, params in self.best_params.items():
+            engine = BacktestEngine(strat_id, GlobalConfig.STRATEGIES[strat_id])
+            engine.mode_config[engine.mode]['position_risk'] = params['position_risk']
+            engine.mode_config[engine.mode]['volatility_mult'] = params['volatility_mult']
+            if strat_id == '1':
+                engine.mode_config['time_based']['entry_conditions'].update({
+                    'mean_deviation': {'threshold': params['mean_deviation_threshold'], 'operator': '<'},
+                    'rsi': {'threshold': params['rsi_threshold'], 'operator': '<'},
+                    'williams_r': {'threshold': params['williams_threshold'], 'operator': '<'},
+                })
+            elif strat_id == '2':
+                engine.mode_config['signal_score']['entry_conditions'].update({
+                    'rsi': {'threshold': params['rsi_threshold'], 'operator': '<'},
+                    'williams_r': {'threshold': params['williams_threshold'], 'operator': '<'},
+                })
+            elif strat_id == '3':
+                engine.mode_config['volatility_breakout']['entry_conditions'].update({
+                    'atr_breakout': {'multiplier': params['atr_multiplier'], 'operator': '>'},
+                    'adx': {'threshold': params['adx_threshold'], 'operator': '>'},
+                })
+
+            for index, _ in test_df.iterrows():
+                if not is_market_close(index):
+                    row = calculate_point_in_time_indicators(test_df, index)
+                    if check_entry_conditions(test_df, index, engine, row):
+                        position_size = engine.calculate_position_size(row)
+                        if position_size > 0:
+                            execute_entry(strat_id, engine, row['close'], index, position_size, row)
+                    elif engine.current_position:
+                        exit_type = check_exit_conditions(test_df, index, engine, row)
+                        if exit_type:
+                            execute_exit(strat_id, engine, row['close'], index, exit_type, row)
+            
+            test_results[strat_id] = calculate_day_metrics(engine.trade_history)
+            logger.info(f"Out-of-sample test results for Strategy #{strat_id}: {test_results[strat_id]['overall']}")
+        
+        return self.best_params, test_results
 
     def apply_best_params(self, engines):
+        """
+        Apply optimized parameters to the engines.
+        """
         for strat_id, params in self.best_params.items():
             engine = engines[strat_id]
             engine.mode_config[engine.mode]['position_risk'] = params['position_risk']
@@ -716,17 +776,14 @@ class ParameterOptimizer:
 # =====================
 # CONDITION CHECKS
 # =====================
-def check_entry_conditions(df, index, engine):
+def check_entry_conditions(df, index, engine, row):
+    """
+    Check entry conditions using point-in-time data.
+    """
     if str(index.tz) != 'America/New_York':
         raise ValueError(f"Invalid timezone in entry check: {index.tz}")
     
     try:
-        df_up_to_index = df.loc[:index]
-        if df_up_to_index.empty:
-            return False
-        
-        row = df.loc[index]
-        prev_row = df_up_to_index.iloc[-1] if len(df_up_to_index) > 1 else row
         config = engine.mode_config[engine.mode]
         conditions = config['entry_conditions']
         total_conditions = len(conditions) + 2
@@ -740,59 +797,69 @@ def check_entry_conditions(df, index, engine):
                 meanrange = row['meanrange_shifted']
                 deviation = (row['close'] - meanline) / meanrange if meanrange > 0 else 0
                 condition_met = deviation < params['threshold']
-                log_details.append(f"Mean Deviation: Value={deviation:.2f}, Threshold={params['threshold']}, Met={condition_met}")
+                log_details.append(f"Mean Deviation: Value={deviation:.2f}, Threshold={params['threshold']}, "
+                                 f"Met={condition_met}")
             elif condition_name == 'rsi':
                 value = row['RSI_shifted']
-                if pd.isna(value):
-                    logger.warning(f"Strategy #{engine.strategy_id} - RSI_shifted is NaN at {index}")
-                    condition_met = False
-                else:
-                    condition_met = value < params['threshold']
+                condition_met = value < params['threshold'] if not pd.isna(value) else False
                 log_details.append(f"RSI: Value={value:.2f}, Threshold={params['threshold']}, Met={condition_met}")
             elif condition_name == 'volatility_filter':
                 volatility = row['ATR'] / row['close'] if row['close'] > 0 else float('inf')
                 condition_met = volatility < params['threshold']
-                log_details.append(f"Volatility: Value={volatility:.2f}, Threshold={params['threshold']}, Met={condition_met}")
+                log_details.append(f"Volatility: Value={volatility:.2f}, Threshold={params['threshold']}, "
+                                 f"Met={condition_met}")
             elif condition_name == 'williams_r':
                 value = row['Williams_%R_shifted']
-                condition_met = value < params['threshold']
-                log_details.append(f"Williams %R: Value={value:.2f}, Threshold={params['threshold']}, Met={condition_met}")
+                condition_met = value < params['threshold'] if not pd.isna(value) else False
+                log_details.append(f"Williams %R: Value={value:.2f}, Threshold={params['threshold']}, "
+                                 f"Met={condition_met}")
             elif condition_name == 'macd_histogram':
                 value = row['Histogram_shifted']
-                condition_met = value > params['threshold']
-                log_details.append(f"MACD Histogram: Value={value:.2f}, Threshold={params['threshold']}, Met={condition_met}")
+                condition_met = value > params['threshold'] if not pd.isna(value) else False
+                log_details.append(f"MACD Histogram: Value={value:.2f}, Threshold={params['threshold']}, "
+                                 f"Met={condition_met}")
             elif condition_name == 'macd_crossover':
-                condition_met = row['MACD_shifted'] > row['Signal_shifted'] and prev_row['MACD_shifted'] <= prev_row['Signal_shifted']
-                log_details.append(f"MACD Crossover: MACD={row['MACD_shifted']:.2f}, Signal={row['Signal_shifted']:.2f}, Prev MACD={prev_row['MACD_shifted']:.2f}, Met={condition_met}")
+                condition_met = (row['MACD_shifted'] > row['Signal_shifted'] and 
+                               (len(df.loc[:index]) > 1 and 
+                                calculate_point_in_time_indicators(df, df.index[df.index.get_loc(index) - 1])['MACD'] <= 
+                                calculate_point_in_time_indicators(df, df.index[df.index.get_loc(index) - 1])['Signal']))
+                log_details.append(f"MACD Crossover: MACD={row['MACD_shifted']:.2f}, Signal={row['Signal_shifted']:.2f}, "
+                                 f"Met={condition_met}")
             elif condition_name == 'vwap':
-                condition_met = row['close'] < row['VWAP_shifted']
-                log_details.append(f"VWAP: Close={row['close']:.2f}, VWAP={row['VWAP_shifted']:.2f}, Met={condition_met}")
+                condition_met = row['close'] < row['VWAP_shifted'] if not pd.isna(row['VWAP_shifted']) else False
+                log_details.append(f"VWAP: Close={row['close']:.2f}, VWAP={row['VWAP_shifted']:.2f}, "
+                                 f"Met={condition_met}")
             elif condition_name == 'stoch':
                 k_value = row['%K_shifted']
                 d_value = row['%D_shifted']
-                condition_met = k_value < params['%K_threshold'] and d_value < params['%D_threshold']
+                condition_met = (k_value < params['%K_threshold'] and d_value < params['%D_threshold'] and 
+                               not pd.isna(k_value) and not pd.isna(d_value))
                 log_details.append(f"Stochastic: %K={k_value:.2f}, %D={d_value:.2f}, Met={condition_met}")
             elif condition_name == 'atr_breakout':
-                prev_high = df_up_to_index['high'].iloc[-2] if len(df_up_to_index) > 1 else row['high']
+                prev_high = df.loc[:index, 'high'].iloc[-2] if len(df.loc[:index]) > 1 else row['high']
                 breakout_level = prev_high + (row['ATR'] * params['multiplier'])
                 condition_met = row['close'] > breakout_level
-                log_details.append(f"ATR Breakout: Close={row['close']:.2f}, Level={breakout_level:.2f}, Met={condition_met}")
+                log_details.append(f"ATR Breakout: Close={row['close']:.2f}, Level={breakout_level:.2f}, "
+                                 f"Met={condition_met}")
             elif condition_name == 'adx':
                 value = row['adx_shifted']
-                condition_met = value > params['threshold']
+                condition_met = value > params['threshold'] if not pd.isna(value) else False
                 log_details.append(f"ADX: Value={value:.2f}, Threshold={params['threshold']}, Met={condition_met}")
             elif condition_name == 'di_spread':
                 spread = row['+di_shifted'] - row['-di_shifted']
-                condition_met = spread > params['threshold']
-                log_details.append(f"DI Spread: Spread={spread:.2f}, Threshold={params['threshold']}, Met={condition_met}")
+                condition_met = spread > params['threshold'] if not pd.isna(spread) else False
+                log_details.append(f"DI Spread: Spread={spread:.2f}, Threshold={params['threshold']}, "
+                                 f"Met={condition_met}")
             elif condition_name == 'volume':
-                condition_met = row['volume'] > row['volume_ma']
-                log_details.append(f"Volume: Vol={row['volume']:.0f}, MA={row['volume_ma']:.0f}, Met={condition_met}")
+                condition_met = row['volume'] > row['volume_ma'] if not pd.isna(row['volume_ma']) else False
+                log_details.append(f"Volume: Vol={row['volume']:.0f}, MA={row['volume_ma']:.0f}, "
+                                 f"Met={condition_met}")
             conditions_met += 1 if condition_met else 0
 
         position_ok = engine.balance > 1000 and not engine.current_position
         conditions_met += 1 if position_ok else 0
-        log_details.append(f"Position OK: Balance={engine.balance:.2f}, Has Position={bool(engine.current_position)}, Met={position_ok}")
+        log_details.append(f"Position OK: Balance={engine.balance:.2f}, Has Position={bool(engine.current_position)}, "
+                         f"Met={position_ok}")
 
         time_ok = not is_market_close(index)
         conditions_met += 1 if time_ok else 0
@@ -809,14 +876,14 @@ def check_entry_conditions(df, index, engine):
             logger.info(f"Strategy #{engine.strategy_id} - Entry conditions met at {index} with {fraction_met:.2%}")
         return entry_triggered
     
-    except KeyError as e:
-        logger.error(f"Strategy #{engine.strategy_id} - Missing data at {index}: '{e}'")
-        return False
     except Exception as e:
         logger.error(f"Strategy #{engine.strategy_id} - Error in entry check at {index}: {str(e)}", exc_info=True)
         return False
 
-def check_exit_conditions(df, index, engine):
+def check_exit_conditions(df, index, engine, row):
+    """
+    Check exit conditions using point-in-time data.
+    """
     if str(index.tz) != 'America/New_York':
         raise ValueError(f"Invalid timezone in exit check: {index.tz}")
     
@@ -824,7 +891,6 @@ def check_exit_conditions(df, index, engine):
         return None
     
     try:
-        row = df.loc[index]
         config = engine.mode_config[engine.mode]
         conditions = config['exit_conditions']
         current_time = enforce_ny_timezone(index)
@@ -837,17 +903,20 @@ def check_exit_conditions(df, index, engine):
             if condition_name == 'mean_reversion':
                 deviation = (current_price - row['meanline']) / meanrange if meanrange > 0 else 0
                 if deviation > params['threshold']:
-                    logger.debug(f"Strategy #{engine.strategy_id} - Mean Reversion exit at {index}: Deviation={deviation:.2f}")
+                    logger.debug(f"Strategy #{engine.strategy_id} - Mean Reversion exit at {index}: "
+                               f"Deviation={deviation:.2f}")
                     return 'Mean Reversion'
             elif condition_name == 'stop_loss':
                 deviation = (current_price - entry_price) / meanrange if meanrange > 0 else 0
                 if deviation < params['threshold']:
-                    logger.debug(f"Strategy #{engine.strategy_id} - Stop Loss exit at {index}: Deviation={deviation:.2f}")
+                    logger.debug(f"Strategy #{engine.strategy_id} - Stop Loss exit at {index}: "
+                               f"Deviation={deviation:.2f}")
                     return 'Stop Loss'
             elif condition_name == 'time_limit':
                 time_diff = (current_time - entry_time).total_seconds() / 3600
                 if time_diff >= params['hours']:
-                    logger.debug(f"Strategy #{engine.strategy_id} - Time Limit exit at {index}: Holding={time_diff:.2f}h")
+                    logger.debug(f"Strategy #{engine.strategy_id} - Time Limit exit at {index}: "
+                               f"Holding={time_diff:.2f}h")
                     return f'Time Limit ({params["hours"]}h)'
             elif condition_name == 'signal_score':
                 score = engine.composite_signal_score(row)
@@ -860,18 +929,17 @@ def check_exit_conditions(df, index, engine):
                 engine.current_position['highest_price'] = max(engine.current_position['highest_price'], current_price)
                 stop_level = engine.current_position['highest_price'] - (row['ATR'] * params['atr_multiplier'])
                 if current_price <= stop_level:
-                    logger.debug(f"Strategy #{engine.strategy_id} - Trailing Stop exit at {index}: Price={current_price:.2f}, Stop={stop_level:.2f}")
+                    logger.debug(f"Strategy #{engine.strategy_id} - Trailing Stop exit at {index}: "
+                               f"Price={current_price:.2f}, Stop={stop_level:.2f}")
                     return f'Trailing Stop ({params["atr_multiplier"]}x ATR)'
             elif condition_name == 'adx_drop':
                 if row['adx_shifted'] < params['threshold']:
-                    logger.debug(f"Strategy #{engine.strategy_id} - ADX Drop exit at {index}: ADX={row['adx_shifted']:.2f}")
+                    logger.debug(f"Strategy #{engine.strategy_id} - ADX Drop exit at {index}: "
+                               f"ADX={row['adx_shifted']:.2f}")
                     return 'ADX Drop'
         
         return None
     
-    except KeyError as e:
-        logger.error(f"Strategy #{engine.strategy_id} - Missing data at {index}: '{e}'")
-        return None
     except Exception as e:
         logger.error(f"Strategy #{engine.strategy_id} - Error in exit check at {index}: {str(e)}", exc_info=True)
         return None
@@ -996,9 +1064,120 @@ def stochastic_oscillator(df, k_period=14, d_period=3):
     df['%D'] = df['%K'].rolling(d_period).mean()
     return df
 
+def calculate_point_in_time_indicators(df, index):
+    """
+    Calculate indicators using only data up to the given index.
+    Returns a Series with current values including shifted (previous) values.
+    """
+    df_past = df.loc[:index].copy()
+    if df_past.empty:
+        logger.warning(f"No past data available at {index}")
+        return pd.Series()
+
+    # Current row
+    row = df_past.iloc[-1].copy()
+    
+    # Ensure basic columns are numeric
+    for col in ['open', 'high', 'low', 'close', 'volume', 'hlc3', 'tr']:
+        if col in row:
+            row[col] = pd.to_numeric(row[col], errors='coerce')
+
+    # Previous row for shifted values (if available)
+    prev_row = df_past.iloc[-2] if len(df_past) > 1 else row.copy()
+
+    # ATR
+    row['ATR'] = df_past['tr'].rolling(14, min_periods=1).mean().iloc[-1]
+    row['ATR_shifted'] = prev_row['tr'] if len(df_past) > 1 else row['ATR']
+
+    # Meanrange and Meanline
+    row['meanrange'] = df_past['tr'].rolling(10, min_periods=1).mean().iloc[-1]
+    row['meanrange_shifted'] = prev_row['tr'] if len(df_past) > 1 else row['meanrange']
+    row['meanline'] = supersmoother(df_past['hlc3'], length=50, apply_savgol=False).iloc[-1]
+
+    # RSI
+    row['RSI'] = calculate_rsi(df_past['close']).iloc[-1]
+    row['RSI_shifted'] = calculate_rsi(df_past['close'].iloc[:-1]).iloc[-1] if len(df_past) > 1 else row['RSI']
+
+    # Williams %R
+    row['Williams_%R'] = williams_r(df_past['high'], df_past['low'], df_past['close']).iloc[-1]
+    row['Williams_%R_shifted'] = williams_r(df_past['high'].iloc[:-1], df_past['low'].iloc[:-1], 
+                                            df_past['close'].iloc[:-1]).iloc[-1] if len(df_past) > 1 else row['Williams_%R']
+
+    # MACD
+    macd, signal, hist = calculate_macd(df_past['close'])
+    row['MACD'] = macd.iloc[-1]
+    row['Signal'] = signal.iloc[-1]
+    row['Histogram'] = hist.iloc[-1]
+    if len(df_past) > 1:
+        macd_prev, signal_prev, hist_prev = calculate_macd(df_past['close'].iloc[:-1])
+        row['MACD_shifted'] = macd_prev.iloc[-1]
+        row['Signal_shifted'] = signal_prev.iloc[-1]
+        row['Histogram_shifted'] = hist_prev.iloc[-1]
+    else:
+        row['MACD_shifted'] = row['MACD']
+        row['Signal_shifted'] = row['Signal']
+        row['Histogram_shifted'] = row['Histogram']
+
+    # Stochastic Oscillator
+    df_past = stochastic_oscillator(df_past)
+    row['%K'] = df_past['%K'].iloc[-1]
+    row['%D'] = df_past['%D'].iloc[-1]
+    if len(df_past) > 1:
+        df_prev = stochastic_oscillator(df_past.iloc[:-1])
+        row['%K_shifted'] = df_prev['%K'].iloc[-1]
+        row['%D_shifted'] = df_prev['%D'].iloc[-1]
+    else:
+        row['%K_shifted'] = row['%K']
+        row['%D_shifted'] = row['%D']
+
+    # ADX
+    df_past = calculate_adx(df_past)
+    row['adx'] = df_past['adx'].iloc[-1]
+    row['+di'] = df_past['+di'].iloc[-1]
+    row['-di'] = df_past['-di'].iloc[-1]
+    if len(df_past) > 1:
+        df_prev = calculate_adx(df_past.iloc[:-1])
+        row['adx_shifted'] = df_prev['adx'].iloc[-1]
+        row['+di_shifted'] = df_prev['+di'].iloc[-1]
+        row['-di_shifted'] = df_prev['-di'].iloc[-1]
+    else:
+        row['adx_shifted'] = row['adx']
+        row['+di_shifted'] = row['+di']
+        row['-di_shifted'] = row['-di']
+
+    # VWAP (daily reset)
+    daily_data = df_past.loc[df_past.index.date == index.date()]
+    if not daily_data.empty:
+        daily_typical = (daily_data['hlc3'] * daily_data['volume']).sum()
+        daily_volume = daily_data['volume'].sum()
+        row['VWAP'] = daily_typical / daily_volume if daily_volume > 0 else row['close']
+        if len(df_past) > 1:
+            prev_daily = df_past.loc[df_past.index.date < index.date()]
+            if not prev_daily.empty:
+                prev_typical = (prev_daily['hlc3'] * prev_daily['volume']).sum()
+                prev_volume = prev_daily['volume'].sum()
+                row['VWAP_shifted'] = prev_typical / prev_volume if prev_volume > 0 else prev_row['close']
+            else:
+                row['VWAP_shifted'] = row['VWAP']
+        else:
+            row['VWAP_shifted'] = row['VWAP']
+    else:
+        row['VWAP'] = row['close']
+        row['VWAP_shifted'] = row['close']
+
+    # Volume MA
+    row['volume_ma'] = df_past['volume'].rolling(20, min_periods=1).mean().iloc[-1]
+    row['volume_ma_shifted'] = df_past['volume'].rolling(20, min_periods=1).mean().iloc[-2] if len(df_past) > 1 else row['volume_ma']
+
+    # Shifted close
+    row['close_shifted'] = prev_row['close'] if len(df_past) > 1 else row['close']
+
+    return row
+
+# Updated get_historical_data (remove precomputed indicators)
 def get_historical_data(ib, timeframe, exchange='SMART', currency='USD', backtest=False):
     """
-    Retrieve and process historical data for a specific timeframe.
+    Retrieve raw historical data for a specific timeframe without precomputed indicators.
     """
     try:
         contract = Stock(GlobalConfig.symbol, exchange, currency)
@@ -1027,7 +1206,6 @@ def get_historical_data(ib, timeframe, exchange='SMART', currency='USD', backtes
 
             logger.debug(f"Raw data shape for {timeframe}: {df.shape}")
             logger.debug(f"Raw data columns for {timeframe}: {df.columns.tolist()}")
-            logger.debug(f"Raw data sample for {timeframe}:\n{df.head().to_string()}")
 
             df['date'] = pd.to_datetime(df['date'], utc=True)
             df.set_index('date', inplace=True)
@@ -1048,39 +1226,14 @@ def get_historical_data(ib, timeframe, exchange='SMART', currency='USD', backtes
                     df[col] = df[col].clip(col_mean - 3 * col_std, col_mean + 3 * col_std)
                 df[col] = df[col].interpolate(method='linear', limit=2).ffill().bfill()
 
+            # Add basic derived columns needed for point-in-time calculations
             df['hlc3'] = (df['high'] + df['low'] + df['close']) / 3
-            df = calculate_mrc_with_gradient(df)
-            df = calculate_adx(df)
-            df = stochastic_oscillator(df)
-            df['VWAP'] = (df['hlc3'] * df['volume']).groupby(df.index.date).cumsum() / df['volume'].groupby(df.index.date).cumsum()
+            df['tr'] = df[['high', 'low', 'close']].apply(
+                lambda x: max(x['high'] - x['low'],
+                              abs(x['high'] - df['close'].shift().bfill().loc[x.name]),
+                              abs(x['low'] - df['close'].shift().bfill().loc[x.name])), axis=1)
 
-            exp12 = df['close'].ewm(span=12, adjust=False).mean()
-            exp26 = df['close'].ewm(span=26, adjust=False).mean()
-            df['MACD'] = exp12 - exp26
-            df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-            df['Histogram'] = df['MACD'] - df['Signal']
-            df['MACD'] = df['MACD'].fillna(0)
-            df['Signal'] = df['Signal'].fillna(0)
-            df['Histogram'] = df['Histogram'].fillna(0)
-
-            logger.debug(f"MACD sample for {timeframe}: {df['MACD'].head().tolist()}")
-            logger.debug(f"Signal sample for {timeframe}: {df['Signal'].head().tolist()}")
-            logger.debug(f"Histogram sample for {timeframe}: {df['Histogram'].head().tolist()}")
-
-            df['RSI'] = calculate_rsi(df['close']).fillna(50)
-            df['Williams_%R'] = williams_r(df['high'], df['low'], df['close']).fillna(-50)
-            df['ATR'] = df['tr'].rolling(14).mean().replace([np.inf, -np.inf], 0).fillna(0)
-            df['volume_ma'] = df['volume'].rolling(20).mean().fillna(df['volume'].mean())
-
-            shifted_cols = ['close', 'RSI', 'Williams_%R', 'VWAP', 'MACD', 'Signal', 'Histogram', 'adx', '+di', '-di', '%K', '%D', 'volume_ma', 'ATR']
-            for col in shifted_cols:
-                if col in df.columns:
-                    default_value = 0 if col in ['MACD', 'Signal', 'Histogram'] else df[col].mean()
-                    df[f'{col}_shifted'] = df[col].shift(1).fillna(default_value)
-                else:
-                    logger.warning(f"Could not shift missing column for {timeframe}: {col}")
-
-            logger.debug(f"Processed data shape for {timeframe}: {df.shape}")
+            logger.debug(f"Processed raw data shape for {timeframe}: {df.shape}")
             logger.debug(f"Missing values for {timeframe}:\n{df.isna().sum().to_string()}")
             return df
         return None
@@ -1362,7 +1515,7 @@ def execute_exit(strategy_id, engine, price, timestamp, exit_type, row):
 
 def run_backtest(df, timeframe):
     """
-    Run backtest for a specific timeframe with independent strategies.
+    Run backtest for a specific timeframe with independent strategies using point-in-time data.
     """
     try:
         if df is None or df.empty:
@@ -1372,35 +1525,35 @@ def run_backtest(df, timeframe):
         logger.debug(f"Starting backtest for {timeframe} with data shape: {df.shape}")
         logger.debug(f"Data columns for {timeframe}: {df.columns.tolist()}")
 
-        # Initialize engines independently for each strategy with timeframe
+        # Initialize engines for each strategy
         engines = {
             '1': BacktestEngine('1', 'time_based', timeframe),
             '2': BacktestEngine('2', 'signal_score', timeframe),
             '3': BacktestEngine('3', 'volatility_breakout', timeframe)
         }
 
-        required_cols = ['close', 'meanrange', 'ATR']
+        required_cols = ['open', 'high', 'low', 'close', 'volume', 'hlc3', 'tr']
         missing_cols = [col for col in required_cols if col not in df.columns]
         if missing_cols:
             logger.error(f"Missing required columns for {timeframe}: {missing_cols}")
             return None, None
 
-        for index, row in df.iterrows():
+        for index, _ in df.iterrows():
             if pd.isna(index):
                 logger.warning(f"Encountered NaN index at {timeframe}, skipping")
                 continue
                 
             logger.debug(f"Processing timestamp for {timeframe}: {index}")
             if not is_market_close(index):
+                row = calculate_point_in_time_indicators(df, index)
                 for strat_id, engine in engines.items():
                     try:
-                        # Each strategy operates independently
-                        if check_entry_conditions(df, index, engine):
+                        if check_entry_conditions(df, index, engine, row):
                             position_size = engine.calculate_position_size(row)
                             if position_size > 0:
                                 execute_entry(strat_id, engine, row['close'], index, position_size, row)
                         elif engine.current_position:
-                            exit_type = check_exit_conditions(df, index, engine)
+                            exit_type = check_exit_conditions(df, index, engine, row)
                             if exit_type:
                                 execute_exit(strat_id, engine, row['close'], index, exit_type, row)
                         else:
@@ -1420,10 +1573,12 @@ def run_backtest(df, timeframe):
                             non_trade_data.update(row.to_dict())
                             engine.backtest_data.append(non_trade_data)
                     except Exception as e:
-                        logger.error(f"Error processing strategy {strat_id} at {timeframe} {index}: {str(e)}")
+                        logger.error(f"Error processing strategy {strat_id} at {timeframe} {index}: {str(e)}",
+                                   exc_info=True)
 
         for strat_id, engine in engines.items():
-            logger.info(f"Strategy #{strat_id} completed for {timeframe} - Trades: {len(engine.trade_history)}, Balance: ${engine.balance:.2f}")
+            logger.info(f"Strategy #{strat_id} completed for {timeframe} - Trades: {len(engine.trade_history)}, "
+                       f"Balance: ${engine.balance:.2f}")
             
         return engines, df
     except Exception as e:
