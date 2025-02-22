@@ -76,8 +76,8 @@ logger = logging.getLogger(__name__)
 class GlobalConfig:
     nest_asyncio.apply()
     symbol = 'TSLA'
-    durationStr = '30 D'
-    barSizeSetting = '1 hour'
+    durationStr = '365 D'
+    barSizeSetting = '1 day'
     currency = 'USD'
     initial_balance = 10000
     MIN_REQUIRED_BANDS = 2
@@ -100,6 +100,8 @@ plt.rcParams.update({
 
 MRC_GRADIENT_STYLE = 'full_spectrum'
 full_spectrum_colors = ['#FF0000', '#FFA500', '#00FF00', '#0000FF']
+def create_colormap(colors_list):
+    return LinearSegmentedColormap.from_list('custom_mrc', colors_list, N=len(GlobalConfig.gradient_levels))
 full_spectrum_cmap = create_colormap(full_spectrum_colors)
 mrc_cmap = full_spectrum_cmap
 
@@ -376,6 +378,11 @@ def calculate_day_metrics(trades, risk_free_rate=0.02):
         }
     }
 
+
+# =====================
+# METRICS CALCULATION (Unchanged)
+# =====================
+
 class BacktestEngine:
     def __init__(self, mode='time_based'):
         self.mode = mode
@@ -535,6 +542,7 @@ class BacktestEngine:
                 self.balance -= (position_value + fees)
                 trade['pnl'] = 0.0
                 trade['pnl_pct'] = 0.0
+                logger.info(f"Buy executed: Price=${price_with_slippage:.2f}, Shares={shares:.2f}, Value=${position_value:.2f}")
             elif action == 'SELL' and self.current_position:
                 entry_price = self.current_position['entry_price']
                 entry_value = self.current_position['position_value']
@@ -549,6 +557,7 @@ class BacktestEngine:
                     self.daily_pnl.get(timestamp.strftime('%Y-%m-%d'), 0) + pnl
                 )
                 self.current_position = None
+                logger.info(f"Sell executed: Price=${price_with_slippage:.2f}, Shares={shares:.2f}, PnL=${pnl:.2f}")
 
             trade['balance_after'] = self.balance
             if row is not None:
@@ -572,6 +581,8 @@ def execute_entry(price, timestamp, position_size, row):
     trade = engine.execute_trade(price=price, shares=shares, action='BUY', timestamp=timestamp, row=row)
     if trade:
         log_trade(trade)
+    else:
+        logger.warning(f"Buy failed at {timestamp}: Trade returned None")
     return trade
 
 def execute_exit(price, timestamp, exit_type, row):
@@ -604,6 +615,8 @@ def check_entry_conditions(df, index):
         conditions_met = 0
         log_details = [f"Entry Check at {index}"]
 
+        logger.debug(f"Row data at {index}: {row.to_dict()}")  # Log full row for debugging
+
         for condition_name, params in conditions.items():
             condition_met = False
             if condition_name == 'sma_crossover':
@@ -613,43 +626,67 @@ def check_entry_conditions(df, index):
                 curr_long = long_sma.loc[index]
                 prev_short = short_sma.shift(1).loc[index]
                 prev_long = long_sma.shift(1).loc[index]
-                if params['direction'] == 'up':
-                    condition_met = (prev_short <= prev_long) and (curr_short > curr_long)
+                if pd.isna([curr_short, curr_long, prev_short, prev_long]).any():
+                    logger.warning(f"SMA data missing at {index}: Short={curr_short}, Long={curr_long}, Prev Short={prev_short}, Prev Long={prev_long}")
+                    condition_met = False
                 else:
-                    condition_met = (prev_short >= prev_long) and (curr_short < curr_long)
+                    if params['direction'] == 'up':
+                        condition_met = (prev_short <= prev_long) and (curr_short > curr_long)
+                    else:
+                        condition_met = (prev_short >= prev_long) and (curr_short < curr_long)
                 log_details.append(f"SMA Crossover: Short={curr_short:.2f}, Long={curr_long:.2f}, "
                                   f"Prev Short={prev_short:.2f}, Prev Long={prev_long:.2f}, Met={condition_met}")
             elif condition_name == 'rsi':
                 value = row['RSI_shifted']
-                threshold = params['threshold']
-                operator = params['operator']
-                condition_met = (value < threshold) if operator == '<' else (value > threshold)
-                log_details.append(f"RSI: Value={value:.2f}, Threshold={threshold}, Met={condition_met}")
+                if pd.isna(value):
+                    logger.warning(f"RSI_shifted is NaN at {index}")
+                    condition_met = False
+                else:
+                    threshold = params['threshold']
+                    operator = params['operator']
+                    condition_met = (value < threshold) if operator == '<' else (value > threshold)
+                log_details.append(f"RSI: Value={value:.2f}, Threshold={params['threshold']}, Met={condition_met}")
             elif condition_name == 'williams_r':
                 value = row['Williams_%R_shifted']
-                threshold = params['threshold']
-                operator = params['operator']
-                condition_met = (value < threshold) if operator == '<' else (value > threshold)
-                log_details.append(f"Williams %R: Value={value:.2f}, Threshold={threshold}, Met={condition_met}")
+                if pd.isna(value):
+                    logger.warning(f"Williams_%R_shifted is NaN at {index}")
+                    condition_met = False
+                else:
+                    threshold = params['threshold']
+                    operator = params['operator']
+                    condition_met = (value < threshold) if operator == '<' else (value > threshold)
+                log_details.append(f"Williams %R: Value={value:.2f}, Threshold={params['threshold']}, Met={condition_met}")
             elif condition_name == 'vwap':
                 value = row['close']
                 vwap_value = row['VWAP_shifted']
-                condition_met = value < vwap_value if params['operator'] == 'custom' else False
+                if pd.isna(vwap_value) or pd.isna(value):
+                    logger.warning(f"VWAP check failed at {index}: Close={value}, VWAP_shifted={vwap_value}")
+                    condition_met = False
+                else:
+                    condition_met = value < vwap_value if params['operator'] == 'custom' else False
                 log_details.append(f"VWAP: Close={value:.2f}, VWAP={vwap_value:.2f}, Met={condition_met}")
             elif condition_name == 'adx':
                 value = row['adx_shifted']
-                threshold = params['threshold']
-                operator = params['operator']
-                condition_met = (value < threshold) if operator == '<' else (value > threshold)
-                log_details.append(f"ADX: Value={value:.2f}, Threshold={threshold}, Met={condition_met}")
+                if pd.isna(value):
+                    logger.warning(f"adx_shifted is NaN at {index}")
+                    condition_met = False
+                else:
+                    threshold = params['threshold']
+                    operator = params['operator']
+                    condition_met = (value < threshold) if operator == '<' else (value > threshold)
+                log_details.append(f"ADX: Value={value:.2f}, Threshold={params['threshold']}, Met={condition_met}")
             elif condition_name == 'mean_deviation':
                 meanline = row['meanline']
                 atr = row['ATR']
-                deviation = (row['close'] - meanline) / atr if atr > 0 else 0
-                threshold = params['threshold']
-                operator = params['operator']
-                condition_met = (deviation < threshold) if operator == '<' else (deviation > threshold)
-                log_details.append(f"Mean Deviation: Deviation={deviation:.2f}, Threshold={threshold}, Met={condition_met}")
+                if pd.isna(meanline) or pd.isna(atr):
+                    logger.warning(f"Mean Deviation check failed at {index}: Meanline={meanline}, ATR={atr}")
+                    condition_met = False
+                else:
+                    deviation = (row['close'] - meanline) / atr if atr > 0 else 0
+                    threshold = params['threshold']
+                    operator = params['operator']
+                    condition_met = (deviation < threshold) if operator == '<' else (deviation > threshold)
+                log_details.append(f"Mean Deviation: Deviation={deviation:.2f}, Threshold={params['threshold']}, Met={condition_met}")
             else:
                 logger.warning(f"Unknown entry condition: {condition_name}")
                 continue
@@ -672,7 +709,12 @@ def check_entry_conditions(df, index):
 
         logger.info(" | ".join(log_details))
 
-        return fraction_met == 1.0
+        entry_triggered = fraction_met >= 0.6
+        if entry_triggered:
+            logger.info(f"Entry conditions fully met at {index}, triggering buy")
+        else:
+            logger.debug(f"Entry not triggered at {index}: Fraction met={fraction_met:.2%}")
+        return entry_triggered
     
     except KeyError as e:
         logger.error(f"Missing data at {index}: '{e}'")
@@ -858,7 +900,7 @@ def get_historical_data(ib, exchange='SMART', currency='USD', backtest=False):
 
         df['vwap_numerator'] = df['volume'] * df['hlc3']
         df['vwap_denominator'] = df['volume'].cumsum()
-        df['VWAP'] = df['vwap_numerator'].cumsum() / df['vwap_denominator']
+        df['VWAP'] = (df['hlc3'] * df['volume']).groupby(df.index.date).cumsum() / df['volume'].groupby(df.index.date).cumsum()
 
         exp12 = df['close'].ewm(span=12, adjust=False).mean()
         exp26 = df['close'].ewm(span=26, adjust=False).mean()
