@@ -22,44 +22,48 @@ from matplotlib.dates import DateFormatter
 from scipy.signal import savgol_filter
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from hyperopt import fmin, tpe, hp, Trials
 import random
-from itertools import product
+
 PARAM_RANGES = {
     'time_based': {
-        'position_risk': [0.01, 0.02, 0.03],
-        'volatility_mult': [1.0, 1.5, 2.0],
+        'position_risk': [0.005, 0.05],
+        'volatility_mult': [0.5, 3.0],
         'entry_conditions': {
-            'rsi': {'threshold': [30, 40, 50]},
-            'mean_deviation': {'threshold': [-0.5, -1.0, -1.5]},
+            'rsi': {'threshold': [20, 60]},
+            'mean_deviation': {'threshold': [-2.0, 0.0]},
         },
         'exit_conditions': {
-            'stop_loss': {'threshold': [-1.5, -2.5, -3.5]},
-            'mean_reversion': {'threshold': [0.3, 0.5, 0.7]},
+            'stop_loss': {'threshold': [-3.5, -1.5]},
+            'mean_reversion': {'threshold': [0.0, 1.0]},
         }
     },
     'signal_score': {
-        'position_risk': [0.01, 0.02, 0.03],
+        'position_risk': [0.005, 0.05],
         'entry_conditions': {
-            'rsi': {'threshold': [30, 35, 40]},
-            'williams_r': {'threshold': [-70, -80, -90]},
+            'rsi': {'threshold': [20, 60]},
+            'williams_r': {'threshold': [-90, -60]},
+            'mean_deviation': {'threshold': [-2.0, 0.0]},
         },
         'signal_weights': {
-            'rsi': [0.2, 0.25, 0.3],
-            'williams': [0.2, 0.25, 0.3],
+            'rsi': [0.2, 0.4],
+            'williams': [0.2, 0.4],
+            'mean_deviation': [0.3, 0.5],
         },
         'exit_conditions': {
-            'signal_score': {'threshold': [0.6, 0.65, 0.7]},
+            'signal_score': {'threshold': [0.6, 0.8]},
         }
     },
     'volatility_breakout': {
-        'position_risk': [0.01, 0.02, 0.03],
-        'volatility_mult': [1.5, 2.0, 2.5],
+        'position_risk': [0.005, 0.05],
+        'volatility_mult': [0.5, 3.0],
         'entry_conditions': {
-            'atr_breakout': {'multiplier': [1.0, 1.5, 2.0]},
-            'adx': {'threshold': [15, 20, 25]},
+            'atr_breakout': {'multiplier': [1.0, 2.5]},
+            'mean_deviation': {'threshold': [-2.0, 0.0]},
         },
         'exit_conditions': {
-            'trailing_stop': {'atr_multiplier': [1.5, 2.0, 2.5]},
+            'trailing_stop': {'atr_multiplier': [1.5, 3.0]},
+            'mean_reversion': {'threshold': [0.0, 1.0]},
         }
     }
 }
@@ -80,69 +84,6 @@ def update_config(base_config, mode, params):
             for sig, weight in value.items():
                 config['signal_weights'][sig] = weight
     return config
-
-def hypertune_strategy(ib, timeframe, mode, base_config, num_trials=10):
-    """Perform random search hypertuning for a given strategy mode."""
-    # Map mode to strategy_id
-    mode_to_id = {
-        'time_based': '1',
-        'signal_score': '2',
-        'volatility_breakout': '3'
-    }
-    strategy_id = mode_to_id[mode]
-
-    best_metrics = None
-    best_params = None
-    best_sharpe = -float('inf')
-
-    # Generate random parameter combinations
-    param_keys = PARAM_RANGES[mode].keys()
-    for trial in range(num_trials):
-        params = {}
-        for key in param_keys:
-            if key in ['position_risk', 'volatility_mult']:
-                params[key] = random.choice(PARAM_RANGES[mode][key])
-            elif key in ['entry_conditions', 'exit_conditions']:
-                params[key] = {
-                    cond: {p: random.choice(PARAM_RANGES[mode][key][cond][p]) 
-                           for p in PARAM_RANGES[mode][key][cond]}
-                    for cond in PARAM_RANGES[mode][key]
-                }
-            elif key == 'signal_weights':
-                weights = {sig: random.choice(PARAM_RANGES[mode][key][sig]) 
-                          for sig in PARAM_RANGES[mode][key]}
-                total = sum(weights.values())
-                params[key] = {sig: w / total for sig, w in weights.items()}  # Normalize weights
-
-        # Update engine config
-        engine = BacktestEngine(strategy_id, mode, timeframe)
-        engine.mode_config[mode] = update_config(base_config, mode, params)
-        
-        # Run backtest for this specific strategy only
-        daily_data = get_historical_data(ib, timeframe, backtest=True)
-        if daily_data is None:
-            logger.warning(f"Trial {trial + 1}/{num_trials} for {mode}: No data retrieved")
-            continue
-        engines, _ = run_backtest(daily_data, timeframe, single_strategy=strategy_id)
-        if engines is None or strategy_id not in engines:
-            logger.warning(f"Trial {trial + 1}/{num_trials} for {mode}: Backtest failed")
-            continue
-        
-        trades = engines[strategy_id].trade_history
-        metrics = calculate_day_metrics(trades)
-        sharpe = metrics['overall']['sharpe_ratio']
-
-        logger.info(f"Trial {trial + 1}/{num_trials} for {mode}: Sharpe={sharpe:.2f}, Params={params}")
-        if sharpe > best_sharpe:
-            best_sharpe = sharpe
-            best_metrics = metrics
-            best_params = params
-
-    if best_params:
-        logger.info(f"Best params for {mode} (ID {strategy_id}): {best_params}, Sharpe={best_sharpe:.2f}")
-    else:
-        logger.warning(f"No valid parameters found for {mode} after {num_trials} trials")
-    return best_params, best_metrics
 
 # =====================
 # LOGGING SETUP
@@ -176,9 +117,9 @@ logger = logging.getLogger(__name__)
 
 class GlobalConfig:
     nest_asyncio.apply()
-    symbol = 'MSFT'
-    durationStr = '14 D'
-    timeframes = ['5 mins', '15 mins']
+    symbol = 'AAPL'
+    durationStr = '30 D'
+    timeframes = ['5 mins', '15 mins', '30 mins', '1 hour']
     currency = 'USD'
     initial_balance = 10000
     MIN_REQUIRED_BANDS = 2
@@ -186,6 +127,11 @@ class GlobalConfig:
     colors = ['#FF0000', '#FFA500', '#00FF00', '#0000FF']
     outer_levels = ['weak', 'moderate', 'strong']
     volatility_threshold = 0.05
+    MODE_TO_ID = {
+    'time_based': '1',
+    'signal_score': '2',
+    'volatility_breakout': '3'
+    }
     STRATEGIES = {
         '1': 'time_based',
         '2': 'signal_score',
@@ -216,6 +162,98 @@ def create_colormap(colors_list):
     return LinearSegmentedColormap.from_list('custom_mrc', colors_list, N=len(GlobalConfig.gradient_levels))
 full_spectrum_cmap = create_colormap(full_spectrum_colors)
 mrc_cmap = full_spectrum_cmap
+
+# =====================
+# HYPER TUNING PARAMS
+# =====================
+def objective(params, ib, timeframe, mode, base_config, daily_data, fold_size, folds):
+    sharpe_sum = 0
+    for fold in range(folds):
+        start_idx = fold * fold_size
+        end_idx = (fold + 1) * fold_size if fold < folds - 1 else len(daily_data)
+        fold_data = daily_data.iloc[start_idx:end_idx]
+        engine = BacktestEngine(GlobalConfig.MODE_TO_ID[mode], mode, timeframe)
+        engine.mode_config[mode] = update_config(base_config, mode, params)
+        engines, _ = run_backtest(fold_data, timeframe, single_strategy=GlobalConfig.MODE_TO_ID[mode])
+        if engines is None or GlobalConfig.MODE_TO_ID[mode] not in engines:
+            return float('inf')
+        trades = engines[GlobalConfig.MODE_TO_ID[mode]].trade_history
+        metrics = calculate_day_metrics(trades)
+        # Multi-objective score: Sharpe + Profit Factor - Max Drawdown penalty
+        score = (metrics['overall']['sharpe_ratio'] * 0.5 +
+                 metrics['overall']['profit_factor'] * 0.3 -
+                 metrics['overall']['max_drawdown'] * 0.2)
+        sharpe_sum += score
+    return -sharpe_sum / folds  # Minimize negative average score
+
+def hypertune_strategy(ib, timeframe, mode, base_config, num_trials=10, folds=3):
+    daily_data = get_historical_data(ib, timeframe, backtest=True)
+    if daily_data is None:
+        logger.warning(f"No data retrieved for {mode} in {timeframe}")
+        return None, None
+    fold_size = len(daily_data) // folds
+    best_sharpe_avg = -float('inf')
+    best_params = None
+
+    strategy_id = GlobalConfig.MODE_TO_ID[mode]
+
+    for trial in range(num_trials):
+        params = {}
+        param_keys = PARAM_RANGES[mode].keys()
+        for key in param_keys:
+            if key in ['position_risk', 'volatility_mult']:
+                params[key] = random.uniform(PARAM_RANGES[mode][key][0], PARAM_RANGES[mode][key][1])
+            elif key in ['entry_conditions', 'exit_conditions']:
+                params[key] = {
+                    cond: {p: random.uniform(PARAM_RANGES[mode][key][cond][p][0], PARAM_RANGES[mode][key][cond][p][1])
+                           for p in PARAM_RANGES[mode][key][cond]}
+                    for cond in PARAM_RANGES[mode][key]
+                }
+            elif key == 'signal_weights' and mode == 'signal_score':
+                weights = {sig: random.uniform(PARAM_RANGES[mode][key][sig][0], PARAM_RANGES[mode][key][sig][1])
+                           for sig in PARAM_RANGES[mode][key]}
+                total = sum(weights.values())
+                params[key] = {sig: w / total for sig, w in weights.items()}  # Normalize weights
+
+        sharpe_sum = 0
+        for fold in range(folds):
+            start_idx = fold * fold_size
+            end_idx = (fold + 1) * fold_size if fold < folds - 1 else len(daily_data)
+            fold_data = daily_data.iloc[start_idx:end_idx]
+            engine = BacktestEngine(GlobalConfig.MODE_TO_ID[mode], mode, timeframe)
+            engine.mode_config[mode] = update_config(base_config, mode, params)
+            engines, _ = run_backtest(fold_data, timeframe, single_strategy=GlobalConfig.MODE_TO_ID[mode])
+            if engines and GlobalConfig.MODE_TO_ID[mode] in engines:
+                trades = engines[GlobalConfig.MODE_TO_ID[mode]].trade_history
+                metrics = calculate_day_metrics(trades)
+                sharpe_sum += metrics['overall']['sharpe_ratio']
+            else:
+                logger.warning(f"Trial {trial + 1}/{num_trials}, Fold {fold + 1}/{folds} for {mode}: Backtest failed")
+                sharpe_sum += -float('inf')  # Penalize failed backtests
+                break
+
+        avg_sharpe = sharpe_sum / folds if sharpe_sum > -float('inf') else -float('inf')
+        logger.info(f"Trial {trial + 1}/{num_trials} for {mode}: Avg Sharpe={avg_sharpe:.2f}, Params={params}")
+        if avg_sharpe > best_sharpe_avg:
+            best_sharpe_avg = avg_sharpe
+            best_params = params
+
+    if best_params:
+        # Run a final backtest with the best parameters on the full dataset
+        engine = BacktestEngine(strategy_id, mode, timeframe)
+        engine.mode_config[mode] = update_config(base_config, mode, best_params)
+        engines, _ = run_backtest(daily_data, timeframe, single_strategy=strategy_id)
+        if engines and strategy_id in engines:
+            trades = engines[strategy_id].trade_history
+            best_metrics = calculate_day_metrics(trades)
+            logger.info(f"Best params for {mode} (ID {strategy_id}): {best_params}, Avg Sharpe={best_sharpe_avg:.2f}")
+            return best_params, best_metrics
+        else:
+            logger.warning(f"Final backtest failed for {mode} with best params: {best_params}")
+            return best_params, None
+    else:
+        logger.warning(f"No valid parameters found for {mode} after {num_trials} trials")
+        return None, None
 
 # =====================
 # MARKET CLOSURE WARNING
@@ -445,45 +483,34 @@ class BacktestEngine:
                 'position_risk': 0.02,
                 'volatility_mult': 1.5,
                 'entry_conditions': {
-                    'mean_deviation': {'threshold': -1.0, 'operator': '<'},
-                    'rsi': {'threshold': 40, 'operator': '<'},
-                    'williams_r': {'threshold': -70, 'operator': '<'},
-                    'volatility_filter': {'threshold': 0.08, 'operator': '<'},
-                    'macd_histogram': {'threshold': 0, 'operator': '>'}
+                    'mean_deviation': {'threshold': -1.0, 'operator': '<'},  # Buy low
+                    'rsi': {'threshold': 30, 'operator': '<'},              # Oversold
+                    'volatility_filter': {'threshold': 0.08, 'operator': '<'}
                 },
                 'exit_conditions': {
-                    'mean_reversion': {'threshold': 0.5, 'operator': '>'},
-                    'stop_loss': {'threshold': -2.5, 'operator': '<'},
-                    'time_limit': {'hours': 24}
-                },
-                'signal_weights': {
-                    'rsi': 0.3,
-                    'mean_deviation': 0.3,
-                    'williams': 0.2,
-                    'volatility': 0.1,
-                    'macd': 0.1
+                    'mean_reversion': {'threshold': 0.0, 'operator': '>'},  # Sell high
+                    'stop_loss': {'threshold': -2.0, 'operator': '<'},
+                    'time_limit': {'hours': 12}
                 }
             },
             'signal_score': {
                 'position_risk': 0.02,
-                'volatility_mult': 1.5,
+                'volatility_mult': 1.5,  # Added to satisfy validation
                 'entry_conditions': {
-                    'rsi': {'threshold': 35, 'operator': '<'},
+                    'mean_deviation': {'threshold': -1.0, 'operator': '<'},
+                    'rsi': {'threshold': 30, 'operator': '<'},
                     'williams_r': {'threshold': -80, 'operator': '<'},
-                    'macd_crossover': {'direction': 'up'},
-                    'vwap': {'threshold': 'close < VWAP_shifted', 'operator': 'custom'},
-                    'stoch': {'%K_threshold': 30, '%D_threshold': 30, 'operator': '<'}
-                },
-                'exit_conditions': {
-                    'signal_score': {'threshold': 0.65},
-                    'stop_loss': {'threshold': -2.0, 'operator': '<'}
+                    'macd_crossover': {'direction': 'up'}  # Momentum confirmation
                 },
                 'signal_weights': {
-                    'rsi': 0.25,
-                    'williams': 0.25,
-                    'macd': 0.2,
-                    'vwap': 0.15,
-                    'stoch': 0.15
+                    'mean_deviation': 0.4,
+                    'rsi': 0.3,
+                    'macd': 0.15,
+                    'williams': 0.15
+                },
+                'exit_conditions': {
+                    'signal_score': {'threshold': 0.7},
+                    'stop_loss': {'threshold': -2.0, 'operator': '<'}
                 }
             },
             'volatility_breakout': {
@@ -491,20 +518,11 @@ class BacktestEngine:
                 'volatility_mult': 2.0,
                 'entry_conditions': {
                     'atr_breakout': {'multiplier': 1.5, 'operator': '>'},
-                    'adx': {'threshold': 20, 'operator': '>'},
-                    'di_spread': {'threshold': 5, 'operator': '>'},
-                    'volume': {'threshold': 'volume > volume_ma', 'operator': 'custom'}
+                    'mean_deviation': {'threshold': -0.5, 'operator': '<'}  # Reversion post-breakout
                 },
                 'exit_conditions': {
-                    'trailing_stop': {'atr_multiplier': 2.0},
-                    'adx_drop': {'threshold': 15, 'operator': '<'},
-                    'mean_reversion': {'threshold': 0.3, 'operator': '<'}
-                },
-                'signal_weights': {
-                    'atr': 0.3,
-                    'adx': 0.3,
-                    'di': 0.2,
-                    'volume': 0.2
+                    'mean_reversion': {'threshold': 0.0, 'operator': '>'},  # Sell high
+                    'trailing_stop': {'atr_multiplier': 2.0}
                 }
             }
         }
@@ -525,69 +543,59 @@ class BacktestEngine:
         return self.balance * 0.25
 
     def validate_mode_config(self):
-        required_keys = ['position_risk', 'volatility_mult', 'entry_conditions', 'exit_conditions', 'signal_weights']
+        required_keys = ['position_risk', 'volatility_mult', 'entry_conditions', 'exit_conditions']
+        signal_score_required = required_keys + ['signal_weights']  # Only signal_score needs signal_weights
         for mode, config in self.mode_config.items():
-            if not all(k in config for k in required_keys):
-                raise ValueError(f"Missing config keys in {mode}")
+            if mode == 'signal_score':
+                if not all(k in config for k in signal_score_required):
+                    raise ValueError(f"Missing config keys in {mode}")
+            else:
+                if not all(k in config for k in required_keys):
+                    raise ValueError(f"Missing config keys in {mode}")
 
     def calculate_position_size(self, row):
         config = self.mode_config[self.mode]
         risk_capital = self.balance * config['position_risk']
-        combined_vol = max(0.01, (max(0.01, row['meanrange']) * config['volatility_mult'] + row['ATR']) / 2)
-        position_size = min(self.max_position_size, risk_capital / combined_vol, self.balance * 0.5)
+        atr_risk = row['ATR_shifted'] * config['volatility_mult']
+        position_size = min(self.max_position_size, risk_capital / atr_risk, self.balance * 0.5)
         if not np.isfinite(position_size) or position_size <= 0:
             logger.warning(f"Strategy #{self.strategy_id}: Invalid position size calculated: {position_size}")
             return 0
-        logger.debug(f"Strategy #{self.strategy_id} - Position size: ${position_size:.2f} (Risk=${risk_capital:.2f}, Vol={combined_vol:.2f})")
+        logger.debug(f"Strategy #{self.strategy_id} - Position size: ${position_size:.2f} (Risk=${risk_capital:.2f}, ATR Risk={atr_risk:.2f})")
         return position_size
 
     def composite_signal_score(self, row):
         config = self.mode_config[self.mode]
-        weights = config['signal_weights']
+        weights = config['signal_weights'].copy()
         total_weight = sum(weights.values())
         scores = {}
         conditions_met = 0
-        total_conditions = len(weights) + 2
+        total_conditions = len(weights)
 
-        volatility_regime = 1 + min(2, (row['ATR'] / row['close']) * 2.5) if not pd.isna(row['ATR']) else 1.0
+        # Dynamic weighting based on volatility
+        volatility = row['ATR_shifted'] / row['close'] if row['close'] > 0 else 0.05
+        if volatility < 0.03:  # Low volatility: favor mean reversion
+            weights['mean_deviation'] *= 1.5
+            total_weight = sum(weights.values())
+
+        if 'mean_deviation' in weights:
+            deviation = (row['close'] - row['meanline']) / row['meanrange_shifted'] if row['meanrange_shifted'] > 0 else 0
+            scores['mean_deviation'] = weights['mean_deviation'] * min(1.0, max(0, (-deviation - 1.0) / 1.0))  # Normalized 0-1
+            conditions_met += 1 if deviation < -1.0 else 0
         if 'rsi' in weights:
-            rsi_value = row['RSI_shifted']
-            scores['rsi'] = weights['rsi'] if rsi_value < 35 else 0
-            conditions_met += 1 if rsi_value < 35 else 0
+            rsi = row['RSI_shifted']
+            scores['rsi'] = weights['rsi'] * min(1.0, max(0, (30 - rsi) / 30))  # Normalized 0-1
+            conditions_met += 1 if rsi < 30 else 0
         if 'williams' in weights:
-            williams_value = row['Williams_%R_shifted']
-            scores['williams'] = weights['williams'] if williams_value < -80 else 0
-            conditions_met += 1 if williams_value < -80 else 0
+            williams = row['Williams_%R_shifted']
+            scores['williams'] = weights['williams'] * min(1.0, max(0, (-80 - williams) / 20))  # Normalized 0-1
+            conditions_met += 1 if williams < -80 else 0
         if 'macd' in weights:
             scores['macd'] = weights['macd'] if row['MACD_shifted'] > row['Signal_shifted'] else 0
             conditions_met += 1 if row['MACD_shifted'] > row['Signal_shifted'] else 0
-        if 'vwap' in weights:
-            scores['vwap'] = weights['vwap'] if row['close_shifted'] < row['VWAP_shifted'] else 0
-            conditions_met += 1 if row['close_shifted'] < row['VWAP_shifted'] else 0
-        if 'stoch' in weights:
-            scores['stoch'] = weights['stoch'] if row['%K_shifted'] < 30 and row['%D_shifted'] < 30 else 0
-            conditions_met += 1 if row['%K_shifted'] < 30 and row['%D_shifted'] < 30 else 0
-        if 'atr' in weights:
-            atr_value = row['ATR'] / row['close']
-            scores['atr'] = weights['atr'] if atr_value > 0.05 else 0
-            conditions_met += 1 if atr_value > 0.05 else 0
-        if 'adx' in weights:
-            scores['adx'] = weights['adx'] if row['adx_shifted'] > 20 else 0
-            conditions_met += 1 if row['adx_shifted'] > 20 else 0
-        if 'di' in weights:
-            di_spread = row['+di_shifted'] - row['-di_shifted']
-            scores['di'] = weights['di'] if di_spread > 5 else 0
-            conditions_met += 1 if di_spread > 5 else 0
-        if 'volume' in weights:
-            scores['volume'] = weights['volume'] if row['volume'] > row['volume_ma'] else 0
-            conditions_met += 1 if row['volume'] > row['volume_ma'] else 0
 
-        conditions_met += 1 if row['+di_shifted'] > row['-di_shifted'] else 0
-        conditions_met += 1 if row['%K_shifted'] > row['%D_shifted'] else 0
-
-        weighted_score = sum(scores.values()) / total_weight if total_weight > 0 else 0
-        percentage_score = (conditions_met / total_conditions) * volatility_regime * weighted_score
-        return min(1.0, percentage_score)
+        weighted_score = sum(scores.values()) / total_weight
+        return weighted_score if conditions_met >= total_conditions * 0.75 else 0
 
     def apply_slippage(self, price, is_buy):
         slippage_factor = 1 + (self.slippage if is_buy else -self.slippage)
