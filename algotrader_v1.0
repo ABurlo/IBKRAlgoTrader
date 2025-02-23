@@ -152,7 +152,7 @@ logger = logging.getLogger(__name__)
 class GlobalConfig:
     nest_asyncio.apply()
     symbol = 'MSFT'
-    durationStr = '30 D'
+    durationStr = '180 D'
     timeframes = ['5 mins']
     currency = 'USD'
     initial_balance = 10000
@@ -630,7 +630,7 @@ class BacktestEngine:
         self.volatility_filter = {'min_mrc': 0.02, 'max_mrc': 0.08}
         self.daily_pnl = {}
         self.backtest_data = []
-        logger.info(f"Strategy #{strategy_id} ({mode}) initialized for {timeframe} with balance: ${self.balance}")
+        logger.info(f"Strategy {strategy_id} ({mode}) initialized for {timeframe} with balance: ${self.balance}")
 
     def validate_mode_config(self):
         """Validate that mode_config contains all required keys."""
@@ -653,31 +653,36 @@ class BacktestEngine:
         active_positions = len(self.current_positions)
         
         # Base risk capital is 2% of current balance
-        base_risk_capital = self.balance * config['position_risk']  # config['position_risk'] = 0.02 by default
+        base_risk_capital = self.balance * config['position_risk']  # 0.02 by default
         
         # Adjust risk based on number of active positions
-        risk_factor = max(1, active_positions * 0.5)  # Scales down with more positions
+        risk_factor = max(1, active_positions * 0.5)
         risk_capital = base_risk_capital / risk_factor
         
-        # ATR-based volatility adjustment
-        atr_risk = max(row['ATR_shifted'] * config['volatility_mult'], 0.01)  # Avoid division by zero
+        # ATR-based volatility adjustment with fallback
+        atr_shifted = row.get('ATR_shifted', 0)
+        if pd.isna(atr_shifted) or atr_shifted <= 0:
+            atr_shifted = 0.01  # Default if missing or invalid
+        atr_risk = max(atr_shifted * config['volatility_mult'], 0.01)
         
-        # Volume adjustment: Scale risk by volume relative to its moving average
-        volume_ratio = row['volume'] / row['volume_ma_shifted'] if row['volume_ma_shifted'] > 0 else 1.0
-        volume_factor = min(max(volume_ratio, 0.5), 2.0)  # Cap between 0.5x and 2x
+        # Volume adjustment with fallback
+        volume = row.get('volume', 0)
+        volume_ma_shifted = row.get('volume_ma_shifted', 1)  # Avoid division by zero
+        volume_ratio = volume / volume_ma_shifted if volume_ma_shifted > 0 else 1.0
+        volume_factor = min(max(volume_ratio, 0.5), 2.0)
         
-        # Risk-reward ratio adjustment (simplified estimate using ATR as potential loss)
+        # Risk-reward ratio adjustment
         potential_loss = atr_risk
-        potential_gain = atr_risk * 2  # Assume 2:1 reward-to-risk as a baseline
-        risk_reward_factor = min(max(potential_gain / potential_loss, 0.5), 2.0)  # Cap between 0.5x and 2x
+        potential_gain = atr_risk * 2  # 2:1 reward-to-risk baseline
+        risk_reward_factor = min(max(potential_gain / potential_loss, 0.5), 2.0)
         
-        # Calculate dynamic position size, respecting the 2% cap
+        # Calculate dynamic position size, respecting 2% cap
         dynamic_size = (risk_capital / atr_risk) * volume_factor * risk_reward_factor
-        position_size = min(self.max_position_size, dynamic_size)  # Strictly enforce 2% cap
-        position_size = max(position_size, GlobalConfig.MIN_TRADE_VALUE)  # Ensure minimum trade value
+        position_size = min(self.max_position_size, dynamic_size)
+        position_size = max(position_size, GlobalConfig.MIN_TRADE_VALUE)
         
         if not np.isfinite(position_size) or position_size <= 0:
-            logger.warning(f"Strategy #{self.strategy_id}: Invalid position size calculated: {position_size}")
+            logger.warning(f"Strategy #{self.strategy_id}: Invalid position size: {position_size}")
             return 0
         
         logger.debug(f"Strategy #{self.strategy_id} - Position size: ${position_size:.2f} (Base Risk=${base_risk_capital:.2f}, ATR Risk={atr_risk:.2f}, Volume Factor={volume_factor:.2f}, RR Factor={risk_reward_factor:.2f}, Active={active_positions})")
@@ -719,7 +724,7 @@ class BacktestEngine:
     def execute_trade(self, price, shares, action, timestamp, exit_type=None, row=None):
         if not is_price_valid(price):
             logger.warning(f"Strategy #{self.strategy_id}: Price ${price:.2f} outside allowed range "
-                          f"(${GlobalConfig.MIN_PRICE}-${GlobalConfig.MAX_PRICE})")
+                        f"(${GlobalConfig.MIN_PRICE}-${GlobalConfig.MAX_PRICE})")
             return None
 
         metrics = calculate_day_metrics(self.trade_history)
@@ -728,12 +733,18 @@ class BacktestEngine:
             return None
 
         try:
-            price_with_slippage = self.apply_slippage(price, action == 'BUY', row) if row is not None else price
+            price_with_slippage = price
+            if row is not None:
+                if 'high' in row and 'low' in row and not pd.isna(row['high']) and not pd.isna(row['low']):
+                    price_with_slippage = self.apply_slippage(price, action == 'BUY', row)
+                else:
+                    logger.warning(f"Strategy #{self.strategy_id}: Missing high/low in row, skipping slippage")
+            
             fees = self.calculate_fees(shares)
             position_value = shares * price_with_slippage
 
-            if position_value < GlobalConfig.MIN_TRADE_VALUE:
-                logger.warning(f"Strategy #{self.strategy_id}: Position value ${position_value:.2f} below minimum ${GlobalConfig.MIN_TRADE_VALUE}")
+            if not np.isfinite(position_value) or position_value < GlobalConfig.MIN_TRADE_VALUE:
+                logger.warning(f"Strategy #{self.strategy_id}: Invalid position value ${position_value:.2f} (min ${GlobalConfig.MIN_TRADE_VALUE})")
                 return None
 
             trade = {
@@ -753,7 +764,7 @@ class BacktestEngine:
                     logger.warning(f"Strategy #{self.strategy_id}: Insufficient funds: ${total_cost:.2f} > ${self.balance:.2f}")
                     return None
                 if position_value > self.max_position_size:
-                    logger.error(f"Strategy #{self.strategy_id}: Position value ${position_value:.2f} exceeds max position size ${self.max_position_size:.2f}")
+                    logger.error(f"Strategy #{self.strategy_id}: Position value ${position_value:.2f} exceeds max ${self.max_position_size:.2f}")
                     return None
                 position_id = len(self.current_positions)
                 self.current_positions.append({
@@ -799,11 +810,13 @@ class BacktestEngine:
                 trade['pnl_pct'] = pnl_pct
                 trade['entry_time'] = entry_time
                 trade['position_id'] = position['position_id']
+                # Add Profit_Outcome: 1 if profitable, 0 if not
+                trade['Profit_Outcome'] = 1 if pnl > 0 else 0
                 self.balance += (exit_value - fees)
                 self.daily_pnl[timestamp.strftime('%Y-%m-%d')] = (
                     self.daily_pnl.get(timestamp.strftime('%Y-%m-%d'), 0) + pnl
                 )
-                logger.info(f"Strategy #{self.strategy_id} - Sell: Position #{position['position_id']}, Entry=${entry_price:.2f}, Exit=${price_with_slippage:.2f}, Shares={shares:.2f}, PnL=${pnl:.2f}, Balance After=${self.balance:.2f}")
+                logger.info(f"Strategy #{self.strategy_id} - Sell: Position #{position['position_id']}, Entry=${entry_price:.2f}, Exit=${price_with_slippage:.2f}, Shares={shares:.2f}, PnL=${pnl:.2f}, Profit_Outcome={trade['Profit_Outcome']}, Balance After=${self.balance:.2f}")
 
             trade['balance_after'] = self.balance
             if row is not None:
@@ -1083,12 +1096,15 @@ def log_trade(trade):
         if 'pnl' not in trade or trade['pnl'] is None:
             logger.error(f"Trade missing PnL: {trade}")
             trade['pnl'] = 0.0
+        if 'Profit_Outcome' not in trade:
+            trade['Profit_Outcome'] = 1 if trade['pnl'] > 0 else 0
         log_parts.extend([
             f"PnL:   ${trade['pnl']:7.2f}",
             f"Return: {trade['pnl_pct']:6.2f}%",
+            f"Profit_Outcome: {trade['Profit_Outcome']}",
             f"Exit:  {trade['exit_type']}"
         ])
-        logger.info(f"Trade PnL Validation: {trade['pnl']:.2f} for Position #{trade['position_id']}")
+        logger.info(f"Trade PnL Validation: {trade['pnl']:.2f} for Position #{trade['position_id']}, Profit_Outcome: {trade['Profit_Outcome']}")
     logger.info(" | ".join(log_parts))
 
 def calculate_mrc_with_gradient(df, length=50, gradient_levels=GlobalConfig.gradient_levels, outer_levels=GlobalConfig.outer_levels):
@@ -1553,6 +1569,12 @@ def run_backtest(df, timeframe, collect_non_trades=False, single_strategy=None):
 
         # Calculate MRC with gradient
         df = calculate_mrc_with_gradient(df)
+        required_indicators = ['tr', 'volume', 'close', 'high', 'low']
+        missing = [col for col in required_indicators if col not in df.columns]
+        if missing:
+            logger.error(f"Missing required columns for indicators: {missing}")
+            return None, None
+
         df['ATR'] = df['tr'].rolling(14, min_periods=1).mean().fillna(0)
         df = calculate_adx(df)
         df = stochastic_oscillator(df)
@@ -1566,14 +1588,10 @@ def run_backtest(df, timeframe, collect_non_trades=False, single_strategy=None):
         df['Williams_%R'] = williams_r(df['high'], df['low'], df['close']).fillna(-50)
         df['volume_ma'] = df['volume'].rolling(20, min_periods=1).mean().fillna(df['volume'].mean())
         
-        # Calculate Bollinger Bands (kept for potential future use)
         df = calculate_bollinger_bands(df)
-        
-        # Calculate price divergence (kept for potential future use)
         df['price_change'] = df['close'].pct_change()
         df['price_divergence_shifted'] = df['price_change'].shift(1).fillna(0)
         
-        # Shift relevant columns
         shifted_cols = ['close', 'RSI', 'Williams_%R', 'VWAP', 'MACD', 'Signal', 'Histogram', 'adx', '+di', '-di', '%K', '%D', 'volume_ma', 'ATR', 'meanrange', 
                         'bollinger_mid', 'bollinger_upper', 'bollinger_lower', 'bollinger_zscore', 'bollinger_std']
         for col in shifted_cols:
@@ -1659,10 +1677,19 @@ def run_backtest(df, timeframe, collect_non_trades=False, single_strategy=None):
 # =====================
 def main():
     ib = IB()
+    max_retries = 3
     try:
         logger.info("Starting main execution with PCA, Time-Based, and Buy & Hold comparison")
-        ib.connect('127.0.0.1', 7497, clientId=1)
-        logger.info("Connected to IBKR")
+        for attempt in range(max_retries):
+            try:
+                ib.connect('127.0.0.1', 7497, clientId=1)
+                logger.info("Connected to IBKR")
+                break
+            except Exception as e:
+                logger.error(f"IB connection attempt {attempt + 1} failed: {str(e)}")
+                if attempt == max_retries - 1:
+                    raise
+                sleep(2)
 
         all_results = {}
         base_config = BacktestEngine('1', 'time_based', '5 mins').mode_config
@@ -1671,7 +1698,7 @@ def main():
             logger.info(f"Processing timeframe: {timeframe}")
             daily_data = get_historical_data(ib, timeframe, backtest=True)
             if daily_data is None:
-                logger.error(f"Failed to retrieve data for {timeframe}")
+                logger.error(f"Failed to retrieve data for {timeframe}, skipping")
                 continue
             if len(daily_data) < 2:
                 logger.error(f"Insufficient data for {timeframe} (rows: {len(daily_data)}), need at least 2 for Buy & Hold")
@@ -1683,7 +1710,7 @@ def main():
             tuned_engines = {}
             for mode in ['pca_stat_arb', 'time_based']:
                 logger.info(f"Hypertuning {mode} for {timeframe}")
-                result = hypertune_strategy(ib, timeframe, mode, base_config, num_trials=5)
+                result = hypertune_strategy(ib, timeframe, mode, base_config, num_trials=50)
                 if result is None:
                     logger.error(f"Hyperparameter tuning for {mode} returned None, skipping")
                     continue
@@ -1709,7 +1736,7 @@ def main():
             for strat_id, trades in trade_histories.items():
                 # Map 'A' and 'B' to 'A/1' and 'B/2' to match STRATEGIES keys
                 full_strat_id = 'A/1' if strat_id == 'A' else 'B/2' if strat_id == 'B' else strat_id
-                strat_name = f"Strategy #{strat_id} ({GlobalConfig.STRATEGIES[full_strat_id]})"
+                strat_name = f"Strategy {strat_id} ({GlobalConfig.STRATEGIES[full_strat_id]})"
                 metrics[strat_name] = calculate_day_metrics(trades)
                 print(f"\n=== {strat_name} Final Stats for {timeframe} TF ===")
                 print(f"# of Trades: {len(trades)}")
@@ -1760,6 +1787,14 @@ def main():
                         'max_drawdown': strat_metrics['overall']['max_drawdown'],
                         'avg_holding_hours': strat_metrics['overall']['avg_holding_hours']
                     })
+                for timeframe, result in all_results.items():
+                    for strat_id, engine in result['engines'].items():
+                        trades_df = pd.DataFrame(engine.trade_history)
+                        if not trades_df.empty:
+                            csv_filename = f"trade_history_{strat_id}_{timeframe.replace(' ', '_')}.csv"
+                            trades_df.to_csv(csv_filename, index=False)
+                            logger.info(f"Trade history for Strategy #{strat_id} on {timeframe} saved to {csv_filename}")
+
             results_df = pd.DataFrame(results_list)
             if not results_df.empty:
                 best_pnl = results_df.loc[results_df['total_pnl'].idxmax()]
