@@ -26,6 +26,7 @@ from hyperopt import fmin, tpe, hp, Trials
 import random
 import statsmodels.api as sm
 from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
 
 PARAM_RANGES = {
     'time_based': {
@@ -139,7 +140,7 @@ logger = logging.getLogger(__name__)
 
 class GlobalConfig:
     nest_asyncio.apply()
-    symbol = 'GIS'
+    symbol = 'MSFT'
     durationStr = '30 D'
     timeframes = ['5 mins']
     currency = 'USD'
@@ -222,76 +223,80 @@ def objective(params, ib, timeframe, mode, base_config, daily_data, fold_size, f
         engine.mode_config[mode] = update_config(base_config, mode, params)
         engines, _ = run_backtest(fold_data, timeframe, single_strategy=GlobalConfig.MODE_TO_ID[mode])
         if engines is None or GlobalConfig.MODE_TO_ID[mode] not in engines:
-            return float('inf')
+            return float('inf')  # Penalize failed backtests
         trades = engines[GlobalConfig.MODE_TO_ID[mode]].trade_history
         metrics = calculate_day_metrics(trades)
-        # Multi-objective score: Sharpe + Profit Factor - Max Drawdown penalty
         score = (metrics['overall']['sharpe_ratio'] * 0.5 +
                  metrics['overall']['profit_factor'] * 0.3 -
                  metrics['overall']['max_drawdown'] * 0.2)
         sharpe_sum += score
     return -sharpe_sum / folds  # Minimize negative average score
 
-def hypertune_strategy(ib, timeframe, mode, base_config, num_trials=10, folds=3):
+def hypertune_strategy(ib, timeframe, mode, base_config, num_trials=50, folds=3):
     daily_data = get_historical_data(ib, timeframe, backtest=True)
     if daily_data is None:
         logger.warning(f"No data retrieved for {mode} in {timeframe}")
         return None, None
-    fold_size = len(daily_data) // folds
-    best_sharpe_avg = -float('inf')
-    best_params = None
 
+    fold_size = len(daily_data) // folds
     strategy_id = GlobalConfig.MODE_TO_ID[mode]
 
-    for trial in range(num_trials):
-        params = {}
-        param_keys = PARAM_RANGES[mode].keys()
-        for key in param_keys:
-            if key in ['position_risk', 'volatility_mult']:
-                params[key] = random.uniform(PARAM_RANGES[mode][key][0], PARAM_RANGES[mode][key][1])
-            elif key in ['entry_conditions', 'exit_conditions']:
-                params[key] = {
-                    cond: {p: random.uniform(PARAM_RANGES[mode][key][cond][p][0], PARAM_RANGES[mode][key][cond][p][1])
-                           for p in PARAM_RANGES[mode][key][cond]}
-                    for cond in PARAM_RANGES[mode][key]
-                }
-            elif key == 'signal_weights' and mode == 'signal_score':
-                weights = {sig: random.uniform(PARAM_RANGES[mode][key][sig][0], PARAM_RANGES[mode][key][sig][1])
-                           for sig in PARAM_RANGES[mode][key]}
-                total = sum(weights.values())
-                params[key] = {sig: w / total for sig, w in weights.items()}  # Normalize weights
+    def objective_wrapper(params):
+        return objective(params, ib, timeframe, mode, base_config, daily_data, fold_size, folds)
 
-        sharpe_sum = 0
-        for fold in range(folds):
-            start_idx = fold * fold_size
-            end_idx = (fold + 1) * fold_size if fold < folds - 1 else len(daily_data)
-            fold_data = daily_data.iloc[start_idx:end_idx]
-            engine = BacktestEngine(GlobalConfig.MODE_TO_ID[mode], mode, timeframe)
-            engine.mode_config[mode] = update_config(base_config, mode, params)
-            engines, _ = run_backtest(fold_data, timeframe, single_strategy=GlobalConfig.MODE_TO_ID[mode])
-            if engines and GlobalConfig.MODE_TO_ID[mode] in engines:
-                trades = engines[GlobalConfig.MODE_TO_ID[mode]].trade_history
-                metrics = calculate_day_metrics(trades)
-                sharpe_sum += metrics['overall']['sharpe_ratio']
-            else:
-                logger.warning(f"Trial {trial + 1}/{num_trials}, Fold {fold + 1}/{folds} for {mode}: Backtest failed")
-                sharpe_sum += -float('inf')  # Penalize failed backtests
-                break
+    space = {}
+    for key in PARAM_RANGES[mode].keys():
+        if key in ['position_risk', 'volatility_mult']:
+            space[key] = hp.uniform(key, PARAM_RANGES[mode][key][0], PARAM_RANGES[mode][key][1])
+        elif key in ['entry_conditions', 'exit_conditions']:
+            space[key] = {
+                cond: {p: hp.uniform(f"{key}_{cond}_{p}", PARAM_RANGES[mode][key][cond][p][0], PARAM_RANGES[mode][key][cond][p][1])
+                       for p in PARAM_RANGES[mode][key][cond]}
+                for cond in PARAM_RANGES[mode][key]
+            }
+        elif key == 'signal_weights' and mode == 'signal_score':
+            space[key] = {
+                sig: hp.uniform(f"{key}_{sig}", PARAM_RANGES[mode][key][sig][0], PARAM_RANGES[mode][key][sig][1])
+                for sig in PARAM_RANGES[mode][key]
+            }
 
-        avg_sharpe = sharpe_sum / folds if sharpe_sum > -float('inf') else -float('inf')
-        logger.info(f"Trial {trial + 1}/{num_trials} for {mode}: Avg Sharpe={avg_sharpe:.2f}, Params={params}")
-        if avg_sharpe > best_sharpe_avg:
-            best_sharpe_avg = avg_sharpe
-            best_params = params
+    trials = Trials()
+    best = fmin(fn=objective_wrapper, space=space, algo=tpe.suggest, max_evals=num_trials, trials=trials)
+
+    best_params = {}
+    for key, value in best.items():
+        if key in ['position_risk', 'volatility_mult']:
+            best_params[key] = value
+        elif key.startswith('entry_conditions') or key.startswith('exit_conditions'):
+            parts = key.split('_')
+            section, cond, param = parts[0], parts[1], parts[2]
+            if section not in best_params:
+                best_params[section] = {}
+            if cond not in best_params[section]:
+                best_params[section][cond] = {}
+            best_params[section][cond][param] = value
+        elif key.startswith('signal_weights') and mode == 'signal_score':
+            if 'signal_weights' not in best_params:
+                best_params['signal_weights'] = {}
+            sig = key.split('_')[1]
+            best_params['signal_weights'][sig] = value
+
+    if 'signal_weights' in best_params:
+        total_weight = sum(best_params['signal_weights'].values())
+        if total_weight > 0:
+            best_params['signal_weights'] = {sig: w / total_weight for sig, w in best_params['signal_weights'].items()}
+
+    logger.info(f"Best params for {mode} after {num_trials} Bayesian trials: {best_params}")
 
     if best_params:
-        # Run a final backtest with the best parameters on the full dataset
         engine = BacktestEngine(strategy_id, mode, timeframe)
         engine.mode_config[mode] = update_config(base_config, mode, best_params)
         engines, _ = run_backtest(daily_data, timeframe, single_strategy=strategy_id)
         if engines and strategy_id in engines:
             trades = engines[strategy_id].trade_history
             best_metrics = calculate_day_metrics(trades)
+            # Correctly access 'loss' from the 'result' dictionary in trials
+            best_sharpe_avg = -min([t['result']['loss'] for t in trials.trials if t['result']['status'] == 'ok'])
             logger.info(f"Best params for {mode} (ID {strategy_id}): {best_params}, Avg Sharpe={best_sharpe_avg:.2f}")
             return best_params, best_metrics
         else:
@@ -524,6 +529,12 @@ def is_price_valid(price):
     """Check if the stock price is within acceptable range."""
     return GlobalConfig.MIN_PRICE <= price <= GlobalConfig.MAX_PRICE
 
+def advanced_regime_detection(df):
+    features = df[['adx_shifted', 'ATR_shifted', 'RSI_shifted']].dropna()
+    kmeans = KMeans(n_clusters=3).fit(features)
+    df['regime'] = kmeans.predict(features)
+    return df
+
 class BacktestEngine:
     def __init__(self, strategy_id, mode='time_based', timeframe='1 hour'):
         self.strategy_id = strategy_id
@@ -660,9 +671,9 @@ class BacktestEngine:
         weighted_score = sum(scores.values()) / total_weight
         return weighted_score if conditions_met >= total_conditions * 0.75 else 0
 
-    def apply_slippage(self, price, is_buy):
-        slippage_factor = 1 + (self.slippage if is_buy else -self.slippage)
-        return price * slippage_factor
+    def apply_slippage(self, price, is_buy, row):
+        spread = (row['high'] - row['low']) * 0.5  # Proxy for bid-ask spread
+        return price * (1 + (spread / price) if is_buy else -(spread / price))
     
     def calculate_fees(self, shares):
         return abs(shares * self.fee_per_share)
@@ -670,14 +681,20 @@ class BacktestEngine:
     def execute_trade(self, price, shares, action, timestamp, exit_type=None, row=None):
         if not is_price_valid(price):
             logger.warning(f"Strategy #{self.strategy_id}: Price ${price:.2f} outside allowed range "
-                          f"(${GlobalConfig.MIN_PRICE}-${GlobalConfig.MAX_PRICE})")
+                        f"(${GlobalConfig.MIN_PRICE}-${GlobalConfig.MAX_PRICE})")
             return None
         if action == 'BUY' and self.current_position:
             logger.warning(f"Strategy #{self.strategy_id}: Buy rejected - existing position")
             return None
+        
+        metrics = calculate_day_metrics(self.trade_history)
+        if metrics['overall']['max_drawdown'] > 20:
+            logger.error(f"Strategy #{self.strategy_id}: Max drawdown exceeded. Halting.")
+            return None
 
         try:
-            price_with_slippage = self.apply_slippage(price, action == 'BUY')
+            # Pass row to apply_slippage; handle None case if needed
+            price_with_slippage = self.apply_slippage(price, action == 'BUY', row) if row is not None else price
             fees = self.calculate_fees(shares)
             position_value = shares * price_with_slippage
 
@@ -1511,7 +1528,7 @@ def main():
         logger.info("Connected to IBKR")
 
         all_results = {}
-        base_config = BacktestEngine('1', 'time_based', '5 mins').mode_config  # Base config from any strategy
+        base_config = BacktestEngine('1', 'time_based', '5 mins').mode_config
 
         for timeframe in GlobalConfig.timeframes:
             logger.info(f"Hypertuning for timeframe: {timeframe}")
@@ -1524,7 +1541,11 @@ def main():
             tuned_engines = {}
             for mode in ['time_based', 'signal_score', 'pca_stat_arb', 'bollinger_reversion', 'rsi_divergence']:
                 logger.info(f"Hypertuning {mode} for {timeframe}")
-                best_params, best_metrics = hypertune_strategy(ib, timeframe, mode, base_config, num_trials=5)
+                result = hypertune_strategy(ib, timeframe, mode, base_config, num_trials=5)
+                if result is None:
+                    logger.error(f"Hyperparameter tuning for {mode} returned None, skipping")
+                    continue
+                best_params, best_metrics = result
                 if best_params:
                     strategy_id = GlobalConfig.MODE_TO_ID[mode]
                     tuned_engine = BacktestEngine(strategy_id, mode, timeframe)
@@ -1533,11 +1554,10 @@ def main():
                     print_backtest_report(best_metrics, timeframe, f"Tuned {mode}")
 
             # Run final backtest with tuned parameters (all strategies)
-            engines, daily_data = run_backtest(daily_data, timeframe)  # No single_strategy here
+            engines, daily_data = run_backtest(daily_data, timeframe)
             if engines is None:
                 continue
 
-            # Plotting and reporting
             plot_candlestick(daily_data, bar_size=timeframe, backtest=True)
 
             trade_histories = {strat_id: engine.trade_history for strat_id, engine in engines.items()}
@@ -1552,7 +1572,6 @@ def main():
 
             all_results[timeframe] = {'engines': engines, 'metrics': metrics, 'data': daily_data}
 
-        # Summary
         if all_results:
             print("\n=== Multi-Timeframe Backtest Summary ===")
             results_list = []
