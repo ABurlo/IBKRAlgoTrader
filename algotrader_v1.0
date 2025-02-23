@@ -651,15 +651,36 @@ class BacktestEngine:
     def calculate_position_size(self, row):
         config = self.mode_config[self.mode]
         active_positions = len(self.current_positions)
-        risk_factor = max(1, active_positions * 0.5)  # Reduce risk as positions increase, but no hard limit
-        risk_capital = self.balance * config['position_risk'] / risk_factor
+        
+        # Base risk capital is 2% of current balance
+        base_risk_capital = self.balance * config['position_risk']  # config['position_risk'] = 0.02 by default
+        
+        # Adjust risk based on number of active positions
+        risk_factor = max(1, active_positions * 0.5)  # Scales down with more positions
+        risk_capital = base_risk_capital / risk_factor
+        
+        # ATR-based volatility adjustment
         atr_risk = max(row['ATR_shifted'] * config['volatility_mult'], 0.01)  # Avoid division by zero
-        position_size = min(self.max_position_size, risk_capital / atr_risk, self.balance * 0.5)
+        
+        # Volume adjustment: Scale risk by volume relative to its moving average
+        volume_ratio = row['volume'] / row['volume_ma_shifted'] if row['volume_ma_shifted'] > 0 else 1.0
+        volume_factor = min(max(volume_ratio, 0.5), 2.0)  # Cap between 0.5x and 2x
+        
+        # Risk-reward ratio adjustment (simplified estimate using ATR as potential loss)
+        potential_loss = atr_risk
+        potential_gain = atr_risk * 2  # Assume 2:1 reward-to-risk as a baseline
+        risk_reward_factor = min(max(potential_gain / potential_loss, 0.5), 2.0)  # Cap between 0.5x and 2x
+        
+        # Calculate dynamic position size, respecting the 2% cap
+        dynamic_size = (risk_capital / atr_risk) * volume_factor * risk_reward_factor
+        position_size = min(self.max_position_size, dynamic_size)  # Strictly enforce 2% cap
+        position_size = max(position_size, GlobalConfig.MIN_TRADE_VALUE)  # Ensure minimum trade value
+        
         if not np.isfinite(position_size) or position_size <= 0:
             logger.warning(f"Strategy #{self.strategy_id}: Invalid position size calculated: {position_size}")
             return 0
-        position_size = max(position_size, GlobalConfig.MIN_TRADE_VALUE)
-        logger.debug(f"Strategy #{self.strategy_id} - Position size: ${position_size:.2f} (Risk=${risk_capital:.2f}, ATR Risk={atr_risk:.2f}, Active={active_positions})")
+        
+        logger.debug(f"Strategy #{self.strategy_id} - Position size: ${position_size:.2f} (Base Risk=${base_risk_capital:.2f}, ATR Risk={atr_risk:.2f}, Volume Factor={volume_factor:.2f}, RR Factor={risk_reward_factor:.2f}, Active={active_positions})")
         return position_size
 
     def apply_slippage(self, price, is_buy, row):
@@ -730,6 +751,9 @@ class BacktestEngine:
                 total_cost = position_value + fees
                 if total_cost > self.balance:
                     logger.warning(f"Strategy #{self.strategy_id}: Insufficient funds: ${total_cost:.2f} > ${self.balance:.2f}")
+                    return None
+                if position_value > self.max_position_size:
+                    logger.error(f"Strategy #{self.strategy_id}: Position value ${position_value:.2f} exceeds max position size ${self.max_position_size:.2f}")
                     return None
                 position_id = len(self.current_positions)
                 self.current_positions.append({
@@ -1488,10 +1512,10 @@ def print_backtest_report(metrics, bar_size, strategy_name):
 
 def execute_entry(strategy_id, engine, price, timestamp, position_size, row):
     timestamp = enforce_ny_timezone(pd.to_datetime(timestamp))
-    # Use position_size directly instead of recalculating shares
-    shares = max(1, round(position_size / price, 0))  # Minimum 1 share, rounded to whole shares
+    # Calculate shares with 2dp fractional precision
+    shares = max(0.01, round(position_size / price, 2))  # Minimum 0.01 shares, 2dp precision
     if not np.isfinite(shares):
-        logger.error(f"Strategy #{strategy_id}: Invalid share calculation")
+        logger.error(f"Strategy #{strategy_id}: Invalid share calculation: Shares={shares}")
         return None
     trade = engine.execute_trade(price=price, shares=shares, action='BUY', timestamp=timestamp, row=row)
     if trade:
