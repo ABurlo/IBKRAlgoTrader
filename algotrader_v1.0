@@ -553,7 +553,6 @@ class BacktestEngine:
         self.mode = mode
         self.timeframe = timeframe
         self.mode_config = {
-            # Existing configuration remains unchanged
             'time_based': {
                 'position_risk': 0.02,
                 'volatility_mult': 1.5,
@@ -569,9 +568,60 @@ class BacktestEngine:
                     'profit_target': {'threshold': 2.25}
                 }
             },
-            # Other modes remain unchanged...
+            'signal_score': {
+                'position_risk': 0.02,
+                'volatility_mult': 1.5,
+                'entry_conditions': {
+                    'mean_deviation': {'threshold': -0.5, 'operator': '<'},
+                    'rsi': {'threshold': 40, 'operator': '<'},
+                    'williams_r': {'threshold': -70, 'operator': '<'}
+                },
+                'signal_weights': {
+                    'mean_deviation': 0.4,
+                    'rsi': 0.3,
+                    'williams': 0.3
+                },
+                'exit_conditions': {
+                    'signal_score': {'threshold': 0.7}
+                }
+            },
+            'pca_stat_arb': {
+                'position_risk': 0.02,
+                'volatility_mult': 1.0,
+                'num_equities': 20,
+                'rebalance_days': 30,
+                'entry_conditions': {
+                    'zscore': {'threshold': -1.0, 'operator': '<'}
+                },
+                'exit_conditions': {
+                    'zscore_reversion': {'threshold': 0.0, 'operator': '>'}
+                }
+            },
+            'bollinger_reversion': {
+                'position_risk': 0.02,
+                'volatility_mult': 1.5,
+                'entry_conditions': {
+                    'bollinger_zscore': {'threshold': -2.0, 'operator': '<'}
+                },
+                'exit_conditions': {
+                    'mean_reversion': {'threshold': 0.0, 'operator': '>'},
+                    'stop_loss': {'threshold': -3.0, 'operator': '<'}
+                }
+            },
+            'rsi_divergence': {
+                'position_risk': 0.02,
+                'volatility_mult': 1.5,
+                'entry_conditions': {
+                    'rsi': {'threshold': 30, 'operator': '<'},
+                    'price_divergence': {'threshold': -0.01, 'operator': '<'}
+                },
+                'exit_conditions': {
+                    'rsi_reversion': {'threshold': 50, 'operator': '>'},
+                    'stop_loss': {'threshold': -2.0, 'operator': '<'}
+                }
+            }
         }
-        self.validate_mode_config()
+        self.validate_mode_config()  # Validate the configuration
         self.balance = GlobalConfig.initial_balance
         self.current_positions = []  # No limit on positions
         self.trade_history = []
@@ -582,14 +632,25 @@ class BacktestEngine:
         self.backtest_data = []
         logger.info(f"Strategy #{strategy_id} ({mode}) initialized for {timeframe} with balance: ${self.balance}")
 
+    def validate_mode_config(self):
+        """Validate that mode_config contains all required keys."""
+        required_keys = ['position_risk', 'volatility_mult', 'entry_conditions', 'exit_conditions']
+        signal_score_required = required_keys + ['signal_weights']
+        for mode, config in self.mode_config.items():
+            if mode == 'signal_score':
+                if not all(k in config for k in signal_score_required):
+                    raise ValueError(f"Missing config keys in {mode}: {set(signal_score_required) - set(config.keys())}")
+            else:
+                if not all(k in config for k in required_keys):
+                    raise ValueError(f"Missing config keys in {mode}: {set(required_keys) - set(config.keys())}")
+
     @property
     def max_position_size(self):
-        return self.balance * 0.02  # Still caps individual position size at 2% of balance
+        return self.balance * 0.02  # Caps individual position size at 2% of balance
 
     def calculate_position_size(self, row):
         config = self.mode_config[self.mode]
         active_positions = len(self.current_positions)
-        # Adjust risk based on number of positions to prevent overexposure
         risk_factor = max(1, active_positions * 0.5)  # Reduce risk as positions increase, but no hard limit
         risk_capital = self.balance * config['position_risk'] / risk_factor
         atr_risk = max(row['ATR_shifted'] * config['volatility_mult'], 0.01)  # Avoid division by zero
@@ -600,6 +661,39 @@ class BacktestEngine:
         position_size = max(position_size, GlobalConfig.MIN_TRADE_VALUE)
         logger.debug(f"Strategy #{self.strategy_id} - Position size: ${position_size:.2f} (Risk=${risk_capital:.2f}, ATR Risk={atr_risk:.2f}, Active={active_positions})")
         return position_size
+
+    def apply_slippage(self, price, is_buy, row):
+        spread = (row['high'] - row['low']) * 0.5  # Proxy for bid-ask spread
+        return price * (1 + (spread / price) if is_buy else -(spread / price))
+
+    def calculate_fees(self, shares):
+        return abs(shares * self.fee_per_share)
+
+    def composite_signal_score(self, row):
+        config = self.mode_config[self.mode]
+        if self.mode != 'signal_score':
+            return 0.0
+        weights = config['signal_weights'].copy()
+        total_weight = sum(weights.values())
+        scores = {}
+        conditions_met = 0
+        total_conditions = len(weights)
+
+        if 'mean_deviation' in weights:
+            deviation = (row['close'] - row['meanline']) / row['meanrange_shifted'] if row['meanrange_shifted'] > 0 else 0
+            scores['mean_deviation'] = weights['mean_deviation'] * min(1.0, max(0, (-deviation - 1.0) / 1.0))
+            conditions_met += 1 if deviation < -1.0 else 0
+        if 'rsi' in weights:
+            rsi = row['RSI_shifted']
+            scores['rsi'] = weights['rsi'] * min(1.0, max(0, (30 - rsi) / 30))
+            conditions_met += 1 if rsi < 30 else 0
+        if 'williams' in weights:
+            williams = row['Williams_%R_shifted']
+            scores['williams'] = weights['williams'] * min(1.0, max(0, (-80 - williams) / 20))
+            conditions_met += 1 if williams < -80 else 0
+
+        weighted_score = sum(scores.values()) / total_weight if total_weight > 0 else 0
+        return weighted_score if conditions_met >= total_conditions * 0.75 else 0
 
     def execute_trade(self, price, shares, action, timestamp, exit_type=None, row=None):
         if not is_price_valid(price):
@@ -880,7 +974,8 @@ def check_all_entry_conditions(df, index, engines, row):
             conditions_results['volume'] = volume_condition
             log_details.append(f"Volume Ratio: {volume_condition:.2f}")
         
-        conditions_results['position_ok'] = {strat_id: engine.balance > 1000 and len(engine.current_positions) < engine.max_positions 
+        # Updated position_ok: Only check balance, no position limit
+        conditions_results['position_ok'] = {strat_id: engine.balance > 1000 
                                             for strat_id, engine in engines.items()}
         conditions_results['time_ok'] = not is_market_close(index)
         log_details.append(f"Time OK: {conditions_results['time_ok']}")
