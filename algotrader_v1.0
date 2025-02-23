@@ -790,19 +790,19 @@ def check_exit_conditions(df, index, engine, row):
         entry_time = engine.current_position['entry_time']
         entry_price = engine.current_position['entry_price']
         current_price = row['close']
-        meanrange = row['meanrange_shifted']
+        meanrange = row.get('meanrange_shifted', 0)  # Default to 0 if missing
 
         for condition_name, params in conditions.items():
             if condition_name == 'mean_reversion':
                 if engine.mode == 'bollinger_reversion':
                     # Use bollinger_std_shifted, handle potential NaN or missing values
                     bollinger_std_shifted = row.get('bollinger_std_shifted', 0)
-                    deviation = (current_price - row['bollinger_mid_shifted']) / bollinger_std_shifted if bollinger_std_shifted > 0 else 0
+                    deviation = (current_price - row.get('bollinger_mid_shifted', current_price)) / bollinger_std_shifted if bollinger_std_shifted > 0 else 0
                     if abs(deviation) < abs(params['threshold']):  # Exit when close to mid-band
                         logger.debug(f"Strategy #{engine.strategy_id} - Bollinger Mean Reversion exit at {index}: Deviation={deviation:.2f}")
                         return 'Bollinger Mean Reversion'
                 else:
-                    deviation = (current_price - row['meanline']) / meanrange if meanrange > 0 else 0
+                    deviation = (current_price - row.get('meanline', current_price)) / meanrange if meanrange > 0 else 0
                     if deviation > params['threshold']:
                         logger.debug(f"Strategy #{engine.strategy_id} - Mean Reversion exit at {index}: Deviation={deviation:.2f}")
                         return 'Mean Reversion'
@@ -825,7 +825,7 @@ def check_exit_conditions(df, index, engine, row):
                 if 'highest_price' not in engine.current_position:
                     engine.current_position['highest_price'] = entry_price
                 engine.current_position['highest_price'] = max(engine.current_position['highest_price'], current_price)
-                stop_level = engine.current_position['highest_price'] - (row['ATR_shifted'] * params['atr_multiplier'])
+                stop_level = engine.current_position['highest_price'] - (row.get('ATR_shifted', 0) * params['atr_multiplier'])
                 if current_price <= stop_level:
                     logger.debug(f"Strategy #{engine.strategy_id} - Trailing Stop exit at {index}: Price={current_price:.2f}, Stop={stop_level:.2f}")
                     return f'Trailing Stop ({params["atr_multiplier"]}x ATR)'
@@ -835,7 +835,7 @@ def check_exit_conditions(df, index, engine, row):
                     logger.debug(f"Strategy #{engine.strategy_id} - Z-Score Reversion exit at {index}: Z-Score={zscore:.2f}")
                     return 'Z-Score Reversion'
             elif condition_name == 'rsi_reversion':
-                rsi = row['RSI_shifted']
+                rsi = row.get('RSI_shifted', 50)  # Default to 50 if missing
                 if rsi > params['threshold']:
                     logger.debug(f"Strategy #{engine.strategy_id} - RSI Reversion exit at {index}: RSI={rsi:.2f}")
                     return 'RSI Reversion'
