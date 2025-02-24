@@ -25,8 +25,57 @@ from concurrent.futures import ThreadPoolExecutor
 import statsmodels.api as sm
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
+from sklearn.model_selection import ParameterGrid
+from bayes_opt import BayesianOptimization
 
-# Removed PARAM_RANGES since it's only used for hypertuning
+param_grid = {
+    'bollinger_zscore': [-3.0, -2.5, -2.0],
+    'band_width': [0.03, 0.05, 0.07],
+    'volume_spike': [1.2, 1.5, 2.0],
+    'mean_reversion': [0.3, 0.5, 0.7],
+    'stop_loss': [-0.01, -0.02, -0.03],
+    'trailing_stop_atr': [0.5, 1.0, 1.5]
+}
+
+def optimize_strategy_a(df, timeframe='5 mins'):
+    """Optimize Strategy A (Bollinger Bands MR) using Bayesian optimization."""
+    logger.info(f"Starting Bayesian optimization for Strategy A on {timeframe}")
+
+    def evaluate_strategy_a(zscore, band_width, volume_spike, mean_reversion, stop_loss, trailing_atr):
+        engine = BacktestEngine('A', 'bollinger_reversion', timeframe)
+        # Set thresholds
+        engine.mode_config['bollinger_reversion']['entry_conditions']['bollinger_zscore']['threshold'] = zscore
+        engine.mode_config['bollinger_reversion']['entry_conditions']['band_width']['threshold'] = band_width
+        engine.mode_config['bollinger_reversion']['entry_conditions']['volume_spike']['threshold'] = volume_spike
+        engine.mode_config['bollinger_reversion']['exit_conditions']['mean_reversion']['threshold'] = lambda row: mean_reversion
+        engine.mode_config['bollinger_reversion']['exit_conditions']['stop_loss']['threshold'] = stop_loss
+        engine.mode_config['bollinger_reversion']['exit_conditions']['trailing_stop']['atr_multiplier'] = trailing_atr
+        
+        engines, _ = run_backtest(df, timeframe)
+        if engines is None or 'A' not in engines:
+            logger.error("Backtest failed during optimization")
+            return -1.0  # Penalize failed runs
+        metrics = calculate_day_metrics(engines['A'].trade_history)
+        return metrics['overall']['sharpe_ratio']
+
+    pbounds = {
+        'zscore': (-3.0, -1.5),
+        'band_width': (0.03, 0.10),
+        'volume_spike': (1.2, 2.5),
+        'mean_reversion': (0.3, 1.0),
+        'stop_loss': (-0.03, -0.01),
+        'trailing_atr': (0.5, 2.0)
+    }
+
+    optimizer = BayesianOptimization(f=evaluate_strategy_a, pbounds=pbounds, random_state=1)
+    optimizer.maximize(init_points=5, n_iter=20)
+    
+    logger.info(f"Best parameters for Strategy A: {optimizer.max['params']}")
+    logger.info(f"Best Sharpe Ratio: {optimizer.max['target']:.2f}")
+    print("Best parameters and Sharpe Ratio for Strategy A:")
+    print(optimizer.max)
+    
+    return optimizer.max  # Return best result for further use
 
 def update_config(base_config, mode, params):
     """Update the mode_config with parameters (kept for potential future use)."""
@@ -622,32 +671,24 @@ class BacktestEngine:
             return None
 
     def compute_pca_zscores(self, df, row):
-        config = self.mode_config[self.mode]
-        if self.mode != 'pca_stat_arb':
-            return 0.0
-        
-        days = int(GlobalConfig.durationStr.replace(' D', ''))
-        bars_per_day = {'5 mins': 78, '15 mins': 26, '30 mins': 13, '1 hour': 6.5}
-        bars_per_day = bars_per_day.get(self.timeframe, 78)
-        lookback = int(days * bars_per_day)
-        
+        lookback = 78 * 30  # 30 days at 5-min bars
         if len(df) < lookback:
             return 0.0
         
         history = df.iloc[-lookback:].copy()
         history['returns'] = history['close'].pct_change().fillna(0)
-        history['rsi_scaled'] = (history['RSI_shifted'] - 50) / 50  # Normalize RSI
-        history['volume_scaled'] = history['volume'] / history['volume_ma_shifted'] - 1  # Normalize volume
+        history['rsi_scaled'] = (history['RSI_shifted'] - 50) / 50
+        history['volume_scaled'] = history['volume'] / history['volume_ma_shifted'] - 1
+        history['macd_scaled'] = history['MACD_shifted'] / history['ATR_shifted']  # New feature
         
-        features = history[['returns', 'rsi_scaled', 'volume_scaled']].fillna(0)
+        features = history[['returns', 'rsi_scaled', 'volume_scaled', 'macd_scaled']].fillna(0)
         pca = PCA(n_components=1)
         factors = pca.fit_transform(features)
         
         X = sm.add_constant(factors)
         model = sm.OLS(history['close'], X).fit()
         residuals = model.resid
-        
-        zscore = (residuals.iloc[-1] - residuals.mean()) / residuals.std()
+        zscore = (residuals.iloc[-1] - residuals.mean()) / residuals.std(ddof=1)
         return zscore
 
 # =====================
@@ -1359,7 +1400,7 @@ def main():
     ib = IB()
     max_retries = 3
     try:
-        logger.setLevel(logging.DEBUG)  # Add this line
+        logger.setLevel(logging.DEBUG)
         logger.info("Starting main execution with Bollinger Bands MR, Stat Arb MR, and Buy & Hold comparison")
         for attempt in range(max_retries):
             try:
@@ -1464,8 +1505,11 @@ def main():
                         print(f"  Total PnL: ${strat_metrics['overall']['total_pnl']:.2f}")
                         print(f"  Sharpe Ratio: {strat_metrics['overall']['sharpe_ratio']:.2f}")
                         print(f"  Max Drawdown: {strat_metrics['overall']['max_drawdown']:.2f}%")
+
             else:
                 logger.warning("No results to summarize across timeframes")
+
+            optimized_result = optimize_strategy_a(all_results['5 mins']['data'], '5 mins')
 
     except Exception as e:
         logger.error(f"Main execution error: {str(e)}", exc_info=True)
