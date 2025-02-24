@@ -83,7 +83,7 @@ logger = logging.getLogger(__name__)
 class GlobalConfig:
     nest_asyncio.apply()
     symbol = 'MSFT'
-    durationStr = '30 D'
+    durationStr = '7 D'
     timeframes = ['5 mins']
     currency = 'USD'
     initial_balance = 10000
@@ -96,16 +96,16 @@ class GlobalConfig:
     MAX_PRICE = 1000.0
     MIN_TRADE_VALUE = 10.0
     MODE_TO_ID = {
-        'time_based': 'A/1',
-        'pca_stat_arb': 'B/2'
+        'bollinger_reversion': 'A',
+        'pca_stat_arb': 'B'
     }
     STRATEGIES = {
-        'A/1': 'time_based',
-        'B/2': 'pca_stat_arb'
+        'A': 'bollinger_reversion',
+        'B': 'pca_stat_arb'
     }
     STRATEGY_LABELS = {
-        'A/1': 'A: Time-Based',
-        'B/2': 'B: PCA Stat Arb',
+        'A': 'A: Bollinger Bands MR',
+        'B': 'B: Stat Arb MR',
         'buy_and_hold': 'Benchmark: Buy & Hold'
     }
 
@@ -142,8 +142,6 @@ def detect_market_regime(row):
         return 'mean_reverting'
     else:
         return 'trending'
-
-# Removed objective and hypertune_strategy functions
 
 # =====================
 # MARKET CLOSURE WARNING
@@ -381,41 +379,23 @@ def advanced_regime_detection(df):
     return df
 
 class BacktestEngine:
-    def __init__(self, strategy_id, mode='time_based', timeframe='1 hour'):
+    def __init__(self, strategy_id, mode, timeframe='5 mins'):
         self.strategy_id = strategy_id
         self.mode = mode
         self.timeframe = timeframe
         self.mode_config = {
-            'time_based': {
+            'bollinger_reversion': {
                 'position_risk': 0.02,
                 'volatility_mult': 1.5,
                 'entry_conditions': {
-                    'rsi': {'threshold': 40},
-                    'mean_deviation': {'threshold': -1.0},
-                    'volume': {'threshold': 1.25}
+                    'bollinger_zscore': {'threshold': -2.5, 'operator': '<'},
+                    'band_width': {'threshold': 0.05, 'operator': '>'},
+                    'volume_spike': {'threshold': 1.5, 'operator': '>'}
                 },
                 'exit_conditions': {
-                    'stop_loss': {'threshold': -1.5},
-                    'mean_reversion': {'threshold': 0.5},
-                    'trailing_stop': {'atr_multiplier': 3.0},
-                    'profit_target': {'threshold': 2.25}
-                }
-            },
-            'signal_score': {
-                'position_risk': 0.02,
-                'volatility_mult': 1.5,
-                'entry_conditions': {
-                    'mean_deviation': {'threshold': -0.5, 'operator': '<'},
-                    'rsi': {'threshold': 40, 'operator': '<'},
-                    'williams_r': {'threshold': -70, 'operator': '<'}
-                },
-                'signal_weights': {
-                    'mean_deviation': 0.4,
-                    'rsi': 0.3,
-                    'williams': 0.3
-                },
-                'exit_conditions': {
-                    'signal_score': {'threshold': 0.7}
+                    'mean_reversion': {'threshold': lambda row: min(0.5, row['ATR_shifted'] * 1.0), 'operator': '>'},  # Relaxed to 0.5 or ATR
+                    'stop_loss': {'threshold': -0.015, 'operator': '<'},
+                    'trailing_stop': {'atr_multiplier': 1.0}  # Tightened to 1.0x ATR
                 }
             },
             'pca_stat_arb': {
@@ -424,33 +404,13 @@ class BacktestEngine:
                 'num_equities': 20,
                 'rebalance_days': 30,
                 'entry_conditions': {
-                    'zscore': {'threshold': -1.0, 'operator': '<'}
+                    'zscore': {'threshold': lambda row: -1.5 - row['ATR_shifted'] * 0.5, 'operator': '<'},
+                    'regime': {'threshold': 'mean_reverting', 'operator': '=='}
                 },
                 'exit_conditions': {
-                    'zscore_reversion': {'threshold': 0.0, 'operator': '>'}
-                }
-            },
-            'bollinger_reversion': {
-                'position_risk': 0.02,
-                'volatility_mult': 1.5,
-                'entry_conditions': {
-                    'bollinger_zscore': {'threshold': -2.0, 'operator': '<'}
-                },
-                'exit_conditions': {
-                    'mean_reversion': {'threshold': 0.0, 'operator': '>'},
-                    'stop_loss': {'threshold': -3.0, 'operator': '<'}
-                }
-            },
-            'rsi_divergence': {
-                'position_risk': 0.02,
-                'volatility_mult': 1.5,
-                'entry_conditions': {
-                    'rsi': {'threshold': 30, 'operator': '<'},
-                    'price_divergence': {'threshold': -0.01, 'operator': '<'}
-                },
-                'exit_conditions': {
-                    'rsi_reversion': {'threshold': 50, 'operator': '>'},
-                    'stop_loss': {'threshold': -2.0, 'operator': '<'}
+                    'zscore_reversion': {'threshold': -0.5, 'operator': '>'},  # Relaxed from 0.0 to -0.5
+                    'profit_target': {'threshold': 0.5, 'operator': '>'},  # Relaxed from 1.0 to 0.5
+                    'stop_loss': {'threshold': -2.5, 'operator': '<'}
                 }
             }
         }
@@ -484,33 +444,28 @@ class BacktestEngine:
         config = self.mode_config[self.mode]
         active_positions = len(self.current_positions)
         
-        base_risk_capital = self.balance * config['position_risk']
+        metrics = calculate_day_metrics(self.trade_history)
+        drawdown_factor = max(0.5, 1 - metrics['overall']['max_drawdown'] / 50)  # Reduce size if drawdown > 50%
+        
+        base_risk_capital = self.balance * config['position_risk'] * drawdown_factor
         risk_factor = max(1, active_positions * 0.5)
         risk_capital = base_risk_capital / risk_factor
         
-        atr_shifted = row.get('ATR_shifted', 0)
-        if pd.isna(atr_shifted) or atr_shifted <= 0:
-            atr_shifted = 0.01
+        atr_shifted = max(row.get('ATR_shifted', 0.01), 0.01)  # Ensure minimum ATR
         atr_risk = max(atr_shifted * config['volatility_mult'], 0.01)
         
-        volume = row.get('volume', 0)
-        volume_ma_shifted = row.get('volume_ma_shifted', 1)
-        volume_ratio = volume / volume_ma_shifted if volume_ma_shifted > 0 else 1.0
+        volume_ratio = row['volume'] / row['volume_ma_shifted'] if row['volume_ma_shifted'] > 0 else 1.0
         volume_factor = min(max(volume_ratio, 0.5), 2.0)
         
-        potential_loss = atr_risk
-        potential_gain = atr_risk * 2
-        risk_reward_factor = min(max(potential_gain / potential_loss, 0.5), 2.0)
-        
-        dynamic_size = (risk_capital / atr_risk) * volume_factor * risk_reward_factor
-        position_size = min(self.max_position_size, dynamic_size)
+        position_size = (risk_capital / atr_risk) * volume_factor
+        position_size = min(self.max_position_size, position_size)
         position_size = max(position_size, GlobalConfig.MIN_TRADE_VALUE)
         
-        if not np.isfinite(position_size) or position_size <= 0:
-            logger.warning(f"Strategy #{self.strategy_id}: Invalid position size: {position_size}")
+        if atr_shifted < 0.01:  # Avoid low-volatility trades
+            logger.warning(f"Strategy {self.strategy_id}: ATR too low ({atr_shifted:.4f}), skipping trade")
             return 0
         
-        logger.debug(f"Strategy #{self.strategy_id} - Position size: ${position_size:.2f} (Base Risk=${base_risk_capital:.2f}, ATR Risk={atr_risk:.2f}, Volume Factor={volume_factor:.2f}, RR Factor={risk_reward_factor:.2f}, Active={active_positions})")
+        logger.debug(f"Strategy {self.strategy_id} - Position size: ${position_size:.2f} (Drawdown Factor={drawdown_factor:.2f})")
         return position_size
 
     def apply_slippage(self, price, is_buy, row):
@@ -546,30 +501,48 @@ class BacktestEngine:
         weighted_score = sum(scores.values()) / total_weight if total_weight > 0 else 0
         return weighted_score if conditions_met >= total_conditions * 0.75 else 0
 
-    def execute_trade(self, price, shares, action, timestamp, exit_type=None, row=None):
+    def execute_trade(self, price, shares, action, timestamp, exit_type=None, row=None, position=None):
         if not is_price_valid(price):
-            logger.warning(f"Strategy #{self.strategy_id}: Price ${price:.2f} outside allowed range "
+            logger.warning(f"Strategy {self.strategy_id}: Price ${price:.2f} outside allowed range "
                         f"(${GlobalConfig.MIN_PRICE}-${GlobalConfig.MAX_PRICE})")
             return None
 
         metrics = calculate_day_metrics(self.trade_history)
         if metrics['overall']['max_drawdown'] > 20:
-            logger.error(f"Strategy #{self.strategy_id}: Max drawdown exceeded. Halting.")
+            logger.error(f"Strategy {self.strategy_id}: Max drawdown exceeded. Halting.")
+            return None
+
+        if action == 'BUY' and len(self.current_positions) >= 5:
+            logger.warning(f"Strategy {self.strategy_id}: Max positions (5) reached, skipping buy")
             return None
 
         try:
             price_with_slippage = price
             if row is not None:
                 if 'high' in row and 'low' in row and not pd.isna(row['high']) and not pd.isna(row['low']):
-                    price_with_slippage = self.apply_slippage(price, action == 'BUY', row)
+                    spread = (row['high'] - row['low']) * 0.5
+                    spread_factor = spread / price
+                    # Cap spread_factor to prevent extreme adjustments
+                    spread_factor = min(max(spread_factor, -0.1), 0.1)  # Limit to ±10%
+                    price_with_slippage = price * (1 + spread_factor if action == 'BUY' else 1 - spread_factor)
+                    logger.debug(f"Strategy {self.strategy_id}: Slippage applied - Price={price:.2f}, Spread={spread:.2f}, Adjusted Price={price_with_slippage:.2f}")
                 else:
-                    logger.warning(f"Strategy #{self.strategy_id}: Missing high/low in row, skipping slippage")
+                    logger.warning(f"Strategy {self.strategy_id}: Missing high/low in row, skipping slippage")
+                    price_with_slippage = price
+            
+            if not np.isfinite(price_with_slippage) or price_with_slippage <= 0:
+                logger.error(f"Strategy {self.strategy_id}: Invalid price_with_slippage: {price_with_slippage}")
+                return None
             
             fees = self.calculate_fees(shares)
             position_value = shares * price_with_slippage
 
-            if not np.isfinite(position_value) or position_value < GlobalConfig.MIN_TRADE_VALUE:
-                logger.warning(f"Strategy #{self.strategy_id}: Invalid position value ${position_value:.2f} (min ${GlobalConfig.MIN_TRADE_VALUE})")
+            if not np.isfinite(position_value) or position_value <= 0:
+                logger.error(f"Strategy {self.strategy_id}: Invalid position value ${position_value:.2f} (shares={shares}, price_with_slippage={price_with_slippage})")
+                return None
+            # Relax MIN_TRADE_VALUE for sells to allow closing positions
+            if action == 'BUY' and position_value < GlobalConfig.MIN_TRADE_VALUE:
+                logger.warning(f"Strategy {self.strategy_id}: Position value ${position_value:.2f} below min ${GlobalConfig.MIN_TRADE_VALUE} for BUY")
                 return None
 
             trade = {
@@ -586,10 +559,10 @@ class BacktestEngine:
             if action == 'BUY':
                 total_cost = position_value + fees
                 if total_cost > self.balance:
-                    logger.warning(f"Strategy #{self.strategy_id}: Insufficient funds: ${total_cost:.2f} > ${self.balance:.2f}")
+                    logger.warning(f"Strategy {self.strategy_id}: Insufficient funds: ${total_cost:.2f} > ${self.balance:.2f}")
                     return None
                 if position_value > self.max_position_size:
-                    logger.error(f"Strategy #{self.strategy_id}: Position value ${position_value:.2f} exceeds max ${self.max_position_size:.2f}")
+                    logger.error(f"Strategy {self.strategy_id}: Position value ${position_value:.2f} exceeds max ${self.max_position_size:.2f}")
                     return None
                 position_id = len(self.current_positions)
                 self.current_positions.append({
@@ -607,19 +580,15 @@ class BacktestEngine:
                 trade['pnl_pct'] = 0.0
                 trade['entry_time'] = timestamp
                 trade['position_id'] = position_id
-                logger.info(f"Strategy #{self.strategy_id} - Buy: Position #{position_id}, Price=${price_with_slippage:.2f}, Shares={shares:.2f}, Value=${position_value:.2f}, Balance After=${self.balance:.2f}")
+                logger.info(f"Strategy {self.strategy_id} - Buy: Position #{position_id}, Price=${price_with_slippage:.2f}, Shares={shares:.2f}, Value=${position_value:.2f}, Balance After=${self.balance:.2f}")
 
             elif action == 'SELL':
-                if not self.current_positions:
-                    logger.warning(f"Strategy #{self.strategy_id}: Sell attempted with no positions")
-                    return None
-                if not exit_type or 'Pos #' not in exit_type:
-                    logger.error(f"Strategy #{self.strategy_id}: Invalid exit_type format: {exit_type}")
-                    return None
-                pos_id = int(exit_type.split('Pos #')[1].strip(')'))
-                position = next((p for p in self.current_positions if p['position_id'] == pos_id), None)
                 if not position:
-                    logger.warning(f"Strategy #{self.strategy_id}: Position #{pos_id} not found for sell")
+                    logger.error(f"Strategy {self.strategy_id}: No position provided for sell")
+                    return None
+                logger.debug(f"Strategy {self.strategy_id}: Before sell, positions={len(self.current_positions)}, removing Pos #{position['position_id']}")
+                if position not in self.current_positions:
+                    logger.error(f"Strategy {self.strategy_id}: Position #{position['position_id']} not in current_positions: {self.current_positions}")
                     return None
                 self.current_positions.remove(position)
                 entry_price = position['entry_price']
@@ -628,7 +597,7 @@ class BacktestEngine:
                 exit_value = price_with_slippage * shares
                 pnl = exit_value - entry_value - fees
                 if not np.isfinite(pnl):
-                    logger.error(f"Strategy #{self.strategy_id}: Invalid PnL calculated: {pnl}")
+                    logger.error(f"Strategy {self.strategy_id}: Invalid PnL calculated: {pnl} (entry_value={entry_value}, exit_value={exit_value}, fees={fees})")
                     pnl = 0.0
                 pnl_pct = (pnl / entry_value) * 100 if entry_value != 0 else 0
                 trade['pnl'] = pnl
@@ -638,9 +607,9 @@ class BacktestEngine:
                 trade['Profit_Outcome'] = 1 if pnl > 0 else 0
                 self.balance += (exit_value - fees)
                 self.daily_pnl[timestamp.strftime('%Y-%m-%d')] = (
-                    self.daily_pnl.get(timestamp.strftime('%Y-%m-%d'), 0) + pnl
+                    self.daily_pnl.get(timestamp.strftime('%Y-m-%d'), 0) + pnl
                 )
-                logger.info(f"Strategy #{self.strategy_id} - Sell: Position #{position['position_id']}, Entry=${entry_price:.2f}, Exit=${price_with_slippage:.2f}, Shares={shares:.2f}, PnL=${pnl:.2f}, Profit_Outcome={trade['Profit_Outcome']}, Balance After=${self.balance:.2f}")
+                logger.info(f"Strategy {self.strategy_id} - Sell: Position #{position['position_id']}, Entry=${entry_price:.2f}, Exit=${price_with_slippage:.2f}, Shares={shares:.2f}, PnL=${pnl:.2f}, Profit_Outcome={trade['Profit_Outcome']}, Balance After=${self.balance:.2f}")
 
             trade['balance_after'] = self.balance
             if row is not None:
@@ -649,7 +618,7 @@ class BacktestEngine:
             self.backtest_data.append(trade)
             return trade
         except Exception as e:
-            logger.error(f"Strategy #{self.strategy_id} trade execution failed: {str(e)}", exc_info=True)
+            logger.error(f"Strategy {self.strategy_id} trade execution failed: {str(e)}", exc_info=True)
             return None
 
     def compute_pca_zscores(self, df, row):
@@ -667,9 +636,12 @@ class BacktestEngine:
         
         history = df.iloc[-lookback:].copy()
         history['returns'] = history['close'].pct_change().fillna(0)
+        history['rsi_scaled'] = (history['RSI_shifted'] - 50) / 50  # Normalize RSI
+        history['volume_scaled'] = history['volume'] / history['volume_ma_shifted'] - 1  # Normalize volume
         
+        features = history[['returns', 'rsi_scaled', 'volume_scaled']].fillna(0)
         pca = PCA(n_components=1)
-        factors = pca.fit_transform(history[['returns']])
+        factors = pca.fit_transform(features)
         
         X = sm.add_constant(factors)
         model = sm.OLS(history['close'], X).fit()
@@ -698,66 +670,60 @@ def check_exit_conditions(df, index, engine, row):
         for pos in engine.current_positions[:]:
             entry_time = pos['entry_time']
             entry_price = pos['entry_price']
-            logger.debug(f"Checking exit for Pos #{pos['position_id']} at {index}: Entry=${entry_price:.2f}, Current=${current_price:.2f}")
+            deviation = (current_price - entry_price) / entry_price
+            logger.debug(f"Checking exit for Pos #{pos['position_id']} at {index}: Entry=${entry_price:.2f}, Current=${current_price:.2f}, Deviation={deviation:.2%}")
+            
+            # Add detailed logging of key indicators
+            bollinger_std_shifted = row.get('bollinger_std_shifted', 1) or 1
+            bollinger_mid_shifted = row.get('bollinger_mid_shifted', current_price)
+            bollinger_deviation = (current_price - bollinger_mid_shifted) / bollinger_std_shifted
+            atr = row.get('ATR_shifted', 1) or 1
+            zscore = engine.compute_pca_zscores(df, row) if engine.mode == 'pca_stat_arb' else 0.0
+            logger.debug(f"Strategy {engine.strategy_id}: ATR={atr:.2f}, Bollinger Deviation={bollinger_deviation:.2f}, Z-Score={zscore:.2f}")
+            
             for condition_name, params in conditions.items():
-                if condition_name == 'mean_reversion':
-                    if engine.mode == 'bollinger_reversion':
-                        bollinger_std_shifted = row.get('bollinger_std_shifted', 0) or 1
-                        deviation = (current_price - row.get('bollinger_mid_shifted', current_price)) / bollinger_std_shifted
-                        if abs(deviation) < abs(params['threshold']):
-                            logger.info(f"Triggered {condition_name} exit for Pos #{pos['position_id']}: Deviation={deviation:.2f} < {params['threshold']}")
-                            return f'Bollinger Mean Reversion (Pos #{pos["position_id"]})'
-                    else:
-                        deviation = (current_price - row.get('meanline', current_price)) / meanrange
-                        if deviation > params['threshold']:
-                            logger.info(f"Triggered {condition_name} exit for Pos #{pos['position_id']}: Deviation={deviation:.2f} > {params['threshold']}")
-                            return f'Mean Reversion (Pos #{pos["position_id"]})'
-                    logger.debug(f"No {condition_name} exit for Pos #{pos['position_id']}: Deviation={deviation:.2f}")
+                # Handle conditions with 'threshold' key
+                if 'threshold' in params:
+                    threshold = params['threshold'] if isinstance(params['threshold'], (int, float)) else params['threshold'](row) if callable(params['threshold']) else params['threshold']
+                
+                if condition_name == 'mean_reversion' and engine.mode == 'bollinger_reversion':
+                    if abs(bollinger_deviation) < abs(threshold):
+                        logger.info(f"Triggered {condition_name} exit for Pos #{pos['position_id']}: Deviation={bollinger_deviation:.2f} < {threshold:.2f}")
+                        return f'Bollinger Mean Reversion (Pos #{pos["position_id"]})'
+                    logger.debug(f"No {condition_name} exit for Pos #{pos['position_id']}: Deviation={bollinger_deviation:.2f}, Threshold={threshold:.2f}")
+                
                 elif condition_name == 'stop_loss':
-                    deviation = (current_price - entry_price) / entry_price
-                    if deviation < params['threshold']:
-                        logger.info(f"Triggered {condition_name} exit for Pos #{pos['position_id']}: Deviation={deviation:.2%} < {params['threshold']:.2%}")
+                    if deviation < threshold:
+                        logger.info(f"Triggered {condition_name} exit for Pos #{pos['position_id']}: Deviation={deviation:.2%} < {threshold:.2%}")
                         return f'Stop Loss (Pos #{pos["position_id"]})'
-                    logger.debug(f"No {condition_name} exit for Pos #{pos['position_id']}: Deviation={deviation:.2%}")
-                elif condition_name == 'trailing_stop':
+                    logger.debug(f"No {condition_name} exit for Pos #{pos['position_id']}: Deviation={deviation:.2%}, Threshold={threshold:.2%}")
+                
+                elif condition_name == 'trailing_stop' and engine.mode == 'bollinger_reversion':
                     if 'highest_price' not in pos:
                         pos['highest_price'] = entry_price
                     pos['highest_price'] = max(pos['highest_price'], current_price)
-                    atr = row.get('ATR_shifted', 0) or 1
                     stop_level = pos['highest_price'] - (atr * params['atr_multiplier'])
                     if current_price <= stop_level:
                         logger.info(f"Triggered {condition_name} exit for Pos #{pos['position_id']}: Price={current_price:.2f} <= Stop={stop_level:.2f}")
                         return f'Trailing Stop ({params["atr_multiplier"]}x ATR, Pos #{pos["position_id"]})'
-                    logger.debug(f"No {condition_name} exit for Pos #{pos['position_id']}: Price={current_price:.2f}, Stop={stop_level:.2f}")
-                elif condition_name == 'signal_score':
-                    score = engine.composite_signal_score(row)
-                    if score >= params['threshold']:
-                        logger.info(f"Triggered {condition_name} exit for Pos #{pos['position_id']}: Score={score:.2f} >= {params['threshold']}")
-                        return f'Signal Score (Pos #{pos["position_id"]})'
-                    logger.debug(f"No {condition_name} exit for Pos #{pos['position_id']}: Score={score:.2f}")
-                elif condition_name == 'zscore_reversion':
-                    zscore = engine.compute_pca_zscores(df, row)
-                    if zscore > params['threshold']:
-                        logger.info(f"Triggered {condition_name} exit for Pos #{pos['position_id']}: Z-Score={zscore:.2f} > {params['threshold']}")
+                    logger.debug(f"No {condition_name} exit for Pos #{pos['position_id']}: Price={current_price:.2f}, Highest={pos['highest_price']:.2f}, Stop={stop_level:.2f}")
+                
+                elif condition_name == 'zscore_reversion' and engine.mode == 'pca_stat_arb':
+                    if zscore > threshold:
+                        logger.info(f"Triggered {condition_name} exit for Pos #{pos['position_id']}: Z-Score={zscore:.2f} > {threshold}")
                         return f'Z-Score Reversion (Pos #{pos["position_id"]})'
-                    logger.debug(f"No {condition_name} exit for Pos #{pos['position_id']}: Z-Score={zscore:.2f}")
-                elif condition_name == 'rsi_reversion':
-                    rsi = row.get('RSI_shifted', 50)
-                    if rsi > params['threshold']:
-                        logger.info(f"Triggered {condition_name} exit for Pos #{pos['position_id']}: RSI={rsi:.2f} > {params['threshold']}")
-                        return f'RSI Reversion (Pos #{pos["position_id"]})'
-                    logger.debug(f"No {condition_name} exit for Pos #{pos['position_id']}: RSI={rsi:.2f}")
-                elif condition_name == 'profit_target':
-                    profit = (current_price - entry_price) / entry_price
-                    if profit >= params['threshold']:
-                        logger.info(f"Triggered {condition_name} exit for Pos #{pos['position_id']}: Profit={profit:.2%} >= {params['threshold']:.2%}")
+                    logger.debug(f"No {condition_name} exit for Pos #{pos['position_id']}: Z-Score={zscore:.2f}, Threshold={threshold}")
+                
+                elif condition_name == 'profit_target' and engine.mode == 'pca_stat_arb':
+                    if zscore > threshold:
+                        logger.info(f"Triggered {condition_name} exit for Pos #{pos['position_id']}: Z-Score={zscore:.2f} > {threshold}")
                         return f'Profit Target (Pos #{pos["position_id"]})'
-                    logger.debug(f"No {condition_name} exit for Pos #{pos['position_id']}: Profit={profit:.2%}")
+                    logger.debug(f"No {condition_name} exit for Pos #{pos['position_id']}: Z-Score={zscore:.2f}, Threshold={threshold}")
         
         return None
     
     except Exception as e:
-        logger.error(f"Strategy #{engine.strategy_id} - Error in exit check at {index}: {str(e)}", exc_info=True)
+        logger.error(f"Strategy {engine.strategy_id} - Error in exit check at {index}: {str(e)}", exc_info=True)
         return None
 
 def check_all_entry_conditions(df, index, engines, row):
@@ -782,11 +748,6 @@ def check_all_entry_conditions(df, index, engines, row):
         regime = detect_market_regime(row)
         conditions_results['regime'] = regime
         log_details.append(f"Regime: {regime}")
-        
-        if regime != 'mean_reverting':
-            log_details.append("Skipping: Not a mean-reverting regime")
-            logger.debug(" | ".join(log_details))
-            return conditions_results
         
         if 'mean_deviation' in all_conditions:
             deviation = (row['close'] - meanline) / meanrange
@@ -823,6 +784,17 @@ def check_all_entry_conditions(df, index, engines, row):
             conditions_results['bollinger_zscore'] = zscore
             log_details.append(f"Bollinger Z-Score: {zscore:.2f}")
         
+        if 'band_width' in all_conditions:  # Added for Strategy A
+            band_width = ((row['bollinger_upper_shifted'] - row['bollinger_lower_shifted']) / row['close']) / \
+                         max(row['ATR_shifted'] / row['close'] if row['close'] > 0 else 0.01, 0.01)
+            conditions_results['band_width'] = band_width
+            log_details.append(f"Bollinger Band Width: {band_width:.2f}")
+        
+        if 'volume_spike' in all_conditions:  # Added for Strategy A
+            volume_spike = row['volume'] / row['volume_ma_shifted'] if row['volume_ma_shifted'] > 0 else 0
+            conditions_results['volume_spike'] = volume_spike
+            log_details.append(f"Volume Spike: {volume_spike:.2f}")
+        
         if 'price_divergence' in all_conditions:
             divergence = row['price_divergence_shifted']
             conditions_results['price_divergence'] = divergence
@@ -848,18 +820,22 @@ def check_all_entry_conditions(df, index, engines, row):
 def evaluate_strategy_entry(strat_id, engine, conditions_results, row):
     config = engine.mode_config[engine.mode]
     conditions = config['entry_conditions']
-    total_conditions = len(conditions) + 3
+    total_conditions = len(conditions) + 3  # Regime, price_valid, time_ok/position_ok
     conditions_met = 0
     
-    log_details = [f"Strategy #{strat_id} Eval at {row.name}"]
+    log_details = [f"Strategy {strat_id} Eval at {row.name}"]
     
     current_price = row['close']
     price_valid = is_price_valid(current_price)
     conditions_met += 1 if price_valid else 0
     log_details.append(f"Price Valid (${current_price:.2f}): {price_valid}")
     if not price_valid:
-        logger.debug(f"Strategy #{strat_id}: Price ${current_price:.2f} outside allowed range "
+        logger.debug(f"Strategy {strat_id}: Price ${current_price:.2f} outside allowed range "
                     f"(${GlobalConfig.MIN_PRICE}-${GlobalConfig.MAX_PRICE})")
+    
+    regime = conditions_results.get('regime', 'unknown')
+    conditions_met += 1 if regime == 'mean_reverting' else 0  # Common requirement for both strategies
+    log_details.append(f"Regime Mean-Reverting: {regime == 'mean_reverting'}")
     
     for condition_name, params in conditions.items():
         if condition_name not in conditions_results:
@@ -867,7 +843,7 @@ def evaluate_strategy_entry(strat_id, engine, conditions_results, row):
         value = conditions_results.get(condition_name)
         condition_met = False
         
-        threshold = params['threshold'] if isinstance(params['threshold'], (int, float)) else params['threshold'][0]
+        threshold = params['threshold'] if isinstance(params['threshold'], (int, float)) else params['threshold'](row) if callable(params['threshold']) else params['threshold']
         
         if condition_name == 'mean_deviation':
             condition_met = value < threshold if not pd.isna(value) else False
@@ -877,10 +853,16 @@ def evaluate_strategy_entry(strat_id, engine, conditions_results, row):
             condition_met = value < threshold if not pd.isna(value) else False
         elif condition_name == 'volume':
             condition_met = value > threshold if not pd.isna(value) else False
-        elif condition_name == 'zscore':
+        elif condition_name == 'zscore':  # Strategy B
             condition_met = value < threshold if not pd.isna(value) else False
-        elif condition_name == 'bollinger_zscore':
+        elif condition_name == 'bollinger_zscore':  # Strategy A
             condition_met = value < threshold if not pd.isna(value) else False
+        elif condition_name == 'band_width':  # Strategy A
+            condition_met = value > threshold if not pd.isna(value) else False
+        elif condition_name == 'volume_spike':  # Strategy A
+            condition_met = value > threshold if not pd.isna(value) else False
+        elif condition_name == 'regime':  # Strategy B
+            condition_met = value == threshold if value is not None else False
         elif condition_name == 'price_divergence':
             condition_met = value < threshold if not pd.isna(value) else False
         
@@ -889,8 +871,7 @@ def evaluate_strategy_entry(strat_id, engine, conditions_results, row):
     
     position_ok = conditions_results.get('position_ok', {}).get(strat_id, False)
     time_ok = conditions_results.get('time_ok', False)
-    conditions_met += 1 if position_ok else 0
-    conditions_met += 1 if time_ok else 0
+    conditions_met += 1 if position_ok and time_ok else 0
     
     fraction_met = conditions_met / total_conditions
     log_details.append(f"Fraction Met: {conditions_met}/{total_conditions} ({fraction_met:.2%})")
@@ -1189,6 +1170,12 @@ def calculate_bollinger_bands(df, window=20, num_std=2):
     
     return df
 
+def calculate_bollinger_width(row):
+    """Calculate Bollinger Band width relative to ATR."""
+    band_width = (row['bollinger_upper_shifted'] - row['bollinger_lower_shifted']) / row['close']
+    atr_normalized = row['ATR_shifted'] / row['close'] if row['close'] > 0 else 0.01
+    return band_width / max(atr_normalized, 0.01)  # Avoid division by zero
+
 def print_backtest_report(metrics, bar_size, strategy_name):
     print(f"\n=== {strategy_name} Performance Report - {bar_size} ===")
     print("\nOverall Metrics:")
@@ -1216,7 +1203,7 @@ def execute_entry(strategy_id, engine, price, timestamp, position_size, row):
     timestamp = enforce_ny_timezone(pd.to_datetime(timestamp))
     shares = max(0.01, round(position_size / price, 2))
     if not np.isfinite(shares):
-        logger.error(f"Strategy #{strategy_id}: Invalid share calculation: Shares={shares}")
+        logger.error(f"Strategy {strategy_id}: Invalid share calculation: Shares={shares}")
         return None
     trade = engine.execute_trade(price=price, shares=shares, action='BUY', timestamp=timestamp, row=row)
     if trade:
@@ -1225,31 +1212,35 @@ def execute_entry(strategy_id, engine, price, timestamp, position_size, row):
 
 def execute_exit(strategy_id, engine, price, timestamp, exit_type, row):
     if not engine.current_positions:
-        logger.warning(f"Strategy #{strategy_id}: Exit attempted with no positions")
+        logger.warning(f"Strategy {strategy_id}: Exit attempted with no positions")
         return None
     timestamp = enforce_ny_timezone(pd.to_datetime(timestamp))
     if not exit_type or 'Pos #' not in exit_type:
-        logger.error(f"Strategy #{strategy_id}: Invalid exit_type format: {exit_type}")
+        logger.error(f"Strategy {strategy_id}: Invalid exit_type format: {exit_type}")
         return None
-    pos_id = int(exit_type.split('Pos #')[1].strip(')'))
+    try:
+        pos_id = int(exit_type.split('Pos #')[1].strip(')'))
+    except (IndexError, ValueError) as e:
+        logger.error(f"Strategy {strategy_id}: Failed to parse pos_id from exit_type '{exit_type}': {str(e)}")
+        return None
     position = next((p for p in engine.current_positions if p['position_id'] == pos_id), None)
     if not position:
-        logger.warning(f"Strategy #{strategy_id}: Position #{pos_id} not found for exit")
+        logger.warning(f"Strategy {strategy_id}: Position #{pos_id} not found for exit in {engine.current_positions}")
         return None
     exit_shares = position['shares']
-    trade = engine.execute_trade(price=price, shares=exit_shares, action='SELL', timestamp=timestamp, exit_type=exit_type, row=row)
+    logger.debug(f"Strategy {strategy_id}: Attempting exit for Pos #{pos_id}, Shares={exit_shares}, Price={price}")
+    trade = engine.execute_trade(price=price, shares=exit_shares, action='SELL', timestamp=timestamp, exit_type=exit_type, row=row, position=position)
     if trade:
         log_trade(trade)
     else:
-        logger.error(f"Strategy #{strategy_id}: Failed to execute exit trade for Pos #{pos_id}")
+        logger.error(f"Strategy {strategy_id}: Failed to execute exit trade for Pos #{pos_id}")
     return trade
 
-def run_backtest(df, timeframe, collect_non_trades=False, single_strategy=None):
+def run_backtest(df, timeframe, collect_non_trades=False):
     try:
         if df is None or df.empty:
             logger.error(f"Invalid input data for backtest at {timeframe}")
             return None, None
-
         logger.info(f"Starting optimized backtest for {timeframe} with data shape: {df.shape}")
 
         df = calculate_mrc_with_gradient(df)
@@ -1282,17 +1273,10 @@ def run_backtest(df, timeframe, collect_non_trades=False, single_strategy=None):
             if col in df.columns:
                 df[f'{col}_shifted'] = df[col].shift(1).fillna(df[col].iloc[0] if not df[col].empty else 0)
 
-        if single_strategy:
-            if single_strategy not in GlobalConfig.STRATEGIES:
-                logger.error(f"Invalid single_strategy ID: {single_strategy}")
-                return None, None
-            mode = GlobalConfig.STRATEGIES[single_strategy]
-            engines = {single_strategy: BacktestEngine(single_strategy, mode, timeframe)}
-        else:
-            engines = {
-                'A': BacktestEngine('A', 'time_based', timeframe),
-                'B': BacktestEngine('B', 'pca_stat_arb', timeframe)
-            }
+        engines = {
+            'A': BacktestEngine('A', 'bollinger_reversion', timeframe),
+            'B': BacktestEngine('B', 'pca_stat_arb', timeframe)
+        }
 
         required_cols = ['open', 'high', 'low', 'close', 'volume', 'hlc3', 'tr', 'meanline', 'meanrange_shifted'] + [f'{col}_shifted' for col in shifted_cols]
         missing_cols = [col for col in required_cols if col not in df.columns]
@@ -1301,6 +1285,7 @@ def run_backtest(df, timeframe, collect_non_trades=False, single_strategy=None):
             return None, None
 
         last_rebalance = None
+        last_index = df.index[-1]  # Get the last timestamp for forced exit
         for index, _ in df.iterrows():
             if pd.isna(index):
                 logger.debug(f"Skipping index with NaN timestamp at {timeframe}")
@@ -1315,10 +1300,10 @@ def run_backtest(df, timeframe, collect_non_trades=False, single_strategy=None):
                                   f"(${GlobalConfig.MIN_PRICE}-${GlobalConfig.MAX_PRICE}) at {index}")
                     continue
                 
-                if '3' in engines:
-                    if last_rebalance is None or (index - last_rebalance).days >= engines['3'].mode_config['pca_stat_arb']['rebalance_days']:
+                if 'B' in engines:
+                    if last_rebalance is None or (index - last_rebalance).days >= engines['B'].mode_config['pca_stat_arb']['rebalance_days']:
                         last_rebalance = index
-                        logger.debug(f"Rebalance triggered for PCA Stat Arb at {index}")
+                        logger.debug(f"Rebalance triggered for Stat Arb MR at {index}")
                 
                 conditions_results = check_all_entry_conditions(df, index, engines, row)
                 
@@ -1328,29 +1313,40 @@ def run_backtest(df, timeframe, collect_non_trades=False, single_strategy=None):
                         if position_size > 0:
                             trade = execute_entry(strat_id, engine, row['close'], index, position_size, row)
                             if trade is None:
-                                logger.warning(f"Strategy #{strat_id}: Trade entry failed at {index}")
+                                logger.warning(f"Strategy {strat_id}: Trade entry failed at {index}")
                             else:
-                                logger.info(f"Entry trade executed for Strategy #{strat_id}: {trade}")
+                                logger.info(f"Entry trade executed for Strategy {strat_id}: {trade}")
                     elif len(engine.current_positions) > 0:
                         exit_type = check_exit_conditions(df, index, engine, row)
                         if exit_type:
                             trade = execute_exit(strat_id, engine, row['close'], index, exit_type, row)
                             if trade:
-                                logger.info(f"Exit trade executed for Strategy #{strat_id}: {trade}")
+                                logger.info(f"Exit trade executed for Strategy {strat_id}: {trade}")
                             else:
-                                logger.warning(f"Strategy #{strat_id}: Exit trade failed for {exit_type} at {index}")
+                                logger.warning(f"Strategy {strat_id}: Exit trade failed for {exit_type} at {index}")
                         else:
-                            logger.debug(f"Strategy #{strat_id}: No exit condition met at {index}, Positions: {len(engine.current_positions)}")
+                            logger.debug(f"Strategy {strat_id}: No exit condition met at {index}, Positions: {len(engine.current_positions)}")
+                
+                # Force exit at the last bar
+                if index == last_index:
+                    for strat_id, engine in engines.items():
+                        for pos in engine.current_positions[:]:
+                            exit_type = f"Forced Exit (Pos #{pos['position_id']})"
+                            trade = execute_exit(strat_id, engine, row['close'], index, exit_type, row)
+                            if trade:
+                                logger.info(f"Forced exit trade executed for Strategy {strat_id}: {trade}")
+                            else:
+                                logger.warning(f"Strategy {strat_id}: Forced exit failed for {exit_type} at {index}")
 
         for strat_id, engine in engines.items():
-            logger.info(f"Strategy #{strat_id} completed for {timeframe} - Trades: {len(engine.trade_history)}, Final Balance: ${engine.balance:.2f}")
-            logger.info(f"Strategy #{strat_id} Trade History: {engine.trade_history}")
+            logger.info(f"Strategy {strat_id} completed for {timeframe} - Trades: {len(engine.trade_history)}, Final Balance: ${engine.balance:.2f}")
+            logger.info(f"Strategy {strat_id} Trade History: {engine.trade_history}")
             if len(engine.trade_history) == 0:
-                logger.warning(f"Strategy #{strat_id}: No trades recorded during backtest")
+                logger.warning(f"Strategy {strat_id}: No trades recorded during backtest")
             else:
                 sell_trades = [t for t in engine.trade_history if t['action'] == 'SELL']
-                logger.info(f"Strategy #{strat_id} Sell Trades: {sell_trades}")
-            
+                logger.info(f"Strategy {strat_id} Sell Trades: {sell_trades}")
+        
         return engines, df
     except Exception as e:
         logger.error(f"Error in run_backtest for {timeframe}: {str(e)}", exc_info=True)
@@ -1363,7 +1359,8 @@ def main():
     ib = IB()
     max_retries = 3
     try:
-        logger.info("Starting main execution with PCA, Time-Based, and Buy & Hold comparison")
+        logger.setLevel(logging.DEBUG)  # Add this line
+        logger.info("Starting main execution with Bollinger Bands MR, Stat Arb MR, and Buy & Hold comparison")
         for attempt in range(max_retries):
             try:
                 ib.connect('127.0.0.1', 7497, clientId=1)
@@ -1387,20 +1384,15 @@ def main():
                 logger.error(f"Insufficient data for {timeframe} (rows: {len(daily_data)}), need at least 2 for Buy & Hold")
                 continue
             
-            logger.info(f"GlobalConfig.STRATEGIES: {GlobalConfig.STRATEGIES}")
-
-            # Run backtest directly with default parameters
             engines, daily_data = run_backtest(daily_data, timeframe)
             if engines is None:
                 logger.error(f"Backtest failed for {timeframe}, skipping")
                 continue
 
-            # Calculate metrics
             trade_histories = {strat_id: engine.trade_history for strat_id, engine in engines.items()}
             metrics = {}
             for strat_id, trades in trade_histories.items():
-                full_strat_id = 'A/1' if strat_id == 'A' else 'B/2' if strat_id == 'B' else strat_id
-                strat_name = GlobalConfig.STRATEGY_LABELS[full_strat_id]
+                strat_name = GlobalConfig.STRATEGY_LABELS[strat_id]
                 metrics[strat_name] = calculate_day_metrics(trades)
                 print(f"\n=== {strat_name} Final Stats for {timeframe} TF ===")
                 print(f"# of Trades: {len(trades)}")
@@ -1412,8 +1404,8 @@ def main():
                 continue
 
             selected_strategies = {
-                'A: Time-Based': metrics['A: Time-Based'],
-                'B: PCA Stat Arb': metrics['B: PCA Stat Arb']
+                'A: Bollinger Bands MR': metrics['A: Bollinger Bands MR'],
+                'B: Stat Arb MR': metrics['B: Stat Arb MR']
             }
 
             buy_hold_result = calculate_buy_and_hold(daily_data)
@@ -1421,4 +1413,66 @@ def main():
                 selected_strategies['Benchmark: Buy & Hold'] = buy_hold_result['metrics']
                 print(f"\n=== Buy & Hold Final Stats for {timeframe} TF ===")
                 print(f"# of Trades: 2 (Buy & Sell)")
-                print(f"Final Balance
+                print(f"Final Balance: ${buy_hold_result['final_balance']:.2f}")
+                print_backtest_report(buy_hold_result['metrics'], timeframe, "Buy & Hold")
+            else:
+                logger.warning(f"Buy & Hold calculation failed for {timeframe}")
+
+            all_results[timeframe] = {
+                'engines': engines,
+                'metrics': selected_strategies,
+                'data': daily_data
+            }
+
+        if all_results:
+            print("\n=== Multi-Timeframe Backtest Summary ===")
+            results_list = []
+            for timeframe, result in all_results.items():
+                for strat_name, strat_metrics in result['metrics'].items():
+                    results_list.append({
+                        'bar_size': timeframe,
+                        'strategy': strat_name,
+                        'total_pnl': strat_metrics['overall']['total_pnl'],
+                        'sharpe_ratio': strat_metrics['overall']['sharpe_ratio'],
+                        'profit_factor': strat_metrics['overall']['profit_factor'],
+                        'num_trades': strat_metrics['overall']['num_trades'],
+                        'win_rate': strat_metrics['overall']['win_rate'],
+                        'max_drawdown': strat_metrics['overall']['max_drawdown'],
+                        'avg_holding_hours': strat_metrics['overall']['avg_holding_hours']
+                    })
+                for strat_id, engine in result['engines'].items():
+                    trades_df = pd.DataFrame(engine.trade_history)
+                    if not trades_df.empty:
+                        csv_filename = f"trade_history_{strat_id}_{timeframe.replace(' ', '_')}.csv"
+                        trades_df.to_csv(csv_filename, index=False)
+                        logger.info(f"Trade history for Strategy {strat_id} on {timeframe} saved to {csv_filename}")
+
+            results_df = pd.DataFrame(results_list)
+            if not results_df.empty:
+                best_pnl = results_df.loc[results_df['total_pnl'].idxmax()]
+                print(f"\nBest Total PnL: {best_pnl['strategy']} on {best_pnl['bar_size']}")
+                print(f"  Total PnL: ${best_pnl['total_pnl']:.2f}")
+                print(f"  Sharpe Ratio: {best_pnl['sharpe_ratio']:.2f}")
+                print(f"  Profit Factor: {best_pnl['profit_factor']:.2f}")
+                print(f"  Number of Trades: {best_pnl['num_trades']}")
+                print(f"  Win Rate: {best_pnl['win_rate']:.2f}%")
+
+                for timeframe, result in all_results.items():
+                    print(f"\n=== A/B Test Comparison for {timeframe} ===")
+                    for strat_name, strat_metrics in result['metrics'].items():
+                        print(f"{strat_name}:")
+                        print(f"  Total PnL: ${strat_metrics['overall']['total_pnl']:.2f}")
+                        print(f"  Sharpe Ratio: {strat_metrics['overall']['sharpe_ratio']:.2f}")
+                        print(f"  Max Drawdown: {strat_metrics['overall']['max_drawdown']:.2f}%")
+            else:
+                logger.warning("No results to summarize across timeframes")
+
+    except Exception as e:
+        logger.error(f"Main execution error: {str(e)}", exc_info=True)
+    finally:
+        if ib.isConnected():
+            ib.disconnect()
+            logger.info("Disconnected from IBKR")
+
+if __name__ == '__main__':
+    main()
