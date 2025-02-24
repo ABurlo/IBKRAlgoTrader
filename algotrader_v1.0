@@ -54,9 +54,11 @@ def optimize_strategy_a(df, timeframe='5 mins'):
         engines, _ = run_backtest(df, timeframe)
         if engines is None or 'A' not in engines:
             logger.error("Backtest failed during optimization")
-            return -1.0  # Penalize failed runs
+            return -1.0
         metrics = calculate_day_metrics(engines['A'].trade_history)
-        return metrics['overall']['sharpe_ratio']
+        sharpe = metrics['overall']['sharpe_ratio']
+        return sharpe if np.isfinite(sharpe) else -1.0
+
 
     pbounds = {
         'zscore': (-3.0, -1.5),
@@ -1284,6 +1286,7 @@ def run_backtest(df, timeframe, collect_non_trades=False):
             return None, None
         logger.info(f"Starting optimized backtest for {timeframe} with data shape: {df.shape}")
 
+        # Precompute all indicators once
         df = calculate_mrc_with_gradient(df)
         required_indicators = ['tr', 'volume', 'close', 'high', 'low']
         missing = [col for col in required_indicators if col not in df.columns]
@@ -1295,102 +1298,93 @@ def run_backtest(df, timeframe, collect_non_trades=False):
         df = calculate_adx(df)
         df = stochastic_oscillator(df)
         df['VWAP'] = (df['hlc3'] * df['volume']).groupby(df.index.date).cumsum() / df['volume'].groupby(df.index.date).cumsum().fillna(df['close'])
-        exp12 = df['close'].ewm(span=12, adjust=False).mean()
-        exp26 = df['close'].ewm(span=26, adjust=False).mean()
-        df['MACD'] = exp12 - exp26
+        df['MACD'] = df['close'].ewm(span=12, adjust=False).mean() - df['close'].ewm(span=26, adjust=False).mean()
         df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
         df['Histogram'] = df['MACD'] - df['Signal']
         df['RSI'] = calculate_rsi(df['close']).fillna(50)
         df['Williams_%R'] = williams_r(df['high'], df['low'], df['close']).fillna(-50)
         df['volume_ma'] = df['volume'].rolling(20, min_periods=1).mean().fillna(df['volume'].mean())
-        
         df = calculate_bollinger_bands(df)
         df['price_change'] = df['close'].pct_change()
         df['price_divergence_shifted'] = df['price_change'].shift(1).fillna(0)
-        
+
         shifted_cols = ['close', 'RSI', 'Williams_%R', 'VWAP', 'MACD', 'Signal', 'Histogram', 'adx', '+di', '-di', '%K', '%D', 'volume_ma', 'ATR', 'meanrange', 
                         'bollinger_mid', 'bollinger_upper', 'bollinger_lower', 'bollinger_zscore', 'bollinger_std']
         for col in shifted_cols:
             if col in df.columns:
-                df[f'{col}_shifted'] = df[col].shift(1).fillna(df[col].iloc[0] if not df[col].empty else 0)
+                df[f'{col}_shifted'] = df[col].shift(1).fillna(df[col].iloc[0])
 
+        # Initialize engines
         engines = {
             'A': BacktestEngine('A', 'bollinger_reversion', timeframe),
             'B': BacktestEngine('B', 'pca_stat_arb', timeframe)
         }
 
-        required_cols = ['open', 'high', 'low', 'close', 'volume', 'hlc3', 'tr', 'meanline', 'meanrange_shifted'] + [f'{col}_shifted' for col in shifted_cols]
-        missing_cols = [col for col in required_cols if col not in df.columns]
-        if missing_cols:
-            logger.error(f"Missing required columns for {timeframe}: {missing_cols}")
-            return None, None
+        # Vectorized entry/exit conditions
+        df['is_market_open'] = ~df.index.map(is_market_close)
+        df['price_valid'] = df['close'].apply(is_price_valid)
 
-        last_rebalance = None
-        last_index = df.index[-1]  # Get the last timestamp for forced exit
-        for index, _ in df.iterrows():
-            if pd.isna(index):
-                logger.debug(f"Skipping index with NaN timestamp at {timeframe}")
-                continue
-                
-            if not is_market_close(index):
-                row = calculate_point_in_time_indicators(df, index)
-                logger.debug(f"Row data at {index}: {row.to_dict()}")
-                
-                if not is_price_valid(row['close']):
-                    logger.warning(f"Backtest at {timeframe}: Price ${row['close']:.2f} outside allowed range "
-                                  f"(${GlobalConfig.MIN_PRICE}-${GlobalConfig.MAX_PRICE}) at {index}")
-                    continue
-                
-                if 'B' in engines:
-                    if last_rebalance is None or (index - last_rebalance).days >= engines['B'].mode_config['pca_stat_arb']['rebalance_days']:
-                        last_rebalance = index
-                        logger.debug(f"Rebalance triggered for Stat Arb MR at {index}")
-                
-                conditions_results = check_all_entry_conditions(df, index, engines, row)
-                
-                for strat_id, engine in engines.items():
-                    if evaluate_strategy_entry(strat_id, engine, conditions_results, row):
-                        position_size = engine.calculate_position_size(row)
-                        if position_size > 0:
-                            trade = execute_entry(strat_id, engine, row['close'], index, position_size, row)
-                            if trade is None:
-                                logger.warning(f"Strategy {strat_id}: Trade entry failed at {index}")
-                            else:
-                                logger.info(f"Entry trade executed for Strategy {strat_id}: {trade}")
-                    elif len(engine.current_positions) > 0:
-                        exit_type = check_exit_conditions(df, index, engine, row)
-                        if exit_type:
-                            trade = execute_exit(strat_id, engine, row['close'], index, exit_type, row)
-                            if trade:
-                                logger.info(f"Exit trade executed for Strategy {strat_id}: {trade}")
-                            else:
-                                logger.warning(f"Strategy {strat_id}: Exit trade failed for {exit_type} at {index}")
-                        else:
-                            logger.debug(f"Strategy {strat_id}: No exit condition met at {index}, Positions: {len(engine.current_positions)}")
-                
-                # Force exit at the last bar
-                if index == last_index:
-                    for strat_id, engine in engines.items():
-                        for pos in engine.current_positions[:]:
-                            exit_type = f"Forced Exit (Pos #{pos['position_id']})"
-                            trade = execute_exit(strat_id, engine, row['close'], index, exit_type, row)
-                            if trade:
-                                logger.info(f"Forced exit trade executed for Strategy {strat_id}: {trade}")
-                            else:
-                                logger.warning(f"Strategy {strat_id}: Forced exit failed for {exit_type} at {index}")
+        # Strategy A: Bollinger Reversion
+        config_a = engines['A'].mode_config['bollinger_reversion']
+        df['entry_a'] = (
+            (df['bollinger_zscore_shifted'] < config_a['entry_conditions']['bollinger_zscore']['threshold']) &
+            (df['bollinger_upper_shifted'] - df['bollinger_lower_shifted']) / df['close'] / (df['ATR_shifted'] / df['close']).clip(lower=0.01) > config_a['entry_conditions']['band_width']['threshold'] &
+            (df['volume'] / df['volume_ma_shifted'] > config_a['entry_conditions']['volume_spike']['threshold']) &
+            df['is_market_open'] & df['price_valid']
+        )
+        df['exit_a_mean'] = df['close'].shift(-1) > df['bollinger_mid_shifted']  # Simplified mean reversion
+        df['exit_a_stop'] = (df['close'].shift(-1) - df['close']) / df['close'] < config_a['exit_conditions']['stop_loss']['threshold']
 
+        # Strategy B: PCA Stat Arb
+        config_b = engines['B'].mode_config['pca_stat_arb']
+        df['zscore'] = df.apply(lambda row: engines['B'].compute_pca_zscores(df, row), axis=1)
+        df['regime'] = df.apply(detect_market_regime, axis=1)
+        df['entry_b'] = (
+            (df['zscore'] < config_b['entry_conditions']['zscore']['threshold'](df.iloc[-1])) &
+            (df['regime'] == 'mean_reverting') &
+            df['is_market_open'] & df['price_valid']
+        )
+        df['exit_b_zscore'] = df['zscore'].shift(-1) > config_b['exit_conditions']['zscore_reversion']['threshold']
+
+        # Process trades in bulk
         for strat_id, engine in engines.items():
-            logger.info(f"Strategy {strat_id} completed for {timeframe} - Trades: {len(engine.trade_history)}, Final Balance: ${engine.balance:.2f}")
-            logger.info(f"Strategy {strat_id} Trade History: {engine.trade_history}")
-            if len(engine.trade_history) == 0:
-                logger.warning(f"Strategy {strat_id}: No trades recorded during backtest")
-            else:
-                sell_trades = [t for t in engine.trade_history if t['action'] == 'SELL']
-                logger.info(f"Strategy {strat_id} Sell Trades: {sell_trades}")
-        
+            entry_col = f'entry_{strat_id.lower()}'
+            positions = []
+            trade_history = []
+
+            for idx, row in df[df[entry_col]].iterrows():
+                if len(positions) < 5:  # Max positions
+                    position_size = engine.calculate_position_size(row)
+                    if position_size > 0:
+                        trade = engine.execute_trade(row['close'], position_size / row['close'], 'BUY', idx, row=row)
+                        if trade:
+                            positions.append(trade)
+                            trade_history.append(trade)
+
+            # Exit logic (simplified for speed)
+            for pos in positions[:]:
+                pos_idx = df.index.get_loc(pos['timestamp'])
+                for i in range(pos_idx + 1, len(df)):
+                    row = df.iloc[i]
+                    exit_type = check_exit_conditions(df, row.name, engine, row)
+                    if exit_type:
+                        trade = engine.execute_trade(row['close'], pos['shares'], 'SELL', row.name, exit_type, row=row, position=pos)
+                        if trade:
+                            trade_history.append(trade)
+                            positions.remove(pos)
+                        break
+                    elif i == len(df) - 1:  # Forced exit
+                        trade = engine.execute_trade(row['close'], pos['shares'], 'SELL', row.name, f"Forced Exit (Pos #{pos['position_id']})", row=row, position=pos)
+                        if trade:
+                            trade_history.append(trade)
+                            positions.remove(pos)
+
+            engine.trade_history = trade_history
+            logger.info(f"Strategy {strat_id} completed - Trades: {len(trade_history)}")
+
         return engines, df
     except Exception as e:
-        logger.error(f"Error in run_backtest for {timeframe}: {str(e)}", exc_info=True)
+        logger.error(f"Error in run_backtest: {str(e)}", exc_info=True)
         return None, None
 
 # =====================
@@ -1510,6 +1504,8 @@ def main():
                 logger.warning("No results to summarize across timeframes")
 
             optimized_result = optimize_strategy_a(all_results['5 mins']['data'], '5 mins')
+            logger.info(f"Optimization result: {optimized_result}")
+
 
     except Exception as e:
         logger.error(f"Main execution error: {str(e)}", exc_info=True)
