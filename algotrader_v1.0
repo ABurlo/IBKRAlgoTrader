@@ -21,12 +21,12 @@ import seaborn as sns
 from matplotlib.dates import DateFormatter
 from scipy.signal import savgol_filter
 import sys
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor  # Added ProcessPoolExecutor
 import statsmodels.api as sm
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
-from sklearn.model_selection import ParameterGrid
 from bayes_opt import BayesianOptimization
+from sklearn.model_selection import ParameterGrid
 
 param_grid = {
     'bollinger_zscore': [-3.0, -2.5, -2.0],
@@ -38,10 +38,10 @@ param_grid = {
 }
 
 def optimize_strategy(df, timeframe='5 mins', strategy_id='A'):
-    """Optimize any strategy using Bayesian optimization."""
-    logger.info(f"Starting Bayesian optimization for Strategy {strategy_id} on {timeframe}")
+    """Optimize strategy using Bayesian followed by grid search to finalize top 3 parameters by Sharpe Ratio."""
+    logger.info(f"Starting hybrid optimization (Bayesian + Grid) for Strategy {strategy_id} on {timeframe}")
 
-    # Define strategy-specific parameter bounds
+    # Define strategy-specific parameter bounds for Bayesian
     strategy_bounds = {
         'A': {  # Bollinger Bands MR
             'zscore': (-3.0, -1.5),
@@ -69,10 +69,7 @@ def optimize_strategy(df, timeframe='5 mins', strategy_id='A'):
     mode = GlobalConfig.STRATEGIES[strategy_id]
 
     def evaluate_strategy(**params):
-        # Initialize backtest engine with the given strategy
         engine = BacktestEngine(strategy_id, mode, timeframe)
-        
-        # Update engine configuration with optimization parameters
         if strategy_id == 'A':
             engine.mode_config['bollinger_reversion']['entry_conditions']['bollinger_zscore']['threshold'] = params['zscore']
             engine.mode_config['bollinger_reversion']['entry_conditions']['band_width']['threshold'] = params['band_width']
@@ -87,29 +84,77 @@ def optimize_strategy(df, timeframe='5 mins', strategy_id='A'):
             engine.mode_config['pca_stat_arb']['exit_conditions']['stop_loss']['threshold'] = params['stop_loss']
             engine.mode_config['pca_stat_arb']['volatility_mult'] = params['volatility_mult']
             engine.mode_config['pca_stat_arb']['position_risk'] = params['position_risk']
-
-        # Run backtest with updated parameters
+        
         engines, _ = run_backtest(df, timeframe)
         if engines is None or strategy_id not in engines:
-            logger.error(f"Backtest failed for Strategy {strategy_id} during optimization")
+            logger.error(f"Backtest failed for Strategy {strategy_id}")
             return -1.0
-        
-        # Calculate performance metrics
         metrics = calculate_day_metrics(engines[strategy_id].trade_history)
         sharpe = metrics['overall']['sharpe_ratio']
         return sharpe if np.isfinite(sharpe) else -1.0
 
-    # Initialize and run Bayesian optimization
+    # Step 1: Bayesian Optimization
     optimizer = BayesianOptimization(f=evaluate_strategy, pbounds=pbounds, random_state=1)
     optimizer.maximize(init_points=5, n_iter=20)
     
+    # Extract top Bayesian result
+    bayesian_best = optimizer.max
+    if bayesian_best['target'] <= -1.0:
+        logger.error(f"Bayesian optimization failed for Strategy {strategy_id} - no valid Sharpe Ratio found")
+        return None
+    logger.info(f"Bayesian best for Strategy {strategy_id}: {bayesian_best['params']}, Sharpe={bayesian_best['target']:.2f}")
+
+    # Step 2: Define refined grid around Bayesian best (only 3 key parameters)
+    def create_refined_grid(best_params, bounds, step_size=0.1):
+        grid = {}
+        # Define key parameters to refine
+        key_params = ['zscore', 'mean_reversion', 'stop_loss'] if strategy_id == 'A' else ['zscore_entry', 'zscore_exit', 'profit_target']
+        for param, value in best_params.items():
+            if param in key_params:
+                min_val, max_val = bounds[param]
+                step = step_size * (max_val - min_val) / 2
+                grid[param] = [
+                    max(min_val, value - step),
+                    value,
+                    min(max_val, value + step)
+                ]
+            else:
+                grid[param] = [value]  # Fix non-key parameters to Bayesian best
+        return grid
+
+    refined_grid = create_refined_grid(bayesian_best['params'], pbounds)
+    grid_combinations = list(ParameterGrid(refined_grid))
+    logger.info(f"Refined grid for Strategy {strategy_id}: {len(grid_combinations)} combinations")
+
+    # Step 3: Grid Search on refined grid with parallelization
+    grid_results = []
+    with ProcessPoolExecutor(max_workers=4) as executor:  # Use 4 cores; adjust as needed
+        future_to_params = {executor.submit(evaluate_strategy, **params): params for params in grid_combinations}
+        for future in future_to_params:
+            params = future_to_params[future]
+            try:
+                sharpe = future.result()
+                grid_results.append({'params': params, 'sharpe': sharpe})
+                logger.debug(f"Grid search for {params}: Sharpe={sharpe:.2f}")
+            except Exception as e:
+                logger.error(f"Grid search failed for {params}: {str(e)}")
+
+    # Sort and get top 3
+    grid_results.sort(key=lambda x: x['sharpe'], reverse=True)
+    top_3 = grid_results[:3]
+
     # Log and print results
-    logger.info(f"Best parameters for Strategy {strategy_id}: {optimizer.max['params']}")
-    logger.info(f"Best Sharpe Ratio: {optimizer.max['target']:.2f}")
-    print(f"Best parameters and Sharpe Ratio for Strategy {strategy_id}:")
-    print(optimizer.max)
-    
-    return optimizer.max  # Return best result for further use
+    logger.info(f"Top 3 parameter sets for Strategy {strategy_id} after hybrid optimization:")
+    print(f"\n=== Top 3 Parameter Sets for Strategy {strategy_id} ({GlobalConfig.STRATEGY_LABELS[strategy_id]}) ===")
+    for i, result in enumerate(top_3, 1):
+        logger.info(f"Rank {i}: Parameters={result['params']}, Sharpe Ratio={result['sharpe']:.2f}")
+        print(f"Rank {i}:")
+        print(f"  Parameters: {result['params']}")
+        print(f"  Sharpe Ratio: {result['sharpe']:.2f}")
+
+    # Return best result for compatibility, plus top 3
+    best_result = top_3[0] if top_3 else {'params': bayesian_best['params'], 'sharpe': bayesian_best['target']}
+    return {'params': best_result['params'], 'target': best_result['sharpe'], 'top_3': top_3}
 
 def update_config(base_config, mode, params):
     """Update the mode_config with parameters (kept for potential future use)."""
@@ -165,7 +210,7 @@ logger = logging.getLogger(__name__)
 
 class GlobalConfig:
     nest_asyncio.apply()
-    symbol = 'AAPL'
+    symbol = 'TSLA'
     durationStr = '7 D'
     timeframes = ['5 mins']
     currency = 'USD'
@@ -1449,7 +1494,7 @@ def main():
     ib = IB()
     max_retries = 3
     try:
-        logger.setLevel(logging.DEBUG)  # Already set, but ensure it’s explicit
+        logger.setLevel(logging.DEBUG)
         logger.info("Starting main execution with Bollinger Bands MR, Stat Arb MR, and Buy & Hold comparison")
         for attempt in range(max_retries):
             try:
@@ -1463,8 +1508,6 @@ def main():
                 sleep(2)
 
         all_results = {}
-
-        # Initial backtest for all timeframes
         for timeframe in GlobalConfig.timeframes:
             logger.info(f"Processing timeframe: {timeframe}")
             daily_data = get_historical_data(ib, timeframe, backtest=True)
@@ -1487,10 +1530,6 @@ def main():
                 print(f"Final Balance: ${engines[strat_id].balance:.2f}")
                 print_backtest_report(metrics[strat_name], timeframe, strat_name)
 
-            if not any(len(trades) > 0 for trades in trade_histories.values()):
-                logger.error(f"No trades executed for any strategy in {timeframe}, skipping comparison")
-                continue
-
             selected_strategies = {
                 'A: Bollinger Bands MR': metrics['A: Bollinger Bands MR'],
                 'B: Stat Arb MR': metrics['B: Stat Arb MR']
@@ -1510,15 +1549,17 @@ def main():
                 'data': daily_data
             }
 
-        # Optimize all strategies for each timeframe
+        # Optimize all strategies for each timeframe using hybrid approach
         optimized_results = {}
         for timeframe, result in all_results.items():
-            for strat_id in ['A', 'B']:  # Optimize both strategies
+            for strat_id in ['A', 'B']:
+                logger.info(f"Optimizing Strategy {strat_id} for timeframe {timeframe}")
                 optimized_result = optimize_strategy(result['data'], timeframe, strat_id)
-                if optimized_result:
+                if optimized_result and 'top_3' in optimized_result:
                     optimized_results[f"{strat_id}_{timeframe}"] = optimized_result
-                    # Optionally apply optimized parameters to engines
                     engine = result['engines'][strat_id]
+                    
+                    # Apply the best parameters from the hybrid optimization
                     if strat_id == 'A':
                         engine.mode_config['bollinger_reversion']['entry_conditions']['bollinger_zscore']['threshold'] = optimized_result['params']['zscore']
                         engine.mode_config['bollinger_reversion']['entry_conditions']['band_width']['threshold'] = optimized_result['params']['band_width']
@@ -1533,12 +1574,19 @@ def main():
                         engine.mode_config['pca_stat_arb']['exit_conditions']['stop_loss']['threshold'] = optimized_result['params']['stop_loss']
                         engine.mode_config['pca_stat_arb']['volatility_mult'] = optimized_result['params']['volatility_mult']
                         engine.mode_config['pca_stat_arb']['position_risk'] = optimized_result['params']['position_risk']
-                    # Re-run backtest with optimized parameters
+                    
+                    # Run backtest with the best optimized parameters
                     engines_opt, _ = run_backtest(result['data'], timeframe)
                     if engines_opt and strat_id in engines_opt:
                         optimized_metrics = calculate_day_metrics(engines_opt[strat_id].trade_history)
                         print(f"\n=== Optimized {GlobalConfig.STRATEGY_LABELS[strat_id]} Stats for {timeframe} TF ===")
+                        print(f"# of Trades: {len(engines_opt[strat_id].trade_history)}")
+                        print(f"Final Balance: ${engines_opt[strat_id].balance:.2f}")
                         print_backtest_report(optimized_metrics, timeframe, f"Optimized {GlobalConfig.STRATEGY_LABELS[strat_id]}")
+                    else:
+                        logger.debug(f"Optimized backtest failed for Strategy {strat_id} on {timeframe}")
+                else:
+                    logger.debug(f"No optimization result for Strategy {strat_id} on {timeframe}")
 
         # Summary
         if all_results:
