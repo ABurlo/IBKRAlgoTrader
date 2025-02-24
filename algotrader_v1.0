@@ -165,7 +165,7 @@ logger = logging.getLogger(__name__)
 
 class GlobalConfig:
     nest_asyncio.apply()
-    symbol = 'MSFT'
+    symbol = 'AAPL'
     durationStr = '7 D'
     timeframes = ['5 mins']
     currency = 'USD'
@@ -1371,27 +1371,31 @@ def run_backtest(df, timeframe, collect_non_trades=False):
             if col in df.columns:
                 df[col] = df[col].fillna(0)
 
-        # Strategy A: Bollinger Reversion
+        # Strategy A: Bollinger Reversion - Relaxed thresholds
         config_a = engines['A'].mode_config['bollinger_reversion']
         df['entry_a'] = (
-            (df['bollinger_zscore_shifted'] < config_a['entry_conditions']['bollinger_zscore']['threshold']) &
-            ((df['bollinger_upper_shifted'] - df['bollinger_lower_shifted']) / df['close'] / (df['ATR_shifted'] / df['close']).clip(lower=0.01) > config_a['entry_conditions']['band_width']['threshold']) &
-            (df['volume'] / df['volume_ma_shifted'] > config_a['entry_conditions']['volume_spike']['threshold']) &
+            (df['bollinger_zscore_shifted'] < -1.5) &  # Relaxed from -2.5
+            ((df['bollinger_upper_shifted'] - df['bollinger_lower_shifted']) / df['close'] / (df['ATR_shifted'] / df['close']).clip(lower=0.01) > 0.03) &  # Relaxed from 0.05
+            (df['volume'] / df['volume_ma_shifted'] > 1.2) &  # Relaxed from 1.5
             df['is_market_open'] & df['price_valid']
         )
-        df['exit_a_mean'] = df['close'].shift(-1) > df['bollinger_mid_shifted']  # Simplified mean reversion
+        df['exit_a_mean'] = df['close'].shift(-1) > df['bollinger_mid_shifted']
         df['exit_a_stop'] = (df['close'].shift(-1) - df['close']) / df['close'] < config_a['exit_conditions']['stop_loss']['threshold']
 
-        # Strategy B: PCA Stat Arb
+        # Strategy B: PCA Stat Arb - Relaxed thresholds
         config_b = engines['B'].mode_config['pca_stat_arb']
         df['zscore'] = df.apply(lambda row: engines['B'].compute_pca_zscores(df, row), axis=1)
         df['regime'] = df.apply(detect_market_regime, axis=1)
         df['entry_b'] = (
-            (df['zscore'] < config_b['entry_conditions']['zscore']['threshold'](df.iloc[-1])) &
+            (df['zscore'] < -1.0) &  # Relaxed from dynamic -1.5 - ATR * 0.5
             (df['regime'] == 'mean_reverting') &
             df['is_market_open'] & df['price_valid']
         )
         df['exit_b_zscore'] = df['zscore'].shift(-1) > config_b['exit_conditions']['zscore_reversion']['threshold']
+
+        # Log entry condition stats
+        logger.debug(f"Strategy A entry conditions met: {df['entry_a'].sum()} times")
+        logger.debug(f"Strategy B entry conditions met: {df['entry_b'].sum()} times")
 
         # Process trades in bulk
         for strat_id, engine in engines.items():
@@ -1399,16 +1403,20 @@ def run_backtest(df, timeframe, collect_non_trades=False):
             positions = []
             trade_history = []
 
+            logger.debug(f"Processing Strategy {strat_id} with {df[entry_col].sum()} potential entries")
             for idx, row in df[df[entry_col]].iterrows():
                 if len(positions) < 5:  # Max positions
                     position_size = engine.calculate_position_size(row)
+                    logger.debug(f"Strategy {strat_id} at {idx}: Position size calculated as ${position_size:.2f}")
                     if position_size > 0:
                         trade = engine.execute_trade(row['close'], position_size / row['close'], 'BUY', idx, row=row)
                         if trade:
                             positions.append(trade)
                             trade_history.append(trade)
+                        else:
+                            logger.debug(f"Strategy {strat_id} at {idx}: Trade execution failed")
 
-            # Exit logic (simplified for speed)
+            # Exit logic
             for pos in positions[:]:
                 pos_idx = df.index.get_loc(pos['timestamp'])
                 for i in range(pos_idx + 1, len(df)):
@@ -1441,7 +1449,7 @@ def main():
     ib = IB()
     max_retries = 3
     try:
-        logger.setLevel(logging.DEBUG)
+        logger.setLevel(logging.DEBUG)  # Already set, but ensure it’s explicit
         logger.info("Starting main execution with Bollinger Bands MR, Stat Arb MR, and Buy & Hold comparison")
         for attempt in range(max_retries):
             try:
