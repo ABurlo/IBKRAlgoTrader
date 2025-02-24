@@ -595,7 +595,7 @@ class BacktestEngine:
                 'num_equities': 1,
                 'rebalance_days': 30,
                 'entry_conditions': {
-                    'zscore': {'threshold': lambda row: -1.0 - row['ATR_shifted'] * 0.5, 'operator': '<'},  # Relaxed threshold
+                    'zscore': {'threshold': lambda row: -1.0 - row['ATR_shifted'] * 0.5, 'operator': '<'},
                     'regime': {'threshold': 'mean_reverting', 'operator': '=='}
                 },
                 'exit_conditions': {
@@ -644,7 +644,6 @@ class BacktestEngine:
         config = self.mode_config[self.mode]
         active_positions = len(self.current_positions)
         
-        # Use cached metrics if available, otherwise calculate once
         if self.trade_history and not self.last_metrics:
             self.last_metrics = calculate_day_metrics(self.trade_history)
         metrics = self.last_metrics if self.last_metrics else {'overall': {'max_drawdown': 0.0}}
@@ -828,40 +827,37 @@ class BacktestEngine:
         zscore = (residuals.iloc[-1] - residuals.mean()) / residuals.std(ddof=1)
         return zscore
 
-# =====================
-# CONDITION CHECKS
-# =====================
-def check_exit_conditions(self, df, index, engine, row):
+    def check_exit_conditions(self, df, index, row):
         if str(index.tz) != 'America/New_York':
             raise ValueError(f"Invalid timezone in exit check: {index.tz}")
         
-        if not engine.current_positions:
+        if not self.current_positions:
             return None
         
         try:
-            config = engine.mode_config[engine.mode]
+            config = self.mode_config[self.mode]
             conditions = config['exit_conditions']
             current_time = enforce_ny_timezone(index)
             current_price = row['close']
             
-            for pos in engine.current_positions[:]:
+            for pos in self.current_positions[:]:
                 entry_time = pos['entry_time']
                 entry_price = pos['entry_price']
                 deviation = (current_price - entry_price) / entry_price
                 
                 atr = row.get('ATR_shifted', 1) or 1
                 
-                if engine.mode == 'bollinger_reversion':
+                if self.mode == 'bollinger_reversion':
                     bollinger_std_shifted = row.get('bollinger_std_shifted', 1) or 1
                     bollinger_mid_shifted = row.get('bollinger_mid_shifted', current_price)
                     bollinger_deviation = (current_price - bollinger_mid_shifted) / bollinger_std_shifted
-                elif engine.mode == 'keltner_reversion':
+                elif self.mode == 'keltner_reversion':
                     keltner_ema = row.get('keltner_ema_shifted', current_price)
                     keltner_upper = row.get('keltner_upper_shifted', keltner_ema + atr * 2)
                     keltner_lower = row.get('keltner_lower_shifted', keltner_ema - atr * 2)
                     keltner_deviation = (current_price - keltner_ema) / atr
-                elif engine.mode == 'pca_stat_arb':
-                    zscore = engine.compute_pca_zscores(df, row)
+                elif self.mode == 'pca_stat_arb':
+                    zscore = self.compute_pca_zscores(df, row)
                 
                 for condition_name, params in conditions.items():
                     if 'threshold' in params:
@@ -872,11 +868,11 @@ def check_exit_conditions(self, df, index, engine, row):
                         threshold = None
                     
                     if condition_name == 'mean_reversion':
-                        if engine.mode == 'bollinger_reversion' and threshold is not None and bollinger_deviation > threshold:
+                        if self.mode == 'bollinger_reversion' and threshold is not None and bollinger_deviation > threshold:
                             logger.info(f"Triggered {condition_name} exit for Pos #{pos['position_id']}: "
                                       f"Deviation={bollinger_deviation:.2f} > {threshold:.2f}")
                             return f'Bollinger Overbought (Pos #{pos["position_id"]})'
-                        elif engine.mode == 'keltner_reversion' and threshold is not None and keltner_deviation > threshold:
+                        elif self.mode == 'keltner_reversion' and threshold is not None and keltner_deviation > threshold:
                             logger.info(f"Triggered {condition_name} exit for Pos #{pos['position_id']}: "
                                       f"Deviation={keltner_deviation:.2f} > {threshold:.2f}")
                             return f'Keltner Overbought (Pos #{pos["position_id"]})'
@@ -899,13 +895,13 @@ def check_exit_conditions(self, df, index, engine, row):
                                           f"Price={current_price:.2f} <= Stop={stop_level:.2f}")
                                 return f'Trailing Stop ({atr_multiplier}x ATR, Pos #{pos["position_id"]})'
                     
-                    elif condition_name == 'zscore_reversion' and engine.mode == 'pca_stat_arb':
+                    elif condition_name == 'zscore_reversion' and self.mode == 'pca_stat_arb':
                         if threshold is not None and zscore > threshold:
                             logger.info(f"Triggered zscore_reversion exit for Pos #{pos['position_id']}: "
                                       f"Z-Score={zscore:.2f} > {threshold:.2f}")
                             return f'Z-Score Reversion (Pos #{pos["position_id"]})'
                     
-                    elif condition_name == 'profit_target' and engine.mode == 'pca_stat_arb':
+                    elif condition_name == 'profit_target' and self.mode == 'pca_stat_arb':
                         if threshold is not None and zscore > threshold:
                             logger.info(f"Triggered profit_target exit for Pos #{pos['position_id']}: "
                                       f"Z-Score={zscore:.2f} > {threshold:.2f}")
@@ -914,7 +910,7 @@ def check_exit_conditions(self, df, index, engine, row):
             return None
         
         except Exception as e:
-            logger.error(f"Strategy {engine.strategy_id} - Error in exit check at {index}: {str(e)}", exc_info=True)
+            logger.error(f"Strategy {self.strategy_id} - Error in exit check at {index}: {str(e)}", exc_info=True)
             return None
 
 def check_all_entry_conditions(df, index, engines, row):
@@ -1488,6 +1484,7 @@ def run_backtest(df, timeframe, collect_non_trades=False):
             if col in df.columns:
                 df[col] = df[col].fillna(0)
 
+        # Define entry and exit conditions before the loop
         config_a = engines['A'].mode_config['bollinger_reversion']
         df['entry_a'] = (
             (df['bollinger_zscore_shifted'] < config_a['entry_conditions']['bollinger_zscore']['threshold']) &
@@ -1496,7 +1493,7 @@ def run_backtest(df, timeframe, collect_non_trades=False):
             (df['volume'] / df['volume_ma_shifted'] > config_a['entry_conditions']['volume_spike']['threshold']) &
             df['is_market_open'] & df['price_valid']
         )
-        df['exit_a_mean'] = df['bollinger_zscore_shifted'] > config_a['exit_conditions']['mean_reversion']['threshold']  # Removed shift(-1)
+        df['exit_a_mean'] = df['bollinger_zscore_shifted'] > config_a['exit_conditions']['mean_reversion']['threshold']
 
         config_b = engines['B'].mode_config['pca_stat_arb']
         df['zscore'] = df.apply(lambda row: engines['B'].compute_pca_zscores(df, row), axis=1)
@@ -1507,14 +1504,14 @@ def run_backtest(df, timeframe, collect_non_trades=False):
             (df['regime'] == 'mean_reverting') &
             df['is_market_open'] & df['price_valid']
         )
-        df['exit_b_zscore'] = df['zscore'] > config_b['exit_conditions']['zscore_reversion']['threshold']  # Removed shift(-1)
+        df['exit_b_zscore'] = df['zscore'] > config_b['exit_conditions']['zscore_reversion']['threshold']
 
         config_c = engines['C'].mode_config['keltner_reversion']
         df['entry_c'] = (
-            (df['keltner_zscore_shifted'] < config_c['entry_conditions']['keltner_zscore']['threshold']) &  # Already negative
+            (df['keltner_zscore_shifted'] < config_c['entry_conditions']['keltner_zscore']['threshold']) &
             df['is_market_open'] & df['price_valid']
         )
-        df['exit_c_mean'] = df['keltner_zscore_shifted'] > config_c['exit_conditions']['mean_reversion']['threshold']  # Removed shift(-1)
+        df['exit_c_mean'] = df['keltner_zscore_shifted'] > config_c['exit_conditions']['mean_reversion']['threshold']
 
         logger.debug(f"Strategy A entry conditions met: {df['entry_a'].sum()} times")
         logger.debug(f"Strategy B entry conditions met: {df['entry_b'].sum()} times")
@@ -1538,7 +1535,7 @@ def run_backtest(df, timeframe, collect_non_trades=False):
 
             for i in range(len(df)):
                 row = df.iloc[i]
-                exit_type = check_exit_conditions(df, row.name, engine, row)
+                exit_type = engine.check_exit_conditions(df, row.name, row)
                 if exit_type:
                     pos_id = int(exit_type.split('Pos #')[1].strip(')'))
                     position = next((p for p in engine.current_positions if p['position_id'] == pos_id), None)
@@ -1546,7 +1543,6 @@ def run_backtest(df, timeframe, collect_non_trades=False):
                         trade = engine.execute_trade(row['close'], position['shares'], 'SELL', row.name, exit_type, row=row, position=position)
                         if trade:
                             trade_history.append(trade)
-                    # Removed break to allow multiple exits
 
             engine.trade_history = trade_history
             logger.info(f"Strategy {strat_id} completed - Trades: {len(trade_history)}")
