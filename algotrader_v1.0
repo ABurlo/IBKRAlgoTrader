@@ -21,7 +21,7 @@ import seaborn as sns
 from matplotlib.dates import DateFormatter
 from scipy.signal import savgol_filter
 import sys
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor  # Added ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import statsmodels.api as sm
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
@@ -29,35 +29,83 @@ from bayes_opt import BayesianOptimization
 from sklearn.model_selection import ParameterGrid
 
 param_grid = {
+    # Strategy A: Bollinger Bands MR
     'bollinger_zscore': [-3.0, -2.5, -2.0],
     'band_width': [0.03, 0.05, 0.07],
     'volume_spike': [1.2, 1.5, 2.0],
-    'mean_reversion': [0.3, 0.5, 0.7],
+    'mean_reversion': [1.5, 2.0, 2.5],
     'stop_loss': [-0.01, -0.02, -0.03],
-    'trailing_stop_atr': [0.5, 1.0, 1.5]
+    'trailing_stop_atr': [0.5, 1.0, 1.5],
+    # Strategy B: PCA Stat Arb
+    'zscore_entry': [-2.5, -2.0, -1.5],
+    'zscore_exit': [-0.5, 0.0, 0.5],
+    'profit_target': [0.2, 0.5, 1.0],
+    'volatility_mult': [0.5, 1.0, 1.5],
+    'position_risk': [0.01, 0.02, 0.03],
+    # Strategy C: Keltner Channels MR
+    'keltner_atr_mult_entry': [1.5, 2.0, 2.5],
+    'keltner_atr_mult_exit': [1.0, 1.5, 2.0],
+    'keltner_ema_period': [10, 20, 30]
 }
+
+def evaluate_strategy(df, timeframe, strategy_id, mode, **params):
+    engine = BacktestEngine(strategy_id, mode, timeframe)
+    if strategy_id == 'A':
+        engine.mode_config['bollinger_reversion']['entry_conditions']['bollinger_zscore']['threshold'] = params['bollinger_zscore']
+        engine.mode_config['bollinger_reversion']['entry_conditions']['band_width']['threshold'] = params['band_width']
+        engine.mode_config['bollinger_reversion']['entry_conditions']['volume_spike']['threshold'] = params['volume_spike']
+        engine.mode_config['bollinger_reversion']['exit_conditions']['mean_reversion']['threshold'] = params['mean_reversion']
+        engine.mode_config['bollinger_reversion']['exit_conditions']['stop_loss']['threshold'] = params['stop_loss']
+        engine.mode_config['bollinger_reversion']['exit_conditions']['trailing_stop']['atr_multiplier'] = params['trailing_stop_atr']
+    elif strategy_id == 'B':
+        engine.mode_config['pca_stat_arb']['entry_conditions']['zscore']['threshold'] = lambda row: params['zscore_entry'] - row['ATR_shifted'] * 0.5
+        engine.mode_config['pca_stat_arb']['exit_conditions']['zscore_reversion']['threshold'] = params['zscore_exit']
+        engine.mode_config['pca_stat_arb']['exit_conditions']['profit_target']['threshold'] = params['profit_target']
+        engine.mode_config['pca_stat_arb']['exit_conditions']['stop_loss']['threshold'] = params['stop_loss']
+        engine.mode_config['pca_stat_arb']['volatility_mult'] = params['volatility_mult']
+        engine.mode_config['pca_stat_arb']['position_risk'] = params['position_risk']
+    elif strategy_id == 'C':
+        engine.mode_config['keltner_reversion']['entry_conditions']['keltner_zscore']['threshold'] = -params['keltner_atr_mult_entry']  # Fixed for oversold
+        engine.mode_config['keltner_reversion']['exit_conditions']['mean_reversion']['threshold'] = params['keltner_atr_mult_exit']
+        engine.mode_config['keltner_reversion']['exit_conditions']['stop_loss']['threshold'] = params['stop_loss']
+        engine.mode_config['keltner_reversion']['exit_conditions']['trailing_stop']['atr_multiplier'] = params['trailing_stop_atr']
+        engine.mode_config['keltner_reversion']['ema_period'] = params['keltner_ema_period']
+    
+    engines, _ = run_backtest(df, timeframe)
+    if engines is None or strategy_id not in engines:
+        logger.error(f"Backtest failed for Strategy {strategy_id}")
+        return -1.0
+    metrics = calculate_day_metrics(engines[strategy_id].trade_history)
+    sharpe = metrics['overall']['sharpe_ratio']
+    return sharpe if np.isfinite(sharpe) else -1.0
 
 def optimize_strategy(df, timeframe='5 mins', strategy_id='A'):
     """Optimize strategy using Bayesian followed by grid search to finalize top 3 parameters by Sharpe Ratio."""
     logger.info(f"Starting hybrid optimization (Bayesian + Grid) for Strategy {strategy_id} on {timeframe}")
 
-    # Define strategy-specific parameter bounds for Bayesian
     strategy_bounds = {
         'A': {  # Bollinger Bands MR
-            'zscore': (-3.0, -1.5),
+            'bollinger_zscore': (-3.0, -1.5),
             'band_width': (0.03, 0.10),
-            'volume_spike': (1.2, 2.5),
-            'mean_reversion': (0.3, 1.0),
+            'volume_spike': (1.2, 2.0),
+            'mean_reversion': (1.5, 3.0),
             'stop_loss': (-0.03, -0.01),
-            'trailing_atr': (0.5, 2.0)
+            'trailing_stop_atr': (0.5, 2.0)
         },
         'B': {  # PCA Stat Arb
             'zscore_entry': (-2.5, -1.0),
-            'zscore_exit': (-1.0, 0.0),
+            'zscore_exit': (-1.0, 0.5),
             'profit_target': (0.2, 1.0),
             'stop_loss': (-3.0, -1.5),
             'volatility_mult': (0.5, 2.0),
             'position_risk': (0.01, 0.05)
+        },
+        'C': {  # Keltner Channels MR
+            'keltner_atr_mult_entry': (1.5, 2.5),
+            'keltner_atr_mult_exit': (1.0, 2.0),
+            'stop_loss': (-0.03, -0.01),
+            'trailing_stop_atr': (0.5, 2.0),
+            'keltner_ema_period': (10, 30)
         }
     }
 
@@ -68,47 +116,30 @@ def optimize_strategy(df, timeframe='5 mins', strategy_id='A'):
     pbounds = strategy_bounds[strategy_id]
     mode = GlobalConfig.STRATEGIES[strategy_id]
 
-    def evaluate_strategy(**params):
-        engine = BacktestEngine(strategy_id, mode, timeframe)
-        if strategy_id == 'A':
-            engine.mode_config['bollinger_reversion']['entry_conditions']['bollinger_zscore']['threshold'] = params['zscore']
-            engine.mode_config['bollinger_reversion']['entry_conditions']['band_width']['threshold'] = params['band_width']
-            engine.mode_config['bollinger_reversion']['entry_conditions']['volume_spike']['threshold'] = params['volume_spike']
-            engine.mode_config['bollinger_reversion']['exit_conditions']['mean_reversion']['threshold'] = lambda row: params['mean_reversion']
-            engine.mode_config['bollinger_reversion']['exit_conditions']['stop_loss']['threshold'] = params['stop_loss']
-            engine.mode_config['bollinger_reversion']['exit_conditions']['trailing_stop']['atr_multiplier'] = params['trailing_atr']
-        elif strategy_id == 'B':
-            engine.mode_config['pca_stat_arb']['entry_conditions']['zscore']['threshold'] = lambda row: params['zscore_entry'] - row['ATR_shifted'] * 0.5
-            engine.mode_config['pca_stat_arb']['exit_conditions']['zscore_reversion']['threshold'] = params['zscore_exit']
-            engine.mode_config['pca_stat_arb']['exit_conditions']['profit_target']['threshold'] = params['profit_target']
-            engine.mode_config['pca_stat_arb']['exit_conditions']['stop_loss']['threshold'] = params['stop_loss']
-            engine.mode_config['pca_stat_arb']['volatility_mult'] = params['volatility_mult']
-            engine.mode_config['pca_stat_arb']['position_risk'] = params['position_risk']
-        
-        engines, _ = run_backtest(df, timeframe)
-        if engines is None or strategy_id not in engines:
-            logger.error(f"Backtest failed for Strategy {strategy_id}")
-            return -1.0
-        metrics = calculate_day_metrics(engines[strategy_id].trade_history)
-        sharpe = metrics['overall']['sharpe_ratio']
-        return sharpe if np.isfinite(sharpe) else -1.0
-
-    # Step 1: Bayesian Optimization
-    optimizer = BayesianOptimization(f=evaluate_strategy, pbounds=pbounds, random_state=1)
+    optimizer = BayesianOptimization(
+        f=lambda **params: evaluate_strategy(df, timeframe, strategy_id, mode, **params),
+        pbounds=pbounds,
+        random_state=1
+    )
+    logger.debug(f"Running Bayesian optimization with bounds: {pbounds}")
     optimizer.maximize(init_points=5, n_iter=20)
     
-    # Extract top Bayesian result
     bayesian_best = optimizer.max
     if bayesian_best['target'] <= -1.0:
-        logger.error(f"Bayesian optimization failed for Strategy {strategy_id} - no valid Sharpe Ratio found")
+        logger.error(f"Bayesian optimization failed for Strategy {strategy_id} - no valid Sharpe Ratio found. Best params: {bayesian_best['params']}, Target: {bayesian_best['target']}")
+        default_params = {k: (v[0] + v[1]) / 2 for k, v in pbounds.items()}
+        sharpe = evaluate_strategy(df, timeframe, strategy_id, mode, **default_params)
+        logger.debug(f"Debug backtest with default params {default_params}: Sharpe = {sharpe}")
         return None
     logger.info(f"Bayesian best for Strategy {strategy_id}: {bayesian_best['params']}, Sharpe={bayesian_best['target']:.2f}")
 
-    # Step 2: Define refined grid around Bayesian best (only 3 key parameters)
     def create_refined_grid(best_params, bounds, step_size=0.1):
         grid = {}
-        # Define key parameters to refine
-        key_params = ['zscore', 'mean_reversion', 'stop_loss'] if strategy_id == 'A' else ['zscore_entry', 'zscore_exit', 'profit_target']
+        key_params = (
+            ['bollinger_zscore', 'mean_reversion', 'stop_loss'] if strategy_id == 'A' else
+            ['zscore_entry', 'zscore_exit', 'profit_target'] if strategy_id == 'B' else
+            ['keltner_atr_mult_entry', 'keltner_atr_mult_exit', 'stop_loss']
+        )
         for param, value in best_params.items():
             if param in key_params:
                 min_val, max_val = bounds[param]
@@ -119,17 +150,19 @@ def optimize_strategy(df, timeframe='5 mins', strategy_id='A'):
                     min(max_val, value + step)
                 ]
             else:
-                grid[param] = [value]  # Fix non-key parameters to Bayesian best
+                grid[param] = [value]
         return grid
 
     refined_grid = create_refined_grid(bayesian_best['params'], pbounds)
     grid_combinations = list(ParameterGrid(refined_grid))
     logger.info(f"Refined grid for Strategy {strategy_id}: {len(grid_combinations)} combinations")
 
-    # Step 3: Grid Search on refined grid with parallelization
     grid_results = []
-    with ProcessPoolExecutor(max_workers=4) as executor:  # Use 4 cores; adjust as needed
-        future_to_params = {executor.submit(evaluate_strategy, **params): params for params in grid_combinations}
+    with ProcessPoolExecutor(max_workers=4) as executor:
+        future_to_params = {
+            executor.submit(evaluate_strategy, df, timeframe, strategy_id, mode, **params): params
+            for params in grid_combinations
+        }
         for future in future_to_params:
             params = future_to_params[future]
             try:
@@ -139,11 +172,9 @@ def optimize_strategy(df, timeframe='5 mins', strategy_id='A'):
             except Exception as e:
                 logger.error(f"Grid search failed for {params}: {str(e)}")
 
-    # Sort and get top 3
     grid_results.sort(key=lambda x: x['sharpe'], reverse=True)
     top_3 = grid_results[:3]
 
-    # Log and print results
     logger.info(f"Top 3 parameter sets for Strategy {strategy_id} after hybrid optimization:")
     print(f"\n=== Top 3 Parameter Sets for Strategy {strategy_id} ({GlobalConfig.STRATEGY_LABELS[strategy_id]}) ===")
     for i, result in enumerate(top_3, 1):
@@ -152,7 +183,6 @@ def optimize_strategy(df, timeframe='5 mins', strategy_id='A'):
         print(f"  Parameters: {result['params']}")
         print(f"  Sharpe Ratio: {result['sharpe']:.2f}")
 
-    # Return best result for compatibility, plus top 3
     best_result = top_3[0] if top_3 else {'params': bayesian_best['params'], 'sharpe': bayesian_best['target']}
     return {'params': best_result['params'], 'target': best_result['sharpe'], 'top_3': top_3}
 
@@ -191,27 +221,57 @@ class TradeFormatter(logging.Formatter):
                 message = f"{self.RED}{message}{self.WHITE}"
         return message
 
-log_file = 'strategy_execution.log'
-with open(log_file, 'w') as f:
+class ErrorFilter(logging.Filter):
+    def filter(self, record):
+        # Filter for ERROR level or messages containing "error", "fail", "could not"
+        msg = record.getMessage().lower()
+        return (record.levelno >= logging.ERROR or 
+                any(keyword in msg for keyword in ["error", "fail", "could not", "warning"]))
+
+# Define log files
+main_log_file = 'strategy_execution.log'
+error_log_file = 'error_logs.log'
+
+# Clear existing log files
+with open(main_log_file, 'w') as f:
+    f.truncate(0)
+with open(error_log_file, 'w') as f:
     f.truncate(0)
 
+# Set up root logger
 root_logger = logging.getLogger()
-root_logger.setLevel(logging.INFO)
+root_logger.setLevel(logging.INFO)  # Base level for all logs
+
+# Remove any existing handlers
 for handler in root_logger.handlers[:]:
     root_logger.removeHandler(handler)
 
+# Console handler with colored output
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(TradeFormatter('%(asctime)s | %(message)s'))
-file_handler = logging.FileHandler(log_file)
-file_handler.setFormatter(logging.Formatter('%(asctime)s | %(message)s'))
+
+# Main file handler (all logs)
+main_file_handler = logging.FileHandler(main_log_file)
+main_file_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s'))
+
+# Error file handler (filtered logs)
+error_file_handler = logging.FileHandler(error_log_file)
+error_file_handler.setLevel(logging.INFO)  # Capture INFO and above, filtered by ErrorFilter
+error_file_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s'))
+error_file_handler.addFilter(ErrorFilter())
+
+# Add handlers to root logger
 root_logger.addHandler(console_handler)
-root_logger.addHandler(file_handler)
+root_logger.addHandler(main_file_handler)
+root_logger.addHandler(error_file_handler)
+
+# Create logger instance
 logger = logging.getLogger(__name__)
 
 class GlobalConfig:
     nest_asyncio.apply()
     symbol = 'TSLA'
-    durationStr = '7 D'
+    durationStr = '30 D'
     timeframes = ['5 mins']
     currency = 'USD'
     initial_balance = 10000
@@ -225,15 +285,18 @@ class GlobalConfig:
     MIN_TRADE_VALUE = 10.0
     MODE_TO_ID = {
         'bollinger_reversion': 'A',
-        'pca_stat_arb': 'B'
+        'pca_stat_arb': 'B',
+        'keltner_reversion': 'C'
     }
     STRATEGIES = {
         'A': 'bollinger_reversion',
-        'B': 'pca_stat_arb'
+        'B': 'pca_stat_arb',
+        'C': 'keltner_reversion'
     }
     STRATEGY_LABELS = {
         'A': 'A: Bollinger Bands MR',
-        'B': 'B: Stat Arb MR',
+        'B': 'B: PCA Stat Arb MR',
+        'C': 'C: Keltner Channels MR',
         'buy_and_hold': 'Benchmark: Buy & Hold'
     }
 
@@ -516,29 +579,42 @@ class BacktestEngine:
                 'position_risk': 0.02,
                 'volatility_mult': 1.5,
                 'entry_conditions': {
-                    'bollinger_zscore': {'threshold': -2.5, 'operator': '<'},
-                    'band_width': {'threshold': 0.05, 'operator': '>'},
-                    'volume_spike': {'threshold': 1.5, 'operator': '>'}
+                    'bollinger_zscore': {'threshold': -2.0, 'operator': '<'},
+                    'band_width': {'threshold': 0.03, 'operator': '>'},
+                    'volume_spike': {'threshold': 1.2, 'operator': '>'}
                 },
                 'exit_conditions': {
-                    'mean_reversion': {'threshold': lambda row: min(0.5, row['ATR_shifted'] * 1.0), 'operator': '>'},  # Relaxed to 0.5 or ATR
+                    'mean_reversion': {'threshold': 2.0, 'operator': '>'},
                     'stop_loss': {'threshold': -0.015, 'operator': '<'},
-                    'trailing_stop': {'atr_multiplier': 1.0}  # Tightened to 1.0x ATR
+                    'trailing_stop': {'atr_multiplier': 1.0}
                 }
             },
             'pca_stat_arb': {
                 'position_risk': 0.02,
                 'volatility_mult': 1.0,
-                'num_equities': 20,
+                'num_equities': 1,
                 'rebalance_days': 30,
                 'entry_conditions': {
-                    'zscore': {'threshold': lambda row: -1.5 - row['ATR_shifted'] * 0.5, 'operator': '<'},
+                    'zscore': {'threshold': lambda row: -1.0 - row['ATR_shifted'] * 0.5, 'operator': '<'},  # Relaxed threshold
                     'regime': {'threshold': 'mean_reverting', 'operator': '=='}
                 },
                 'exit_conditions': {
-                    'zscore_reversion': {'threshold': -0.5, 'operator': '>'},  # Relaxed from 0.0 to -0.5
-                    'profit_target': {'threshold': 0.5, 'operator': '>'},  # Relaxed from 1.0 to 0.5
+                    'zscore_reversion': {'threshold': -0.5, 'operator': '>'},
+                    'profit_target': {'threshold': 0.5, 'operator': '>'},
                     'stop_loss': {'threshold': -2.5, 'operator': '<'}
+                }
+            },
+            'keltner_reversion': {
+                'position_risk': 0.02,
+                'volatility_mult': 1.5,
+                'ema_period': 20,
+                'entry_conditions': {
+                    'keltner_zscore': {'threshold': -2.0, 'operator': '<'}
+                },
+                'exit_conditions': {
+                    'mean_reversion': {'threshold': 1.5, 'operator': '>'},
+                    'stop_loss': {'threshold': -0.015, 'operator': '<'},
+                    'trailing_stop': {'atr_multiplier': 1.0}
                 }
             }
         }
@@ -551,18 +627,14 @@ class BacktestEngine:
         self.volatility_filter = {'min_mrc': 0.02, 'max_mrc': 0.08}
         self.daily_pnl = {}
         self.backtest_data = []
+        self.last_metrics = None  # Cache for metrics
         logger.info(f"Strategy {strategy_id} ({mode}) initialized for {timeframe} with balance: ${self.balance}")
 
     def validate_mode_config(self):
         required_keys = ['position_risk', 'volatility_mult', 'entry_conditions', 'exit_conditions']
-        signal_score_required = required_keys + ['signal_weights']
         for mode, config in self.mode_config.items():
-            if mode == 'signal_score':
-                if not all(k in config for k in signal_score_required):
-                    raise ValueError(f"Missing config keys in {mode}: {set(signal_score_required) - set(config.keys())}")
-            else:
-                if not all(k in config for k in required_keys):
-                    raise ValueError(f"Missing config keys in {mode}: {set(required_keys) - set(config.keys())}")
+            if not all(k in config for k in required_keys):
+                raise ValueError(f"Missing config keys in {mode}: {set(required_keys) - set(config.keys())}")
 
     @property
     def max_position_size(self):
@@ -572,14 +644,17 @@ class BacktestEngine:
         config = self.mode_config[self.mode]
         active_positions = len(self.current_positions)
         
-        metrics = calculate_day_metrics(self.trade_history)
-        drawdown_factor = max(0.5, 1 - metrics['overall']['max_drawdown'] / 50)  # Reduce size if drawdown > 50%
+        # Use cached metrics if available, otherwise calculate once
+        if self.trade_history and not self.last_metrics:
+            self.last_metrics = calculate_day_metrics(self.trade_history)
+        metrics = self.last_metrics if self.last_metrics else {'overall': {'max_drawdown': 0.0}}
+        drawdown_factor = max(0.5, 1 - metrics['overall']['max_drawdown'] / 50)
         
         base_risk_capital = self.balance * config['position_risk'] * drawdown_factor
         risk_factor = max(1, active_positions * 0.5)
         risk_capital = base_risk_capital / risk_factor
         
-        atr_shifted = max(row.get('ATR_shifted', 0.01), 0.01)  # Ensure minimum ATR
+        atr_shifted = max(row.get('ATR_shifted', 0.01), 0.01)
         atr_risk = max(atr_shifted * config['volatility_mult'], 0.01)
         
         volume_ratio = row['volume'] / row['volume_ma_shifted'] if row['volume_ma_shifted'] > 0 else 1.0
@@ -589,7 +664,7 @@ class BacktestEngine:
         position_size = min(self.max_position_size, position_size)
         position_size = max(position_size, GlobalConfig.MIN_TRADE_VALUE)
         
-        if atr_shifted < 0.01:  # Avoid low-volatility trades
+        if atr_shifted < 0.01:
             logger.warning(f"Strategy {self.strategy_id}: ATR too low ({atr_shifted:.4f}), skipping trade")
             return 0
         
@@ -602,32 +677,6 @@ class BacktestEngine:
 
     def calculate_fees(self, shares):
         return abs(shares * self.fee_per_share)
-
-    def composite_signal_score(self, row):
-        config = self.mode_config[self.mode]
-        if self.mode != 'signal_score':
-            return 0.0
-        weights = config['signal_weights'].copy()
-        total_weight = sum(weights.values())
-        scores = {}
-        conditions_met = 0
-        total_conditions = len(weights)
-
-        if 'mean_deviation' in weights:
-            deviation = (row['close'] - row['meanline']) / row['meanrange_shifted'] if row['meanrange_shifted'] > 0 else 0
-            scores['mean_deviation'] = weights['mean_deviation'] * min(1.0, max(0, (-deviation - 1.0) / 1.0))
-            conditions_met += 1 if deviation < -1.0 else 0
-        if 'rsi' in weights:
-            rsi = row['RSI_shifted']
-            scores['rsi'] = weights['rsi'] * min(1.0, max(0, (30 - rsi) / 30))
-            conditions_met += 1 if rsi < 30 else 0
-        if 'williams' in weights:
-            williams = row['Williams_%R_shifted']
-            scores['williams'] = weights['williams'] * min(1.0, max(0, (-80 - williams) / 20))
-            conditions_met += 1 if williams < -80 else 0
-
-        weighted_score = sum(scores.values()) / total_weight if total_weight > 0 else 0
-        return weighted_score if conditions_met >= total_conditions * 0.75 else 0
 
     def execute_trade(self, price, shares, action, timestamp, exit_type=None, row=None, position=None):
         if not is_price_valid(price):
@@ -650,7 +699,7 @@ class BacktestEngine:
                 if 'high' in row and 'low' in row and not pd.isna(row['high']) and not pd.isna(row['low']):
                     spread = (row['high'] - row['low']) * 0.5
                     spread_factor = spread / price
-                    spread_factor = min(max(spread_factor, -0.1), 0.1)  # Limit to ±10%
+                    spread_factor = min(max(spread_factor, -0.1), 0.1)
                     price_with_slippage = price * (1 + spread_factor if action == 'BUY' else 1 - spread_factor)
                     logger.debug(f"Strategy {self.strategy_id}: Slippage applied - Price={price:.2f}, Spread={spread:.2f}, Adjusted Price={price_with_slippage:.2f}")
                 else:
@@ -661,9 +710,8 @@ class BacktestEngine:
                 logger.error(f"Strategy {self.strategy_id}: Invalid price_with_slippage: {price_with_slippage}")
                 return None
             
-            # Adjust shares to ensure position_value respects max_position_size after slippage
             if action == 'BUY':
-                position_size = self.calculate_position_size(row)  # Recalculate to ensure freshness
+                position_size = self.calculate_position_size(row)
                 shares = max(0.01, round(position_size / price_with_slippage, 2))
             
             fees = self.calculate_fees(shares)
@@ -693,7 +741,7 @@ class BacktestEngine:
                 if total_cost > self.balance:
                     logger.warning(f"Strategy {self.strategy_id}: Insufficient funds: ${total_cost:.2f} > ${self.balance:.2f}")
                     return None
-                if position_value > self.max_position_size:  # This should now be rare due to share adjustment
+                if position_value > self.max_position_size:
                     logger.warning(f"Strategy {self.strategy_id}: Adjusted position value ${position_value:.2f} still exceeds max ${self.max_position_size:.2f}, scaling down")
                     shares = max(0.01, round(self.max_position_size / price_with_slippage, 2))
                     position_value = shares * price_with_slippage
@@ -768,7 +816,7 @@ class BacktestEngine:
         history['returns'] = history['close'].pct_change().fillna(0)
         history['rsi_scaled'] = (history['RSI_shifted'] - 50) / 50
         history['volume_scaled'] = history['volume'] / history['volume_ma_shifted'] - 1
-        history['macd_scaled'] = history['MACD_shifted'] / history['ATR_shifted']  # New feature
+        history['macd_scaled'] = history['MACD_shifted'] / history['ATR_shifted']
         
         features = history[['returns', 'rsi_scaled', 'volume_scaled', 'macd_scaled']].fillna(0)
         pca = PCA(n_components=1)
@@ -783,78 +831,91 @@ class BacktestEngine:
 # =====================
 # CONDITION CHECKS
 # =====================
-def check_exit_conditions(df, index, engine, row):
-    if str(index.tz) != 'America/New_York':
-        raise ValueError(f"Invalid timezone in exit check: {index.tz}")
-    
-    if not engine.current_positions:
-        return None
-    
-    try:
-        config = engine.mode_config[engine.mode]
-        conditions = config['exit_conditions']
-        current_time = enforce_ny_timezone(index)
-        current_price = row['close']
-        meanrange = row.get('meanrange_shifted', 0) or 1
+def check_exit_conditions(self, df, index, engine, row):
+        if str(index.tz) != 'America/New_York':
+            raise ValueError(f"Invalid timezone in exit check: {index.tz}")
         
-        for pos in engine.current_positions[:]:
-            entry_time = pos['entry_time']
-            entry_price = pos['entry_price']
-            deviation = (current_price - entry_price) / entry_price
-            logger.debug(f"Checking exit for Pos #{pos['position_id']} at {index}: Entry=${entry_price:.2f}, Current=${current_price:.2f}, Deviation={deviation:.2%}")
-            
-            # Add detailed logging of key indicators
-            bollinger_std_shifted = row.get('bollinger_std_shifted', 1) or 1
-            bollinger_mid_shifted = row.get('bollinger_mid_shifted', current_price)
-            bollinger_deviation = (current_price - bollinger_mid_shifted) / bollinger_std_shifted
-            atr = row.get('ATR_shifted', 1) or 1
-            zscore = engine.compute_pca_zscores(df, row) if engine.mode == 'pca_stat_arb' else 0.0
-            logger.debug(f"Strategy {engine.strategy_id}: ATR={atr:.2f}, Bollinger Deviation={bollinger_deviation:.2f}, Z-Score={zscore:.2f}")
-            
-            for condition_name, params in conditions.items():
-                # Handle conditions with 'threshold' key
-                if 'threshold' in params:
-                    threshold = params['threshold'] if isinstance(params['threshold'], (int, float)) else params['threshold'](row) if callable(params['threshold']) else params['threshold']
-                
-                if condition_name == 'mean_reversion' and engine.mode == 'bollinger_reversion':
-                    if abs(bollinger_deviation) < abs(threshold):
-                        logger.info(f"Triggered {condition_name} exit for Pos #{pos['position_id']}: Deviation={bollinger_deviation:.2f} < {threshold:.2f}")
-                        return f'Bollinger Mean Reversion (Pos #{pos["position_id"]})'
-                    logger.debug(f"No {condition_name} exit for Pos #{pos['position_id']}: Deviation={bollinger_deviation:.2f}, Threshold={threshold:.2f}")
-                
-                elif condition_name == 'stop_loss':
-                    if deviation < threshold:
-                        logger.info(f"Triggered {condition_name} exit for Pos #{pos['position_id']}: Deviation={deviation:.2%} < {threshold:.2%}")
-                        return f'Stop Loss (Pos #{pos["position_id"]})'
-                    logger.debug(f"No {condition_name} exit for Pos #{pos['position_id']}: Deviation={deviation:.2%}, Threshold={threshold:.2%}")
-                
-                elif condition_name == 'trailing_stop' and engine.mode == 'bollinger_reversion':
-                    if 'highest_price' not in pos:
-                        pos['highest_price'] = entry_price
-                    pos['highest_price'] = max(pos['highest_price'], current_price)
-                    stop_level = pos['highest_price'] - (atr * params['atr_multiplier'])
-                    if current_price <= stop_level:
-                        logger.info(f"Triggered {condition_name} exit for Pos #{pos['position_id']}: Price={current_price:.2f} <= Stop={stop_level:.2f}")
-                        return f'Trailing Stop ({params["atr_multiplier"]}x ATR, Pos #{pos["position_id"]})'
-                    logger.debug(f"No {condition_name} exit for Pos #{pos['position_id']}: Price={current_price:.2f}, Highest={pos['highest_price']:.2f}, Stop={stop_level:.2f}")
-                
-                elif condition_name == 'zscore_reversion' and engine.mode == 'pca_stat_arb':
-                    if zscore > threshold:
-                        logger.info(f"Triggered {condition_name} exit for Pos #{pos['position_id']}: Z-Score={zscore:.2f} > {threshold}")
-                        return f'Z-Score Reversion (Pos #{pos["position_id"]})'
-                    logger.debug(f"No {condition_name} exit for Pos #{pos['position_id']}: Z-Score={zscore:.2f}, Threshold={threshold}")
-                
-                elif condition_name == 'profit_target' and engine.mode == 'pca_stat_arb':
-                    if zscore > threshold:
-                        logger.info(f"Triggered {condition_name} exit for Pos #{pos['position_id']}: Z-Score={zscore:.2f} > {threshold}")
-                        return f'Profit Target (Pos #{pos["position_id"]})'
-                    logger.debug(f"No {condition_name} exit for Pos #{pos['position_id']}: Z-Score={zscore:.2f}, Threshold={threshold}")
+        if not engine.current_positions:
+            return None
         
-        return None
-    
-    except Exception as e:
-        logger.error(f"Strategy {engine.strategy_id} - Error in exit check at {index}: {str(e)}", exc_info=True)
-        return None
+        try:
+            config = engine.mode_config[engine.mode]
+            conditions = config['exit_conditions']
+            current_time = enforce_ny_timezone(index)
+            current_price = row['close']
+            
+            for pos in engine.current_positions[:]:
+                entry_time = pos['entry_time']
+                entry_price = pos['entry_price']
+                deviation = (current_price - entry_price) / entry_price
+                
+                atr = row.get('ATR_shifted', 1) or 1
+                
+                if engine.mode == 'bollinger_reversion':
+                    bollinger_std_shifted = row.get('bollinger_std_shifted', 1) or 1
+                    bollinger_mid_shifted = row.get('bollinger_mid_shifted', current_price)
+                    bollinger_deviation = (current_price - bollinger_mid_shifted) / bollinger_std_shifted
+                elif engine.mode == 'keltner_reversion':
+                    keltner_ema = row.get('keltner_ema_shifted', current_price)
+                    keltner_upper = row.get('keltner_upper_shifted', keltner_ema + atr * 2)
+                    keltner_lower = row.get('keltner_lower_shifted', keltner_ema - atr * 2)
+                    keltner_deviation = (current_price - keltner_ema) / atr
+                elif engine.mode == 'pca_stat_arb':
+                    zscore = engine.compute_pca_zscores(df, row)
+                
+                for condition_name, params in conditions.items():
+                    if 'threshold' in params:
+                        threshold = (params['threshold'] if isinstance(params['threshold'], (int, float))
+                                     else params['threshold'](row) if callable(params['threshold'])
+                                     else params['threshold'])
+                    else:
+                        threshold = None
+                    
+                    if condition_name == 'mean_reversion':
+                        if engine.mode == 'bollinger_reversion' and threshold is not None and bollinger_deviation > threshold:
+                            logger.info(f"Triggered {condition_name} exit for Pos #{pos['position_id']}: "
+                                      f"Deviation={bollinger_deviation:.2f} > {threshold:.2f}")
+                            return f'Bollinger Overbought (Pos #{pos["position_id"]})'
+                        elif engine.mode == 'keltner_reversion' and threshold is not None and keltner_deviation > threshold:
+                            logger.info(f"Triggered {condition_name} exit for Pos #{pos['position_id']}: "
+                                      f"Deviation={keltner_deviation:.2f} > {threshold:.2f}")
+                            return f'Keltner Overbought (Pos #{pos["position_id"]})'
+                    
+                    elif condition_name == 'stop_loss':
+                        if threshold is not None and deviation < threshold:
+                            logger.info(f"Triggered {condition_name} exit for Pos #{pos['position_id']}: "
+                                      f"Deviation={deviation:.2%} < {threshold:.2%}")
+                            return f'Stop Loss (Pos #{pos["position_id"]})'
+                    
+                    elif condition_name == 'trailing_stop':
+                        if 'atr_multiplier' in params:
+                            atr_multiplier = params['atr_multiplier']
+                            if 'highest_price' not in pos:
+                                pos['highest_price'] = entry_price
+                            pos['highest_price'] = max(pos['highest_price'], current_price)
+                            stop_level = pos['highest_price'] - (atr * atr_multiplier)
+                            if current_price <= stop_level:
+                                logger.info(f"Triggered {condition_name} exit for Pos #{pos['position_id']}: "
+                                          f"Price={current_price:.2f} <= Stop={stop_level:.2f}")
+                                return f'Trailing Stop ({atr_multiplier}x ATR, Pos #{pos["position_id"]})'
+                    
+                    elif condition_name == 'zscore_reversion' and engine.mode == 'pca_stat_arb':
+                        if threshold is not None and zscore > threshold:
+                            logger.info(f"Triggered zscore_reversion exit for Pos #{pos['position_id']}: "
+                                      f"Z-Score={zscore:.2f} > {threshold:.2f}")
+                            return f'Z-Score Reversion (Pos #{pos["position_id"]})'
+                    
+                    elif condition_name == 'profit_target' and engine.mode == 'pca_stat_arb':
+                        if threshold is not None and zscore > threshold:
+                            logger.info(f"Triggered profit_target exit for Pos #{pos['position_id']}: "
+                                      f"Z-Score={zscore:.2f} > {threshold:.2f}")
+                            return f'Profit Target (Pos #{pos["position_id"]})'
+            
+            return None
+        
+        except Exception as e:
+            logger.error(f"Strategy {engine.strategy_id} - Error in exit check at {index}: {str(e)}", exc_info=True)
+            return None
 
 def check_all_entry_conditions(df, index, engines, row):
     if str(index.tz) != 'America/New_York':
@@ -1366,6 +1427,20 @@ def execute_exit(strategy_id, engine, price, timestamp, exit_type, row):
         logger.error(f"Strategy {strategy_id}: Failed to execute exit trade for Pos #{pos_id}")
     return trade
 
+def calculate_keltner_channels(df, ema_period=20, atr_period=14, atr_multiplier=2.0):
+    df = df.copy()
+    df['keltner_ema'] = df['close'].ewm(span=ema_period, adjust=False).mean()
+    df['ATR'] = df['tr'].rolling(atr_period, min_periods=1).mean()
+    df['keltner_upper'] = df['keltner_ema'] + (df['ATR'] * atr_multiplier)
+    df['keltner_lower'] = df['keltner_ema'] - (df['ATR'] * atr_multiplier)
+    df['keltner_zscore'] = (df['close'] - df['keltner_ema']) / df['ATR'].replace(0, np.nan).fillna(0.01)
+    
+    shifted_cols = ['keltner_ema', 'keltner_upper', 'keltner_lower', 'keltner_zscore']
+    for col in shifted_cols:
+        df[f'{col}_shifted'] = df[col].shift(1).fillna(df[col].iloc[0] if not df[col].empty else 0)
+    
+    return df
+
 def run_backtest(df, timeframe, collect_non_trades=False):
     try:
         if df is None or df.empty:
@@ -1373,14 +1448,8 @@ def run_backtest(df, timeframe, collect_non_trades=False):
             return None, None
         logger.info(f"Starting optimized backtest for {timeframe} with data shape: {df.shape}")
 
-        # Precompute all indicators once
+        # Precompute all indicators
         df = calculate_mrc_with_gradient(df)
-        required_indicators = ['tr', 'volume', 'close', 'high', 'low']
-        missing = [col for col in required_indicators if col not in df.columns]
-        if missing:
-            logger.error(f"Missing required columns for indicators: {missing}")
-            return None, None
-
         df['ATR'] = df['tr'].rolling(14, min_periods=1).mean().fillna(0)
         df = calculate_adx(df)
         df = stochastic_oscillator(df)
@@ -1392,92 +1461,92 @@ def run_backtest(df, timeframe, collect_non_trades=False):
         df['Williams_%R'] = williams_r(df['high'], df['low'], df['close']).fillna(-50)
         df['volume_ma'] = df['volume'].rolling(20, min_periods=1).mean().fillna(df['volume'].mean())
         df = calculate_bollinger_bands(df)
+        df = calculate_keltner_channels(df)
         df['price_change'] = df['close'].pct_change()
         df['price_divergence_shifted'] = df['price_change'].shift(1).fillna(0)
 
-        shifted_cols = ['close', 'RSI', 'Williams_%R', 'VWAP', 'MACD', 'Signal', 'Histogram', 'adx', '+di', '-di', '%K', '%D', 'volume_ma', 'ATR', 'meanrange', 
-                        'bollinger_mid', 'bollinger_upper', 'bollinger_lower', 'bollinger_zscore', 'bollinger_std']
+        shifted_cols = ['close', 'RSI', 'Williams_%R', 'VWAP', 'MACD', 'Signal', 'Histogram', 'adx', '+di', '-di', '%K', '%D', 'volume_ma', 'ATR', 'meanrange',
+                        'bollinger_mid', 'bollinger_upper', 'bollinger_lower', 'bollinger_zscore', 'bollinger_std',
+                        'keltner_ema', 'keltner_upper', 'keltner_lower', 'keltner_zscore']
         for col in shifted_cols:
             if col in df.columns:
                 df[f'{col}_shifted'] = df[col].shift(1).fillna(df[col].iloc[0])
 
-        # Initialize engines
         engines = {
             'A': BacktestEngine('A', 'bollinger_reversion', timeframe),
-            'B': BacktestEngine('B', 'pca_stat_arb', timeframe)
+            'B': BacktestEngine('B', 'pca_stat_arb', timeframe),
+            'C': BacktestEngine('C', 'keltner_reversion', timeframe)
         }
 
-        # Vectorized entry/exit conditions
         df['is_market_open'] = ~df.index.map(is_market_close)
         df['price_valid'] = df['close'].apply(is_price_valid)
 
-        # Ensure no NaN values in critical columns
-        for col in ['bollinger_zscore_shifted', 'bollinger_upper_shifted', 'bollinger_lower_shifted', 'close', 'ATR_shifted', 'volume', 'volume_ma_shifted']:
+        critical_cols = ['bollinger_zscore_shifted', 'bollinger_upper_shifted', 'bollinger_lower_shifted', 
+                         'keltner_zscore_shifted', 'keltner_upper_shifted', 'keltner_lower_shifted', 
+                         'close', 'ATR_shifted', 'volume', 'volume_ma_shifted']
+        for col in critical_cols:
             if col in df.columns:
                 df[col] = df[col].fillna(0)
 
-        # Strategy A: Bollinger Reversion - Relaxed thresholds
         config_a = engines['A'].mode_config['bollinger_reversion']
         df['entry_a'] = (
-            (df['bollinger_zscore_shifted'] < -1.5) &  # Relaxed from -2.5
-            ((df['bollinger_upper_shifted'] - df['bollinger_lower_shifted']) / df['close'] / (df['ATR_shifted'] / df['close']).clip(lower=0.01) > 0.03) &  # Relaxed from 0.05
-            (df['volume'] / df['volume_ma_shifted'] > 1.2) &  # Relaxed from 1.5
+            (df['bollinger_zscore_shifted'] < config_a['entry_conditions']['bollinger_zscore']['threshold']) &
+            ((df['bollinger_upper_shifted'] - df['bollinger_lower_shifted']) / df['close'] / 
+             (df['ATR_shifted'] / df['close']).clip(lower=0.01) > config_a['entry_conditions']['band_width']['threshold']) &
+            (df['volume'] / df['volume_ma_shifted'] > config_a['entry_conditions']['volume_spike']['threshold']) &
             df['is_market_open'] & df['price_valid']
         )
-        df['exit_a_mean'] = df['close'].shift(-1) > df['bollinger_mid_shifted']
-        df['exit_a_stop'] = (df['close'].shift(-1) - df['close']) / df['close'] < config_a['exit_conditions']['stop_loss']['threshold']
+        df['exit_a_mean'] = df['bollinger_zscore_shifted'] > config_a['exit_conditions']['mean_reversion']['threshold']  # Removed shift(-1)
 
-        # Strategy B: PCA Stat Arb - Relaxed thresholds
         config_b = engines['B'].mode_config['pca_stat_arb']
         df['zscore'] = df.apply(lambda row: engines['B'].compute_pca_zscores(df, row), axis=1)
         df['regime'] = df.apply(detect_market_regime, axis=1)
+        logger.debug(f"Regime distribution: {df['regime'].value_counts().to_dict()}")
         df['entry_b'] = (
-            (df['zscore'] < -1.0) &  # Relaxed from dynamic -1.5 - ATR * 0.5
+            (df['zscore'] < config_b['entry_conditions']['zscore']['threshold'](df.iloc[-1])) &
             (df['regime'] == 'mean_reverting') &
             df['is_market_open'] & df['price_valid']
         )
-        df['exit_b_zscore'] = df['zscore'].shift(-1) > config_b['exit_conditions']['zscore_reversion']['threshold']
+        df['exit_b_zscore'] = df['zscore'] > config_b['exit_conditions']['zscore_reversion']['threshold']  # Removed shift(-1)
 
-        # Log entry condition stats
+        config_c = engines['C'].mode_config['keltner_reversion']
+        df['entry_c'] = (
+            (df['keltner_zscore_shifted'] < config_c['entry_conditions']['keltner_zscore']['threshold']) &  # Already negative
+            df['is_market_open'] & df['price_valid']
+        )
+        df['exit_c_mean'] = df['keltner_zscore_shifted'] > config_c['exit_conditions']['mean_reversion']['threshold']  # Removed shift(-1)
+
         logger.debug(f"Strategy A entry conditions met: {df['entry_a'].sum()} times")
         logger.debug(f"Strategy B entry conditions met: {df['entry_b'].sum()} times")
+        logger.debug(f"Strategy C entry conditions met: {df['entry_c'].sum()} times")
 
-        # Process trades in bulk
         for strat_id, engine in engines.items():
             entry_col = f'entry_{strat_id.lower()}'
-            positions = []
             trade_history = []
 
             logger.debug(f"Processing Strategy {strat_id} with {df[entry_col].sum()} potential entries")
             for idx, row in df[df[entry_col]].iterrows():
-                if len(positions) < 5:  # Max positions
+                if len(engine.current_positions) < 5:
                     position_size = engine.calculate_position_size(row)
                     logger.debug(f"Strategy {strat_id} at {idx}: Position size calculated as ${position_size:.2f}")
                     if position_size > 0:
                         trade = engine.execute_trade(row['close'], position_size / row['close'], 'BUY', idx, row=row)
                         if trade:
-                            positions.append(trade)
                             trade_history.append(trade)
                         else:
                             logger.debug(f"Strategy {strat_id} at {idx}: Trade execution failed")
 
-            # Exit logic
-            for pos in positions[:]:
-                pos_idx = df.index.get_loc(pos['timestamp'])
-                for i in range(pos_idx + 1, len(df)):
-                    row = df.iloc[i]
-                    exit_type = check_exit_conditions(df, row.name, engine, row)
-                    if exit_type:
-                        trade = engine.execute_trade(row['close'], pos['shares'], 'SELL', row.name, exit_type, row=row, position=pos)
+            for i in range(len(df)):
+                row = df.iloc[i]
+                exit_type = check_exit_conditions(df, row.name, engine, row)
+                if exit_type:
+                    pos_id = int(exit_type.split('Pos #')[1].strip(')'))
+                    position = next((p for p in engine.current_positions if p['position_id'] == pos_id), None)
+                    if position:
+                        trade = engine.execute_trade(row['close'], position['shares'], 'SELL', row.name, exit_type, row=row, position=position)
                         if trade:
                             trade_history.append(trade)
-                            positions.remove(pos)
-                        break
-                    elif i == len(df) - 1:  # Forced exit
-                        trade = engine.execute_trade(row['close'], pos['shares'], 'SELL', row.name, f"Forced Exit (Pos #{pos['position_id']})", row=row, position=pos)
-                        if trade:
-                            trade_history.append(trade)
-                            positions.remove(pos)
+                    # Removed break to allow multiple exits
 
             engine.trade_history = trade_history
             logger.info(f"Strategy {strat_id} completed - Trades: {len(trade_history)}")
@@ -1495,7 +1564,7 @@ def main():
     max_retries = 3
     try:
         logger.setLevel(logging.DEBUG)
-        logger.info("Starting main execution with Bollinger Bands MR, Stat Arb MR, and Buy & Hold comparison")
+        logger.info("Starting main execution with Bollinger Bands MR, PCA Stat Arb MR, Keltner Channels MR, and Buy & Hold comparison")
         for attempt in range(max_retries):
             try:
                 ib.connect('127.0.0.1', 7497, clientId=1)
@@ -1532,7 +1601,8 @@ def main():
 
             selected_strategies = {
                 'A: Bollinger Bands MR': metrics['A: Bollinger Bands MR'],
-                'B: Stat Arb MR': metrics['B: Stat Arb MR']
+                'B: PCA Stat Arb MR': metrics['B: PCA Stat Arb MR'],
+                'C: Keltner Channels MR': metrics['C: Keltner Channels MR']
             }
 
             buy_hold_result = calculate_buy_and_hold(daily_data)
@@ -1549,24 +1619,23 @@ def main():
                 'data': daily_data
             }
 
-        # Optimize all strategies for each timeframe using hybrid approach
+        # Optimize all strategies
         optimized_results = {}
         for timeframe, result in all_results.items():
-            for strat_id in ['A', 'B']:
+            for strat_id in ['A', 'B', 'C']:
                 logger.info(f"Optimizing Strategy {strat_id} for timeframe {timeframe}")
                 optimized_result = optimize_strategy(result['data'], timeframe, strat_id)
                 if optimized_result and 'top_3' in optimized_result:
                     optimized_results[f"{strat_id}_{timeframe}"] = optimized_result
                     engine = result['engines'][strat_id]
                     
-                    # Apply the best parameters from the hybrid optimization
                     if strat_id == 'A':
-                        engine.mode_config['bollinger_reversion']['entry_conditions']['bollinger_zscore']['threshold'] = optimized_result['params']['zscore']
+                        engine.mode_config['bollinger_reversion']['entry_conditions']['bollinger_zscore']['threshold'] = optimized_result['params']['bollinger_zscore']
                         engine.mode_config['bollinger_reversion']['entry_conditions']['band_width']['threshold'] = optimized_result['params']['band_width']
                         engine.mode_config['bollinger_reversion']['entry_conditions']['volume_spike']['threshold'] = optimized_result['params']['volume_spike']
-                        engine.mode_config['bollinger_reversion']['exit_conditions']['mean_reversion']['threshold'] = lambda row: optimized_result['params']['mean_reversion']
+                        engine.mode_config['bollinger_reversion']['exit_conditions']['mean_reversion']['threshold'] = optimized_result['params']['mean_reversion']
                         engine.mode_config['bollinger_reversion']['exit_conditions']['stop_loss']['threshold'] = optimized_result['params']['stop_loss']
-                        engine.mode_config['bollinger_reversion']['exit_conditions']['trailing_stop']['atr_multiplier'] = optimized_result['params']['trailing_atr']
+                        engine.mode_config['bollinger_reversion']['exit_conditions']['trailing_stop']['atr_multiplier'] = optimized_result['params']['trailing_stop_atr']
                     elif strat_id == 'B':
                         engine.mode_config['pca_stat_arb']['entry_conditions']['zscore']['threshold'] = lambda row: optimized_result['params']['zscore_entry'] - row['ATR_shifted'] * 0.5
                         engine.mode_config['pca_stat_arb']['exit_conditions']['zscore_reversion']['threshold'] = optimized_result['params']['zscore_exit']
@@ -1574,8 +1643,13 @@ def main():
                         engine.mode_config['pca_stat_arb']['exit_conditions']['stop_loss']['threshold'] = optimized_result['params']['stop_loss']
                         engine.mode_config['pca_stat_arb']['volatility_mult'] = optimized_result['params']['volatility_mult']
                         engine.mode_config['pca_stat_arb']['position_risk'] = optimized_result['params']['position_risk']
+                    elif strat_id == 'C':
+                        engine.mode_config['keltner_reversion']['entry_conditions']['keltner_zscore']['threshold'] = optimized_result['params']['keltner_atr_mult_entry']
+                        engine.mode_config['keltner_reversion']['exit_conditions']['mean_reversion']['threshold'] = optimized_result['params']['keltner_atr_mult_exit']
+                        engine.mode_config['keltner_reversion']['exit_conditions']['stop_loss']['threshold'] = optimized_result['params']['stop_loss']
+                        engine.mode_config['keltner_reversion']['exit_conditions']['trailing_stop']['atr_multiplier'] = optimized_result['params']['trailing_stop_atr']
+                        engine.mode_config['keltner_reversion']['ema_period'] = optimized_result['params']['keltner_ema_period']
                     
-                    # Run backtest with the best optimized parameters
                     engines_opt, _ = run_backtest(result['data'], timeframe)
                     if engines_opt and strat_id in engines_opt:
                         optimized_metrics = calculate_day_metrics(engines_opt[strat_id].trade_history)
