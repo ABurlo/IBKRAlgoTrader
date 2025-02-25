@@ -29,23 +29,29 @@ from bayes_opt import BayesianOptimization
 from sklearn.model_selection import ParameterGrid
 
 param_grid = {
-    # Strategy A: Bollinger Bands MR
-    'bollinger_zscore': [-3.0, -2.5, -2.0],
-    'band_width': [0.03, 0.05, 0.07],
-    'volume_spike': [1.2, 1.5, 2.0],
-    'mean_reversion': [1.5, 2.0, 2.5],
-    'stop_loss': [-0.01, -0.02, -0.03],
-    'trailing_stop_atr': [0.5, 1.0, 1.5],
-    # Strategy B: PCA Stat Arb
-    'zscore_entry': [-2.5, -2.0, -1.5],
-    'zscore_exit': [-0.5, 0.0, 0.5],
-    'profit_target': [0.2, 0.5, 1.0],
-    'volatility_mult': [0.5, 1.0, 1.5],
-    'position_risk': [0.01, 0.02, 0.03],
-    # Strategy C: Keltner Channels MR
-    'keltner_atr_mult_entry': [1.5, 2.0, 2.5],
-    'keltner_atr_mult_exit': [1.0, 1.5, 2.0],
-    'keltner_ema_period': [10, 20, 30]
+    'A': {
+        'bollinger_zscore': [-3.0, -2.5, -2.0],
+        'band_width': [0.03, 0.05, 0.07],
+        'volume_spike': [1.2, 1.5, 2.0],
+        'mean_reversion': [1.5, 2.0, 2.5],
+        'stop_loss': [-0.01, -0.02, -0.03],
+        'trailing_stop_atr': [0.5, 1.0, 1.5]
+    },
+    'B': {
+        'zscore_entry': [-2.5, -2.0, -1.5],
+        'zscore_exit': [-0.5, 0.0, 0.5],
+        'profit_target': [0.2, 0.5, 1.0],
+        'volatility_mult': [0.5, 1.0, 1.5],
+        'position_risk': [0.01, 0.02, 0.03],
+        'stop_loss': [-3.0, -2.0, -1.5]  # Added stop_loss to match strategy_bounds
+    },
+    'C': {
+        'keltner_atr_mult_entry': [1.5, 2.0, 2.5],
+        'keltner_atr_mult_exit': [1.0, 1.5, 2.0],
+        'keltner_ema_period': [10, 20, 30],
+        'stop_loss': [-0.03, -0.02, -0.01],  # Adjusted to match strategy_bounds range
+        'trailing_stop_atr': [0.5, 1.0, 2.0]  # Adjusted to match strategy_bounds range
+    }
 }
 
 def evaluate_strategy(df, timeframe, strategy_id, mode, **params):
@@ -80,7 +86,7 @@ def evaluate_strategy(df, timeframe, strategy_id, mode, **params):
     metrics = calculate_day_metrics(trade_history)
     sharpe = metrics['overall']['sharpe_ratio']
     logger.debug(f"Strategy {strategy_id}: Sharpe Ratio = {sharpe}, Metrics = {metrics['overall']}")
-    return sharpe if np.isfinite(sharpe) else -1.0
+    return sharpe if np.isfinite(sharpe) and sharpe > -1.0 else 0.01  # Return small positive value if invalid or too low
 
 def optimize_strategy(df, timeframe='5 mins', strategy_id='A'):
     logger.info(f"Starting hybrid optimization (Bayesian + Grid) for Strategy {strategy_id} on {timeframe}")
