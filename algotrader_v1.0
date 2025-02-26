@@ -134,9 +134,9 @@ def optimize_strategy(df, timeframe=GlobalConfig.durationStr, strategy_id='A'):
         },
         'C': {
             'keltner_atr_mult_entry': (0.5, 3.0),
-            'keltner_atr_mult_exit': (0.0, 2.0),
+            'keltner_atr_mult_exit': (0.5, 1.5),
             'stop_loss': (-0.05, -0.01),
-            'trailing_stop_atr': (1.0, 4.0),
+            'trailing_stop_atr': (1.5, 2.5),
             'keltner_ema_period': (10, 30)
         }
     }
@@ -1753,21 +1753,22 @@ def main():
                         engine.mode_config['pca_stat_arb']['volatility_mult'] = optimized_result['params']['volatility_mult']
                         engine.mode_config['pca_stat_arb']['position_risk'] = optimized_result['params']['position_risk']
                     elif strat_id == 'C':
-                        engine.mode_config['keltner_reversion']['entry_conditions']['keltner_zscore']['threshold'] = -optimized_result['params']['keltner_atr_mult_entry']  # Negate here
-                        engine.mode_config['keltner_reversion']['exit_conditions']['mean_reversion']['threshold'] = optimized_result['params']['keltner_atr_mult_exit']
+                        engine.mode_config['keltner_reversion']['entry_conditions']['keltner_zscore']['threshold'] = -optimized_result['params']['keltner_atr_mult_entry']
+                        engine.mode_config['keltner_reversion']['exit_conditions']['mean_reversion']['threshold'] = 1.0  # Adjusted to 1.0
                         engine.mode_config['keltner_reversion']['exit_conditions']['stop_loss']['threshold'] = optimized_result['params']['stop_loss']
-                        engine.mode_config['keltner_reversion']['exit_conditions']['trailing_stop']['atr_multiplier'] = optimized_result['params']['trailing_stop_atr']
+                        engine.mode_config['keltner_reversion']['exit_conditions']['trailing_stop']['atr_multiplier'] = 2.0  # Adjusted to 2.0
                         engine.mode_config['keltner_reversion']['ema_period'] = optimized_result['params']['keltner_ema_period']
-                    
-                    engines_opt, _ = run_backtest(result['data'], timeframe)
-                    if engines_opt and strat_id in engines_opt:
-                        optimized_metrics = calculate_day_metrics(engines_opt[strat_id].trade_history)
-                        print(f"\n=== Optimized {GlobalConfig.STRATEGY_LABELS[strat_id]} Stats for {timeframe} TF ===")
-                        print(f"# of Trades: {len(engines_opt[strat_id].trade_history)}")
-                        print(f"Final Balance: ${engines_opt[strat_id].balance:.2f}")
-                        print_backtest_report(optimized_metrics, timeframe, f"Optimized {GlobalConfig.STRATEGY_LABELS[strat_id]}")
-                    else:
-                        logger.debug(f"Optimized backtest failed for Strategy {strat_id} on {timeframe}")
+                        
+                        engines_opt, _ = run_backtest(result['data'], timeframe)
+                        if engines_opt and strat_id in engines_opt:
+                            optimized_metrics = calculate_day_metrics(engines_opt[strat_id].trade_history)
+                            print(f"\n=== Adjusted {GlobalConfig.STRATEGY_LABELS[strat_id]} Stats for {timeframe} TF ===")
+                            print(f"# of Trades: {len(engines_opt[strat_id].trade_history)}")
+                            print(f"Final Balance: ${engines_opt[strat_id].balance:.2f}")
+                            print_backtest_report(optimized_metrics, timeframe, f"Adjusted {GlobalConfig.STRATEGY_LABELS[strat_id]}")
+                        else:
+                            logger.debug(f"Adjusted backtest failed for Strategy {strat_id} on {timeframe}")
+
                 else:
                     logger.debug(f"No optimization result for Strategy {strat_id} on {timeframe}")
 
