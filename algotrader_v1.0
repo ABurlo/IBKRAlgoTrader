@@ -516,7 +516,6 @@ def calculate_day_metrics(trades, risk_free_rate=0.02):
                 logger.warning(f"Invalid timestamps in trade: {t}")
                 holding_time = 0.0
             else:
-                # Ensure timezone consistency and positive holding time
                 entry_time = enforce_ny_timezone(entry_time)
                 exit_time = enforce_ny_timezone(exit_time)
                 holding_time = max((exit_time - entry_time).total_seconds() / 3600, 0)
@@ -535,15 +534,15 @@ def calculate_day_metrics(trades, risk_free_rate=0.02):
             exit_strategy_holding[exit_type] = exit_strategy_holding.get(exit_type, []) + [holding_time]
 
             if 'ATR' in t and 'entry_price' in t and 'price' in t:
-                atr_list.append(float(t['ATR']))
+                atr = float(t.get('ATR', 0.0))
+                atr_list.append(atr)
                 entry_price = float(t['entry_price'])
                 exit_price = float(t['price'])
-                potential_loss = abs(entry_price - (entry_price - t['ATR']))
-                potential_gain = abs(exit_price - entry_price) if trade_pnl > 0 else 0
+                potential_loss = atr  # Risk is 1x ATR below entry
+                potential_gain = exit_price - entry_price if trade_pnl > 0 else 0
                 if potential_loss > 0 and potential_gain > 0:
                     risk_rewards.append(potential_gain / potential_loss)
 
-    # Rest of the function remains unchanged (win_rate, sharpe_ratio, etc.)
     win_rate = (wins / (wins + losses)) * 100 if (wins + losses) > 0 else 0.0
     win_loss_ratio = (wins / losses) if losses > 0 else float('inf') if wins > 0 else 0.0
     avg_pnl = total_pnl / num_trades if num_trades > 0 else 0.0
@@ -684,12 +683,14 @@ class BacktestEngine:
                 'volatility_mult': 1.5,
                 'ema_period': 20,
                 'entry_conditions': {
-                    'keltner_zscore': {'threshold': -2.0, 'operator': '<'}
+                    'keltner_zscore': {'threshold': lambda row: -2.0 * (1 + row['ATR_shifted'] / row['close']), 'operator': '<'},  # Dynamic threshold
+                    'volume_spike': {'threshold': 1.5, 'operator': '>'}  # Volume confirmation
                 },
                 'exit_conditions': {
                     'mean_reversion': {'threshold': 1.5, 'operator': '>'},
                     'stop_loss': {'threshold': -0.015, 'operator': '<'},
-                    'trailing_stop': {'atr_multiplier': 1.0}
+                    'trailing_stop': {'atr_multiplier': 2.0},  # Adjusted to 2.0
+                    'profit_target': {'threshold': 0.005, 'operator': '>'}  # 0.5% profit target
                 }
             }
         }
@@ -813,7 +814,8 @@ class BacktestEngine:
                 'shares': shares,
                 'position_value': position_value,
                 'balance_before': self.balance,
-                'exit_type': exit_type if action == 'SELL' else None
+                'exit_type': exit_type if action == 'SELL' else None,
+                'ATR': row['ATR_shifted'] if row is not None and 'ATR_shifted' in row else 0.0  # Add ATR to trade
             }
 
             execution_log = [
@@ -867,7 +869,7 @@ class BacktestEngine:
                 trade['position_id'] = position['position_id']
                 trade['Profit_Outcome'] = 1 if pnl > 0 else 0
                 self.balance += (exit_value - fees)
-                self.daily_pnl[timestamp.strftime('%Y-%m-%d')] = self.daily_pnl.get(timestamp.strftime('%Y-m-%d'), 0) + pnl
+                self.daily_pnl[timestamp.strftime('%Y-%m-%d')] = self.daily_pnl.get(timestamp.strftime('%Y-%m-%d'), 0) + pnl
                 execution_log.extend([f"PnL: ${pnl:.2f}", f"Balance After: ${self.balance:.2f}"])
 
             logger.info(" | ".join(execution_log))
